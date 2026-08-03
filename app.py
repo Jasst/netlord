@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Request, HTTPException
+import asyncio
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from smart_brain_v4 import Brain, cosine_similarity, Teacher
@@ -11,11 +12,47 @@ import os
 import signal
 import atexit
 import sys
+import secrets
 from agent import BrainAgent
+from dotenv import load_dotenv
+
+load_dotenv()  # загружает переменные из .env в os.environ
 
 app = FastAPI(title="Smart Brain v4")
 
-# Инициализация мозга
+# ============================================================
+# ФИКС: адрес LM Studio теперь берём из окружения, а не хардкодим
+# IP разработчика. См. также smart_brain_v4.LM_STUDIO_BASE_URL --
+# оба места должны указывать на один и тот же инстанс.
+# ============================================================
+LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
+LM_STUDIO_API_KEY = os.environ.get("LM_STUDIO_API_KEY", "not-needed")
+
+llm_client = OpenAI(
+    base_url=LM_STUDIO_BASE_URL,
+    api_key=LM_STUDIO_API_KEY,
+)
+
+# ============================================================
+# ФИКС: авторизация на деструктивных эндпоинтах (/learn*, /train*,
+# /sleep, /chat/clear, /agent/*). Если ADMIN_API_KEY не задан в
+# окружении -- генерируем случайный на старте и печатаем его в лог,
+# чтобы сервис нельзя было по недосмотру оставить полностью открытым.
+# ============================================================
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY") or secrets.token_urlsafe(24)
+if not os.environ.get("ADMIN_API_KEY"):
+    print(f"[SECURITY] ADMIN_API_KEY не задан в окружении -- сгенерирован временный ключ на этот запуск:\n"
+          f"           {ADMIN_API_KEY}\n"
+          f"           Передавайте его в заголовке X-Admin-Key на /learn, /train_*, /sleep, /chat/clear, /agent/*.")
+
+def require_admin_key(x_admin_key: str = Header(default="")):
+    if not secrets.compare_digest(x_admin_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=401, detail="Неверный или отсутствующий X-Admin-Key")
+    return True
+
+# Инициализация мозга -- ФИКС: передаём единый llm_client явно,
+# чтобы Brain/Teacher/EmbeddingProvider не полагались на глобальный
+# клиент из smart_brain_v4.py с другим (потенциально) хостом.
 brain = Brain(
     dim_embedding=128,
     input_neurons=40,
@@ -23,17 +60,14 @@ brain = Brain(
     hidden_layers=[100, 80, 60],
     model_path="brain_model_trained.json",
     max_neurons=800,
-    max_synapses=8000
+    max_synapses=8000,
+    llm_client=llm_client,
 )
 brain.load()
 # Загружаем историю диалога (если есть)
 brain.load_dialog_history()
 
-teacher = Teacher()
-llm_client = OpenAI(
-    base_url="http://192.168.0.13:1234/v1",
-    api_key="not-needed",
-)
+teacher = Teacher(llm_client=llm_client)
 
 # ============================================================
 #  Сохранение при завершении (включая историю)
@@ -136,12 +170,23 @@ def handle_remember_command(text: str) -> tuple[bool, str]:
     fact = extract_fact_from_command(text, REMEMBER_PATTERNS)
     if not fact:
         return False, ""
-    brain.learn_pair(text, fact)
+    brain.learn_pair(text, fact)  # уже под своим локом внутри
     brain.save()
     response_text = f"✅ Я запомнил: «{fact}»."
     brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
     print(f"[CMD] Запомнил: '{fact}'")
     return True, response_text
+
+def _text_overlaps(norm_phrase: str, key: str) -> bool:
+    """ФИКС: раньше матчилось произвольной подстрокой
+    (`norm_phrase in key or key in norm_phrase`) -- короткая фраза вроде
+    "мир" случайно сносила бы "мировая война", "мирный житель" и т.п.
+    Теперь сравниваем целыми словами."""
+    phrase_words = set(norm_phrase.split())
+    key_words = set(key.split())
+    if not phrase_words or not key_words:
+        return False
+    return phrase_words == key_words or phrase_words.issubset(key_words) or key_words.issubset(phrase_words)
 
 def handle_forget_command(text: str) -> tuple[bool, str]:
     phrase = extract_fact_from_command(text, FORGET_PATTERNS)
@@ -149,25 +194,30 @@ def handle_forget_command(text: str) -> tuple[bool, str]:
         return False, ""
     norm_phrase = normalize_text(phrase)
     removed_any = False
-    to_delete = []
-    for key, nid in brain.concept_index.items():
-        if norm_phrase in key or key in norm_phrase:
-            to_delete.append((key, nid))
-    for key, nid in to_delete:
-        if nid in brain.neurons:
-            neuron = brain.neurons[nid]
-            for syn_id in list(neuron.incoming_synapses) + list(neuron.outgoing_synapses):
-                brain._remove_synapse(syn_id)
-            del brain.neurons[nid]
-        del brain.concept_index[key]
-        removed_any = True
-    new_kb = []
-    for item in brain.knowledge_base:
-        if norm_phrase in normalize_text(item["q"]) or norm_phrase in normalize_text(item["a"]):
+    # ФИКС: эта функция мутирует внутренности brain напрямую (concept_index,
+    # neurons, knowledge_base), в обход всех методов Brain с их собственным
+    # локом -- поэтому берём brain.lock явно, иначе гонка с BrainAgent/другими
+    # запросами всё ещё возможна именно здесь.
+    with brain.lock:
+        to_delete = []
+        for key, nid in brain.concept_index.items():
+            if _text_overlaps(norm_phrase, key):
+                to_delete.append((key, nid))
+        for key, nid in to_delete:
+            if nid in brain.neurons:
+                neuron = brain.neurons[nid]
+                for syn_id in list(neuron.incoming_synapses) + list(neuron.outgoing_synapses):
+                    brain._remove_synapse(syn_id)
+                del brain.neurons[nid]
+            del brain.concept_index[key]
             removed_any = True
-            continue
-        new_kb.append(item)
-    brain.knowledge_base = new_kb
+        new_kb = []
+        for item in brain.knowledge_base:
+            if norm_phrase in normalize_text(item["q"]) or norm_phrase in normalize_text(item["a"]):
+                removed_any = True
+                continue
+            new_kb.append(item)
+        brain.knowledge_base = new_kb
     if removed_any:
         response_text = f"✅ Я забыл всё, что связано с «{phrase}»."
     else:
@@ -294,28 +344,36 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
 
 # ============================================================
 # API эндпоинты
+#
+# ФИКС: все обращения к brain.*, которые под капотом синхронно бьют в
+# LM Studio (generate_answer, learn_pair, sleep, ...), теперь идут через
+# asyncio.to_thread(...). Раньше блокирующий вызов внутри `async def`
+# замораживал весь event loop uvicorn на время генерации ответа локальной
+# моделью -- ни один другой запрос (даже /stats) не обрабатывался, пока
+# LM Studio не ответит. to_thread уводит блокирующий вызов в отдельный
+# поток, event loop остаётся отзывчивым.
 # ============================================================
 @app.post("/ask")
 async def ask(req: AskRequest):
     try:
-        handled, response = handle_remember_command(req.question)
+        handled, response = await asyncio.to_thread(handle_remember_command, req.question)
         if handled:
             return {"question": req.question, "answer": response, "facts": [], "known": True}
-        handled, response = handle_forget_command(req.question)
+        handled, response = await asyncio.to_thread(handle_forget_command, req.question)
         if handled:
             return {"question": req.question, "answer": response, "facts": [], "known": True}
 
-        result = brain.generate_answer(req.question, temperature=req.temperature, use_rag=True)
+        result = await asyncio.to_thread(brain.generate_answer, req.question, req.temperature, True)
         answer_text = result["text"]
         clarifying = None
         if req.allow_clarifying and len(result.get("facts", [])) < 3:
             history = brain.dialog_memory.items[-5:] if brain.dialog_memory.items else []
-            clarifying = brain.generate_context_question(
-                req.question, answer_text, history, result.get("facts", [])
+            clarifying = await asyncio.to_thread(
+                brain.generate_context_question, req.question, answer_text, history, result.get("facts", [])
             )
         brain.dialog_memory.add_turn(req.question, answer_text, brain.text_to_embedding(req.question))
         # Сохраняем историю после каждого сообщения (для надёжности)
-        brain.save_dialog_history()
+        await asyncio.to_thread(brain.save_dialog_history)
         return {
             "question": req.question,
             "answer": answer_text,
@@ -327,28 +385,28 @@ async def ask(req: AskRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/learn")
-async def learn(req: LearnRequest):
+async def learn(req: LearnRequest, _auth: bool = Depends(require_admin_key)):
     try:
-        brain.learn_pair(req.question, req.answer)
-        brain.save()
+        await asyncio.to_thread(brain.learn_pair, req.question, req.answer)
+        await asyncio.to_thread(brain.save)
         return {"status": "learned", "question": req.question, "answer": req.answer}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/learn_neg")
-async def learn_neg(req: LearnRequest):
+async def learn_neg(req: LearnRequest, _auth: bool = Depends(require_admin_key)):
     try:
-        brain.learn_negative_pair(req.question, req.answer)
-        brain.save()
+        await asyncio.to_thread(brain.learn_negative_pair, req.question, req.answer)
+        await asyncio.to_thread(brain.save)
         return {"status": "learned_negative", "question": req.question, "answer": req.answer}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/train_topic")
-async def train_topic(req: TrainTopicRequest):
+async def train_topic(req: TrainTopicRequest, _auth: bool = Depends(require_admin_key)):
     try:
-        result = train_model_on_topic(
-            brain, req.topic, req.num_pairs, req.negative_ratio,
+        result = await asyncio.to_thread(
+            train_model_on_topic, brain, req.topic, req.num_pairs, req.negative_ratio,
             req.temperature, req.integrate, req.epochs
         )
         return result
@@ -356,12 +414,14 @@ async def train_topic(req: TrainTopicRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/train_pair")
-async def train_pair(req: TrainPairRequest):
+async def train_pair(req: TrainPairRequest, _auth: bool = Depends(require_admin_key)):
     try:
-        for epoch in range(req.epochs):
-            brain.learn_pair(req.question, req.answer)
-            time.sleep(0.1)
-        brain.save()
+        def _run():
+            for _ in range(req.epochs):
+                brain.learn_pair(req.question, req.answer)
+                time.sleep(0.1)
+            brain.save()
+        await asyncio.to_thread(_run)
         return {"status": "learned", "question": req.question, "answer": req.answer, "epochs": req.epochs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -377,27 +437,26 @@ async def stats():
     }
 
 @app.post("/sleep")
-async def sleep_brain():
+async def sleep_brain(_auth: bool = Depends(require_admin_key)):
     try:
-        brain.sleep(duration_steps=5)
-        brain.save()
+        await asyncio.to_thread(brain.sleep, 5)
         return {"status": "ok", "message": "Сон завершен"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- Эндпоинты управления агентом ---
 @app.post("/agent/start")
-async def agent_start():
+async def agent_start(_auth: bool = Depends(require_admin_key)):
     agent.start()
     return {"status": "agent started"}
 
 @app.post("/agent/stop")
-async def agent_stop():
+async def agent_stop(_auth: bool = Depends(require_admin_key)):
     agent.stop()
     return {"status": "agent stopped"}
 
 @app.post("/agent/config")
-async def agent_config(req: AgentConfigRequest):
+async def agent_config(req: AgentConfigRequest, _auth: bool = Depends(require_admin_key)):
     if req.topics is not None:
         agent.topics = req.topics
     if req.interval is not None and req.interval > 0:
@@ -424,11 +483,11 @@ async def get_next_question():
 
 @app.post("/agent/submit_answer")
 async def submit_answer(question: str, answer: str):
-    agent.submit_answer(question, answer)
+    await asyncio.to_thread(agent.submit_answer, question, answer)
     return {"status": "ok"}
 
 # ============================================================
-# НОВЫЕ ЭНДПОИНТЫ ДЛЯ ИСТОРИИ ЧАТА
+# ЭНДПОИНТЫ ДЛЯ ИСТОРИИ ЧАТА
 # ============================================================
 @app.get("/chat/messages")
 async def get_chat_messages(limit: int = 50):
@@ -446,10 +505,10 @@ async def get_chat_messages(limit: int = 50):
     return {"messages": messages}
 
 @app.post("/chat/clear")
-async def clear_chat():
+async def clear_chat(_auth: bool = Depends(require_admin_key)):
     """Очищает историю диалога."""
     brain.dialog_memory.clear()
-    brain.save_dialog_history()
+    await asyncio.to_thread(brain.save_dialog_history)
     return {"status": "cleared"}
 
 # --- Главная страница ---

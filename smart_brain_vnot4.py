@@ -14,14 +14,10 @@ from openai import OpenAI
 
 # ============================
 # Настройка подключения к LM Studio
-# ФИКС: адрес берём из переменной окружения, а не хардкодим.
 # ============================
-LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
-LM_STUDIO_API_KEY = os.environ.get("LM_STUDIO_API_KEY", "not-needed")
-
 client = OpenAI(
-    base_url=LM_STUDIO_BASE_URL,
-    api_key=LM_STUDIO_API_KEY,
+    base_url="http://192.168.0.13:1234/v1",
+    api_key="not-needed",
 )
 
 # ============================
@@ -50,24 +46,15 @@ def softmax(x: np.ndarray) -> np.ndarray:
 
 # ============================
 # Провайдер эмбеддингов
-# ФИКС: раньше при несовпадении размерности API-вектор просто
-# выбрасывался и подменялся хэш-вектором -- на практике это
-# происходило почти всегда (128 не совпадает ни с одной реальной
-# моделью эмбеддингов). Теперь вектор проецируется случайной
-# матрицей (johnson-lindenstrauss) в целевую размерность вместо
-# полного отбрасывания -- относительное расстояние между близкими
-# по смыслу текстами сохраняется приближённо, семантика не теряется
-# целиком.
 # ============================
 class EmbeddingProvider:
-    def __init__(self, dim: int = 128, api_model: str = "local-model", llm_client: Optional[OpenAI] = None):
+    # (без изменений)
+    def __init__(self, dim: int = 128, api_model: str = "local-model"):
         self.dim = dim
         self.api_model = api_model
-        self.llm_client = llm_client or client
         self._cache: Dict[str, np.ndarray] = {}
         self._cache_lock = threading.Lock()
         self._api_available = True
-        self._projection: Optional[np.ndarray] = None  # (api_dim, self.dim), лениво инициализируется
 
     def _local_embedding(self, text: str) -> np.ndarray:
         text = text.lower().strip()
@@ -88,20 +75,6 @@ class EmbeddingProvider:
         norm = np.linalg.norm(vec)
         return vec / norm if norm > 0 else random_vector(self.dim)
 
-    def _project_to_dim(self, vec: np.ndarray) -> np.ndarray:
-        """Проецирует вектор произвольной размерности в self.dim фиксированной
-        случайной матрицей (одна и та же матрица для всех вызовов -- иначе
-        косинусное сходство между двумя эмбеддингами перестанет что-либо значить)."""
-        src_dim = len(vec)
-        if src_dim == self.dim:
-            return vec
-        if self._projection is None or self._projection.shape[0] != src_dim:
-            rng = np.random.RandomState(1234567)  # фиксированный seed -- проекция стабильна между запусками
-            self._projection = rng.randn(src_dim, self.dim).astype(np.float32) / np.sqrt(self.dim)
-        projected = vec @ self._projection
-        norm = np.linalg.norm(projected)
-        return projected / norm if norm > 0 else projected
-
     def get_embedding(self, text: str) -> np.ndarray:
         if not text:
             return random_vector(self.dim)
@@ -110,13 +83,13 @@ class EmbeddingProvider:
                 return self._cache[text].copy()
         if self._api_available:
             try:
-                resp = self.llm_client.embeddings.create(
+                resp = client.embeddings.create(
                     model=self.api_model,
                     input=[text]
                 )
                 vec = np.array(resp.data[0].embedding, dtype=np.float32)
                 if len(vec) != self.dim:
-                    vec = self._project_to_dim(vec)  # ФИКС: проекция вместо отбрасывания
+                    vec = self._local_embedding(text)
                 with self._cache_lock:
                     self._cache[text] = vec.copy()
                 return vec
@@ -128,7 +101,7 @@ class EmbeddingProvider:
         return vec
 
 # ============================
-# Классы Signal, Synapse, Neuron
+# Классы Signal, Synapse, Neuron (без изменений)
 # ============================
 class Signal:
     # (без изменений)
@@ -358,26 +331,16 @@ class Brain:
                  hidden_layers: List[int] = None,
                  model_path: str = "brain_model_trained.json",
                  max_neurons: int = 800,
-                 max_synapses: int = 8000,
-                 llm_client: Optional[OpenAI] = None):
+                 max_synapses: int = 8000):
         if hidden_layers is None:
             hidden_layers = [100, 80, 60]
-        # ФИКС: реально используем переданный клиент, а не только присваиваем и забываем.
-        # Все методы Brain/Teacher ниже обращаются к self.llm_client, а не к глобальному client.
-        self.llm_client = llm_client or client
+        self.llm_client = client  # или llm_client, если передаёте извне
         self.dim = dim_embedding
-        self.embedder = EmbeddingProvider(dim=dim_embedding, llm_client=self.llm_client)
+        self.embedder = EmbeddingProvider(dim=dim_embedding)
         self.neurons: Dict[int, Neuron] = {}
         self.synapses: Dict[int, Synapse] = {}
         self.edge_index: Dict[Tuple[int, int], int] = {}
         self.concept_index: Dict[str, int] = {}
-
-        # ФИКС: собственный монотонный счётчик ID вместо id(self) (адреса в памяти),
-        # который мог коллизировать с ID, загруженными из старого файла модели.
-        self._next_id = 1
-        # ФИКС: единая блокировка на все мутирующие операции графа -- Brain делят
-        # между собой поток FastAPI-хендлеров и фоновый поток BrainAgent.
-        self.lock = threading.RLock()
 
         self.hidden_layer_sizes = hidden_layers
         self.num_hidden_layers = len(hidden_layers)
@@ -409,38 +372,22 @@ class Brain:
         self.prune_every = 25
         self.similarity_threshold_new_neuron = 0.85
 
-        # --- Параметры биологических механизмов (STDP / гомеостаз) ---
-        self.stdp_tau = 2.0          # секунды -- окно значимости порядка спайков
-        self.stdp_a_plus = 0.03      # сила потенциации (pre before post)
-        self.stdp_a_minus = 0.032    # сила депрессии (post before pre), чуть больше a_plus как в биологии
-        self.homeostasis_target_rate = 0.15
-        self.homeostasis_every = 20  # раз в N шагов step()
-
         self._init_architecture(input_neurons, hidden_layers, output_neurons)
-
-    def _alloc_id(self) -> int:
-        """Монотонный счётчик ID для нейронов/синапсов (заменяет id(self))."""
-        nid = self._next_id
-        self._next_id += 1
-        return nid
 
     def _init_architecture(self, input_n: int, hidden_layers: List[int], output_n: int):
         for _ in range(input_n):
             n = Neuron(embedding=random_vector(self.dim), cluster='input', layer=0)
-            n.id = self._alloc_id()
             self.neurons[n.id] = n
 
         layer_id = 1
         for hsize in hidden_layers:
             for _ in range(hsize):
                 n = Neuron(embedding=random_vector(self.dim), cluster='hidden', layer=layer_id)
-                n.id = self._alloc_id()
                 self.neurons[n.id] = n
             layer_id += 1
 
         for _ in range(output_n):
             n = Neuron(embedding=random_vector(self.dim), cluster='output', layer=layer_id)
-            n.id = self._alloc_id()
             self.neurons[n.id] = n
 
         layer_map = defaultdict(list)
@@ -501,7 +448,6 @@ class Brain:
                       semantic_vector=random_vector(self.dim),
                       episodic_vector=random_vector(self.dim),
                       is_inhibitory=is_inhibitory)
-        syn.id = self._alloc_id()  # ФИКС: счётчик вместо id(self)
         self.synapses[syn.id] = syn
         self.edge_index[key] = syn.id
         self.neurons[from_id].add_outgoing(syn.id)
@@ -553,7 +499,6 @@ class Brain:
         if layer is None:
             layer = self.num_hidden_layers // 2 + 1
         n = Neuron(embedding=embedding, importance=importance, cluster=cluster, layer=layer)
-        n.id = self._alloc_id()  # ФИКС: счётчик вместо id(self)
         if label:
             n.label = label[:self.MAX_LABEL_LEN] if len(label) > self.MAX_LABEL_LEN else label
         self.neurons[n.id] = n
@@ -633,40 +578,16 @@ class Brain:
         for sid in to_remove:
             self._remove_synapse(sid)
 
-    def _stdp_delta(self, pre_time: float, post_time: float) -> float:
-        """Асимметричное правило STDP (Bi & Poo, 1998): если пре-нейрон
-        активировался РАНЬШЕ пост-нейрона -- потенциация (LTP), связь
-        причинно предсказывает результат. Если ПОЗЖЕ -- депрессия (LTD),
-        связь скорее случайна/обратна по времени. dt берём в секундах между
-        последними активациями (last_activation), затухание экспоненциальное
-        с постоянной self.stdp_tau."""
-        dt = post_time - pre_time
-        if dt >= 0:
-            return self.stdp_a_plus * np.exp(-dt / self.stdp_tau)
-        else:
-            return -self.stdp_a_minus * np.exp(dt / self.stdp_tau)
-
     def _hebbian_update(self, activated_ids: List[int], query_vec: np.ndarray):
-        """ФИКС (биология): раньше связь между любыми двумя совместно
-        активированными нейронами усиливалась симметрично -- независимо от
-        того, кто из них 'вызвал' кого. Теперь используется STDP: знак и
-        сила изменения веса зависят от порядка активации (кто раньше
-        спайкнул -- pre или post), что и делает обучение причинным, а не
-        просто корреляционным."""
         for i in range(len(activated_ids)):
-            for j in range(i + 1, len(activated_ids)):
+            for j in range(i+1, len(activated_ids)):
                 a, b = activated_ids[i], activated_ids[j]
                 syn_id = self.edge_index.get((a, b)) or self.edge_index.get((b, a))
                 if syn_id is not None and syn_id in self.synapses:
                     syn = self.synapses[syn_id]
                     if not syn.is_inhibitory:
-                        pre_id, post_id = syn.from_neuron, syn.to_neuron
-                        pre_n, post_n = self.neurons.get(pre_id), self.neurons.get(post_id)
-                        if pre_n is None or post_n is None:
-                            continue
                         att = syn.attention_score(query_vec)
-                        stdp_delta = self._stdp_delta(pre_n.last_activation, post_n.last_activation)
-                        delta = stdp_delta * (1.0 - min(1.0, abs(syn.weight))) * (1.0 + att)
+                        delta = 0.015 * (1.0 - min(1.0, syn.weight)) * (1.0 + att)
                         syn.update(delta_weight=delta, delta_plasticity=0.001,
                                    delta_confidence=0.001, delta_frequency=0.001)
                         syn.update_attention(query_vec)
@@ -682,27 +603,6 @@ class Brain:
                         if self.coactivation_counter[old_pair] <= 0:
                             del self.coactivation_counter[old_pair]
 
-    def _homeostatic_scaling(self):
-        """ФИКС (биология): гомеостатическая синаптическая нормировка
-        (Turrigiano & Nelson, 2004). Без неё веса, усиленные STDP/Hebbian,
-        могут неограниченно расти для часто используемых путей -- нейрон
-        "залипает" в постоянном возбуждении. Здесь входящие возбуждающие
-        связи каждого нейрона мягко скейлятся к целевой частоте активации."""
-        for nid, neuron in self.neurons.items():
-            if neuron.age <= 0:
-                continue
-            actual_rate = neuron.usage_counter / neuron.age
-            if actual_rate <= 1e-6:
-                continue
-            scale = self.homeostasis_target_rate / actual_rate
-            scale = float(np.clip(scale, 0.9, 1.1))  # мягкая коррекция за один вызов
-            if abs(scale - 1.0) < 1e-4:
-                continue
-            for syn_id in neuron.incoming_synapses:
-                syn = self.synapses.get(syn_id)
-                if syn and not syn.is_inhibitory:
-                    syn.weight = float(np.clip(syn.weight * scale, -2.0, 2.0))
-
     def _create_new_synapses_from_coactivation(self):
         for pair, count in list(self.coactivation_counter.items()):
             if count >= self.synapse_creation_threshold:
@@ -716,18 +616,6 @@ class Brain:
                             self.coactivation_counter[pair] = 0
 
     def propagate_signal(self, input_signal: Signal, max_steps: int = 20) -> Tuple[List[int], Dict[int, float]]:
-        # ФИКС: блокировка на всю функцию -- она мутирует нейроны/синапсы и
-        # раньше вызывалась (через retrieve_facts/generate_answer) в обход
-        # step()/learn_pair(), то есть без всякой защиты от гонки потоков.
-        # RLock реентерабелен -- вызов изнутри step()/learn_pair(), которые
-        # уже держат self.lock, не приведёт к деадлоку.
-        self.lock.acquire()
-        try:
-            return self._propagate_signal_impl(input_signal, max_steps)
-        finally:
-            self.lock.release()
-
-    def _propagate_signal_impl(self, input_signal: Signal, max_steps: int = 20) -> Tuple[List[int], Dict[int, float]]:
         self.working_memory.add(input_signal)
         self.working_memory.update_context(input_signal.embedding)
 
@@ -811,44 +699,36 @@ class Brain:
 
     def step(self, input_signal: Signal, target_neuron_id: Optional[int] = None,
              reward: float = 0.0) -> List[int]:
-        # ФИКС: единая блокировка на всю мутацию графа за один шаг -- защищает
-        # от гонки между фоновым BrainAgent и HTTP-обработчиками (RLock, так что
-        # вложенные with self.lock ниже по стеку вызовов не деадлочатся).
-        with self.lock:
-            self.step_counter += 1
-            for neuron in self.neurons.values():
-                neuron.decay_energy(rate=0.0005)
+        self.step_counter += 1
+        for neuron in self.neurons.values():
+            neuron.decay_energy(rate=0.0005)
 
-            activated, _ = self.propagate_signal(input_signal)
+        activated, _ = self.propagate_signal(input_signal)
 
-            if target_neuron_id is not None:
-                reward = 1.0 if target_neuron_id in activated else 0.0
+        if target_neuron_id is not None:
+            reward = 1.0 if target_neuron_id in activated else 0.0
 
-            if reward > 0:
-                for nid in activated:
-                    neuron = self.neurons.get(nid)
-                    if neuron is None:
-                        continue
-                    neuron.importance += reward * 0.02
-                    for syn_id in neuron.incoming_synapses + neuron.outgoing_synapses:
-                        syn = self.synapses.get(syn_id)
-                        if syn and not syn.is_inhibitory:
-                            syn.reward += reward
-                            syn.update(delta_weight=reward * 0.005, delta_confidence=reward * 0.005)
+        if reward > 0:
+            for nid in activated:
+                neuron = self.neurons.get(nid)
+                if neuron is None:
+                    continue
+                neuron.importance += reward * 0.02
+                for syn_id in neuron.incoming_synapses + neuron.outgoing_synapses:
+                    syn = self.synapses.get(syn_id)
+                    if syn and not syn.is_inhibitory:
+                        syn.reward += reward
+                        syn.update(delta_weight=reward * 0.005, delta_confidence=reward * 0.005)
 
-            if self.step_counter % 10 == 0:
-                self._create_new_synapses_from_coactivation()
-            # ФИКС (биология): гомеостатическая нормировка синапсов -- держит
-            # частоту активации нейронов в целевом диапазоне, не даёт "залипать".
-            if self.step_counter % self.homeostasis_every == 0:
-                self._homeostatic_scaling()
-            if self.step_counter % self.prune_every == 0:
-                self._prune_synapses()
-                self._prune_neurons()
+        if self.step_counter % 10 == 0:
+            self._create_new_synapses_from_coactivation()
+        if self.step_counter % self.prune_every == 0:
+            self._prune_synapses()
+            self._prune_neurons()
 
-            self.short_memory.add((input_signal, activated))
-            self.global_time = time.time()
-            return activated
+        self.short_memory.add((input_signal, activated))
+        self.global_time = time.time()
+        return activated
 
     # ----- Текстовые методы с улучшениями -----
     def normalize_text(self, text: str) -> str:
@@ -952,7 +832,7 @@ class Brain:
             user_prompt = f"{context_str}\n\nТекущий вопрос: {input_text}"
 
         try:
-            response = self.llm_client.chat.completions.create(
+            response = client.chat.completions.create(
                 model="local-model",
                 messages=[
                     {"role": "system", "content": system_msg},
@@ -1050,61 +930,60 @@ class Brain:
         Обучает модель на паре (вопрос→ответ). При epochs > 1 повторяет обучение
         для закрепления связи (усиливает синапс).
         """
-        with self.lock:  # ФИКС: блокировка -- защита от гонки с BrainAgent/другими запросами
-            for epoch in range(epochs):
-                input_norm = self.normalize_text(input_text)
-                output_norm = self.normalize_text(output_text)
-                if input_norm == output_norm:
-                    print("[Пропуск] Вход и выход совпадают.")
-                    return
+        for epoch in range(epochs):
+            input_norm = self.normalize_text(input_text)
+            output_norm = self.normalize_text(output_text)
+            if input_norm == output_norm:
+                print("[Пропуск] Вход и выход совпадают.")
+                return
 
-                input_id = self.get_or_create_concept_neuron(input_text)
-                output_id = self.get_or_create_concept_neuron(output_text)
+            input_id = self.get_or_create_concept_neuron(input_text)
+            output_id = self.get_or_create_concept_neuron(output_text)
 
-                sim = cosine_similarity(self.neurons[input_id].embedding, self.neurons[output_id].embedding)
-                sim_bonus = max(0.0, sim) * 0.05
+            sim = cosine_similarity(self.neurons[input_id].embedding, self.neurons[output_id].embedding)
+            sim_bonus = max(0.0, sim) * 0.05
 
-                # Создаём или получаем существующий синапс
-                syn_id = self._create_synapse(input_id, output_id, weight=0.2 + sim_bonus)
-                if syn_id is None:
-                    print("[Ошибка] Не удалось создать синапс (лимит).")
-                    return
-                syn = self.synapses[syn_id]
+            # Создаём или получаем существующий синапс
+            syn_id = self._create_synapse(input_id, output_id, weight=0.2 + sim_bonus)
+            if syn_id is None:
+                print("[Ошибка] Не удалось создать синапс (лимит).")
+                return
+            syn = self.synapses[syn_id]
 
-                if syn.usage_count > 0:
-                    syn.update(delta_weight=reinforce_boost, delta_plasticity=0.02,
-                               delta_confidence=0.05, delta_frequency=0.02)
-                else:
-                    syn.update(delta_weight=0.0, delta_confidence=0.05)
+            if syn.usage_count > 0:
+                syn.update(delta_weight=reinforce_boost, delta_plasticity=0.02,
+                           delta_confidence=0.05, delta_frequency=0.02)
+            else:
+                syn.update(delta_weight=0.0, delta_confidence=0.05)
 
-                # Распространение сигнала и создание дополнительных связей (только на первой эпохе,
-                # чтобы избежать дублирования)
-                if epoch == 0:
-                    sig = self.text_to_signal(input_text)
-                    activated, _ = self.propagate_signal(sig, max_steps=15)
-                    if activated:
-                        sorted_activated = sorted(activated, key=lambda nid: self.neurons[nid].importance, reverse=True)
-                        for nid in sorted_activated[:3]:
-                            neuron = self.neurons.get(nid)
-                            if neuron is None or neuron.cluster == 'output':
-                                continue
-                            hsyn_id = self._create_synapse(nid, output_id, weight=0.05)
-                            if hsyn_id is not None:
-                                self.synapses[hsyn_id].update(delta_weight=0.03)
+            # Распространение сигнала и создание дополнительных связей (только на первой эпохе,
+            # чтобы избежать дублирования)
+            if epoch == 0:
+                sig = self.text_to_signal(input_text)
+                activated, _ = self.propagate_signal(sig, max_steps=15)
+                if activated:
+                    sorted_activated = sorted(activated, key=lambda nid: self.neurons[nid].importance, reverse=True)
+                    for nid in sorted_activated[:3]:
+                        neuron = self.neurons.get(nid)
+                        if neuron is None or neuron.cluster == 'output':
+                            continue
+                        hsyn_id = self._create_synapse(nid, output_id, weight=0.05)
+                        if hsyn_id is not None:
+                            self.synapses[hsyn_id].update(delta_weight=0.03)
 
-                    self.step(sig, target_neuron_id=output_id)
+                self.step(sig, target_neuron_id=output_id)
 
-                # Добавляем в knowledge_base только один раз (защита от дублирования уже есть)
-                if epoch == 0:
-                    self._add_to_knowledge_base(input_text, output_text)
+            # Добавляем в knowledge_base только один раз (защита от дублирования уже есть)
+            if epoch == 0:
+                self._add_to_knowledge_base(input_text, output_text)
 
-                print(
-                    f"[+] Обучение (эпоха {epoch + 1}/{epochs}): '{input_text}' -> '{output_text}' (вес: {syn.weight:.3f})")
+            print(
+                f"[+] Обучение (эпоха {epoch + 1}/{epochs}): '{input_text}' -> '{output_text}' (вес: {syn.weight:.3f})")
 
-            self._learn_counter += epochs
-            if self._learn_counter % self.AUTO_SAVE_EVERY == 0:
-                self.save(self._model_path)
-                print(f"[Автосохранение] {self._model_path}")
+        self._learn_counter += epochs
+        if self._learn_counter % self.AUTO_SAVE_EVERY == 0:
+            self.save(self._model_path)
+            print(f"[Автосохранение] {self._model_path}")
 
     # УЛУЧШЕНИЕ: предотвращение дублирования фактов
     def _add_to_knowledge_base(self, q: str, a: str):
@@ -1118,34 +997,33 @@ class Brain:
             self.knowledge_base.pop(0)
 
     def learn_negative_pair(self, input_text: str, output_text: str, penalty: float = 0.15):
-        with self.lock:  # ФИКС: блокировка
-            input_norm = self.normalize_text(input_text)
-            output_norm = self.normalize_text(output_text)
-            if input_norm == output_norm:
-                return
+        input_norm = self.normalize_text(input_text)
+        output_norm = self.normalize_text(output_text)
+        if input_norm == output_norm:
+            return
 
-            input_id = self.get_or_create_concept_neuron(input_text)
-            output_id = self.get_or_create_concept_neuron(output_text)
+        input_id = self.get_or_create_concept_neuron(input_text)
+        output_id = self.get_or_create_concept_neuron(output_text)
 
-            syn_id = self.edge_index.get((input_id, output_id))
-            if syn_id is not None and syn_id in self.synapses:
-                syn = self.synapses[syn_id]
-                new_weight = max(-2.0, syn.weight - penalty)
-                syn.update(delta_weight=new_weight - syn.weight)
-                if syn.weight < 0:
-                    syn.is_inhibitory = True
-                print(f"[-] Отриц. обучение: '{input_text}' -> '{output_text}' = {syn.weight:.3f}")
+        syn_id = self.edge_index.get((input_id, output_id))
+        if syn_id is not None and syn_id in self.synapses:
+            syn = self.synapses[syn_id]
+            new_weight = max(-2.0, syn.weight - penalty)
+            syn.update(delta_weight=new_weight - syn.weight)
+            if syn.weight < 0:
+                syn.is_inhibitory = True
+            print(f"[-] Отриц. обучение: '{input_text}' -> '{output_text}' = {syn.weight:.3f}")
+        else:
+            syn_id = self._create_synapse(input_id, output_id,
+                                          weight=-random.uniform(0.1, 0.3), is_inhibitory=True)
+            if syn_id is not None:
+                print(f"[-] Тормозной синапс: '{input_text}' -> '{output_text}'")
             else:
-                syn_id = self._create_synapse(input_id, output_id,
-                                              weight=-random.uniform(0.1, 0.3), is_inhibitory=True)
-                if syn_id is not None:
-                    print(f"[-] Тормозной синапс: '{input_text}' -> '{output_text}'")
-                else:
-                    print("[Ошибка] Не удалось создать тормозной синапс (лимит).")
+                print("[Ошибка] Не удалось создать тормозной синапс (лимит).")
 
-            self._learn_counter += 1
-            if self._learn_counter % self.AUTO_SAVE_EVERY == 0:
-                self.save(self._model_path)
+        self._learn_counter += 1
+        if self._learn_counter % self.AUTO_SAVE_EVERY == 0:
+            self.save(self._model_path)
 
     # -------------------- НОВЫЙ МЕТОД: forget_concept --------------------
     def forget_concept(self, text: str) -> bool:
@@ -1153,30 +1031,29 @@ class Brain:
         Удаляет понятие из сети и из knowledge_base.
         Возвращает True, если понятие было найдено и удалено.
         """
-        with self.lock:  # ФИКС: блокировка
-            normalized = self.normalize_text(text)
-            nid = self.concept_index.get(normalized)
-            if nid is None or nid not in self.neurons:
-                return False
+        normalized = self.normalize_text(text)
+        nid = self.concept_index.get(normalized)
+        if nid is None or nid not in self.neurons:
+            return False
 
-            neuron = self.neurons[nid]
-            # Удаляем все синапсы
-            for syn_id in list(neuron.incoming_synapses) + list(neuron.outgoing_synapses):
-                self._remove_synapse(syn_id)
-            # Удаляем из concept_index
-            del self.concept_index[normalized]
-            # Удаляем сам нейрон
-            del self.neurons[nid]
+        neuron = self.neurons[nid]
+        # Удаляем все синапсы
+        for syn_id in list(neuron.incoming_synapses) + list(neuron.outgoing_synapses):
+            self._remove_synapse(syn_id)
+        # Удаляем из concept_index
+        del self.concept_index[normalized]
+        # Удаляем сам нейрон
+        del self.neurons[nid]
 
-            # Удаляем из knowledge_base записи, где вопрос или ответ содержат этот текст (частичное совпадение)
-            new_kb = []
-            for item in self.knowledge_base:
-                if normalized not in self.normalize_text(item["q"]) and normalized not in self.normalize_text(item["a"]):
-                    new_kb.append(item)
-            self.knowledge_base = new_kb
+        # Удаляем из knowledge_base записи, где вопрос или ответ содержат этот текст (частичное совпадение)
+        new_kb = []
+        for item in self.knowledge_base:
+            if normalized not in self.normalize_text(item["q"]) and normalized not in self.normalize_text(item["a"]):
+                new_kb.append(item)
+        self.knowledge_base = new_kb
 
-            print(f"[Забыто] Понятие '{text}' удалено из сети и из KB.")
-            return True
+        print(f"[Забыто] Понятие '{text}' удалено из сети и из KB.")
+        return True
 
     # -------------------- Остальные методы без изменений --------------------
     def show_links(self, text: str, top_k: int = 10):
@@ -1206,186 +1083,141 @@ class Brain:
             inhib_str = " (тормозная)" if inhib else ""
             print(f"  -> {label}   (вес={weight:.3f}, повторов={count}, уверенность={conf:.2f}){inhib_str}")
 
-    def _replay_recent_memory(self, n: int = 30, energy_scale: float = 0.5):
-        """ФИКС (биология): replay недавних сигналов во время сна --
-        приближение к hippocampal replay / sharp-wave ripples, которые
-        считаются механизмом system consolidation (перенос кратковременной
-        памяти в долговременную через повторное проигрывание последовательностей
-        активации). Раньше sleep() только чистил слабые нейроны/синапсы и слегка
-        усиливал часто использованные -- реального "проигрывания" не было.
-        Сигналы проигрываются с ослабленной энергией (как "эхо" воспоминания),
-        что заново прогоняет STDP по тем же путям и закрепляет их."""
-        recent = self.short_memory.get_recent(n)
-        for signal, _activated_ids in recent:
-            if signal is None:
-                continue
-            replayed = copy.deepcopy(signal)
-            replayed.energy *= energy_scale
-            self.propagate_signal(replayed, max_steps=10)
-
     def sleep(self, duration_steps: int = 10):
-        with self.lock:  # ФИКС: блокировка
-            print("=== Сон ===")
+        print("=== Сон ===")
+        for _ in range(duration_steps):
+            to_remove = []
+            for nid, neuron in self.neurons.items():
+                if neuron.energy < 0.05 and neuron.importance < 0.1 and neuron.cluster not in ('output', 'input'):
+                    to_remove.append(nid)
+            for nid in to_remove:
+                neuron = self.neurons[nid]
+                for syn_id in list(neuron.incoming_synapses) + list(neuron.outgoing_synapses):
+                    self._remove_synapse(syn_id)
+                del self.neurons[nid]
+                print(f"  Удален шумовой нейрон {nid}")
 
-            # ФИКС (биология): replay ДО чистки -- проигрываем недавний опыт,
-            # чтобы STDP успел закрепить реально полезные пути прежде, чем
-            # ниже удалятся "шумовые" низкоэнергетические нейроны.
-            self._replay_recent_memory(n=30)
+            for syn in self.synapses.values():
+                if syn.frequency > 0.5:
+                    syn.update(delta_weight=0.01, delta_confidence=0.01)
+                if syn.reward > 0.5:
+                    syn.update(delta_weight=0.02, delta_confidence=0.02)
+                syn.reward *= 0.9
 
-            for _ in range(duration_steps):
-                to_remove = []
-                for nid, neuron in self.neurons.items():
-                    if neuron.energy < 0.05 and neuron.importance < 0.1 and neuron.cluster not in ('output', 'input'):
-                        to_remove.append(nid)
-                for nid in to_remove:
-                    neuron = self.neurons[nid]
-                    for syn_id in list(neuron.incoming_synapses) + list(neuron.outgoing_synapses):
-                        self._remove_synapse(syn_id)
-                    del self.neurons[nid]
-                    print(f"  Удален шумовой нейрон {nid}")
-
-                for syn in self.synapses.values():
-                    if syn.frequency > 0.5:
-                        syn.update(delta_weight=0.01, delta_confidence=0.01)
-                    if syn.reward > 0.5:
-                        syn.update(delta_weight=0.02, delta_confidence=0.02)
-                    syn.reward *= 0.9
-
-            # ФИКС (биология): гомеостаз тоже применяем во время сна --
-            # именно во сне мозг перебалансирует общую возбудимость сети.
-            self._homeostatic_scaling()
-
-            for item in self.short_memory.get_recent(50):
-                self.long_memory.add(item)
-            self.short_memory.clear()
-            print("Сон завершен.")
-            self.save(self._model_path)
+        for item in self.short_memory.get_recent(50):
+            self.long_memory.add(item)
+        self.short_memory.clear()
+        print("Сон завершен.")
+        self.save(self._model_path)
 
     def save(self, filename: str = None):
-        with self.lock:  # ФИКС: блокировка -- не пишем файл, пока идёт мутация графа
-            filename = filename or self._model_path
-            data = {
-                "dim": self.dim,
-                "step_counter": self.step_counter,
-                "next_id": self._next_id,  # ФИКС: сохраняем счётчик ID
-                "coactivation_counter": {str(k): v for k, v in self.coactivation_counter.items()},
-                "neurons": [],
-                "synapses": [],
-                "knowledge_base": [],
-            }
-            for nid, n in self.neurons.items():
-                data["neurons"].append({
-                    "id": nid, "embedding": n.embedding.tolist(), "cluster": n.cluster,
-                    "layer": n.layer, "label": n.label, "importance": n.importance, "energy": n.energy,
-                    "utility_score": n.utility_score,
-                })
-            for sid, s in self.synapses.items():
-                data["synapses"].append({
-                    "id": sid, "from": s.from_neuron, "to": s.to_neuron,
-                    "weight": s.weight, "plasticity": s.plasticity, "confidence": s.confidence,
-                    "frequency": s.frequency, "energy": s.energy, "reward": s.reward,
-                    "usage_count": s.usage_count, "is_inhibitory": s.is_inhibitory,
-                    "context_vector": s.context_vector.tolist(),
-                    "semantic_vector": s.semantic_vector.tolist(),
-                    "episodic_vector": s.episodic_vector.tolist(),
-                    "key_vectors": [kv.tolist() for kv in s.key_vectors],
-                    "value_vectors": [vv.tolist() for vv in s.value_vectors],
-                })
-            for kb in self.knowledge_base:
-                data["knowledge_base"].append({
-                    "q": kb["q"], "a": kb["a"], "emb": kb["emb"].tolist(), "time": kb["time"]
-                })
+        filename = filename or self._model_path
+        data = {
+            "dim": self.dim,
+            "step_counter": self.step_counter,
+            "coactivation_counter": {str(k): v for k, v in self.coactivation_counter.items()},
+            "neurons": [],
+            "synapses": [],
+            "knowledge_base": [],
+        }
+        for nid, n in self.neurons.items():
+            data["neurons"].append({
+                "id": nid, "embedding": n.embedding.tolist(), "cluster": n.cluster,
+                "layer": n.layer, "label": n.label, "importance": n.importance, "energy": n.energy,
+                "utility_score": n.utility_score,
+            })
+        for sid, s in self.synapses.items():
+            data["synapses"].append({
+                "id": sid, "from": s.from_neuron, "to": s.to_neuron,
+                "weight": s.weight, "plasticity": s.plasticity, "confidence": s.confidence,
+                "frequency": s.frequency, "energy": s.energy, "reward": s.reward,
+                "usage_count": s.usage_count, "is_inhibitory": s.is_inhibitory,
+                "context_vector": s.context_vector.tolist(),
+                "semantic_vector": s.semantic_vector.tolist(),
+                "episodic_vector": s.episodic_vector.tolist(),
+                "key_vectors": [kv.tolist() for kv in s.key_vectors],
+                "value_vectors": [vv.tolist() for vv in s.value_vectors],
+            })
+        for kb in self.knowledge_base:
+            data["knowledge_base"].append({
+                "q": kb["q"], "a": kb["a"], "emb": kb["emb"].tolist(), "time": kb["time"]
+            })
 
-            tmp = filename + ".tmp"
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, filename)  # атомарная замена -- уже было так и раньше, оставляем
-            print(f"[Сохранено] {filename}")
+        tmp = filename + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, filename)
+        print(f"[Сохранено] {filename}")
 
     def load(self, filename: str = None):
-        with self.lock:  # ФИКС: блокировка
-            filename = filename or self._model_path
-            if not os.path.exists(filename):
-                print(f"Файл {filename} не найден, создаем новую модель.")
-                return
+        filename = filename or self._model_path
+        if not os.path.exists(filename):
+            print(f"Файл {filename} не найден, создаем новую модель.")
+            return
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"Ошибка загрузки: {e}")
+            return
+
+        self.dim = data["dim"]
+        self.step_counter = data["step_counter"]
+        self.coactivation_counter = defaultdict(int)
+        for k, v in data.get("coactivation_counter", {}).items():
             try:
-                with open(filename, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            except Exception as e:
-                print(f"Ошибка загрузки: {e}")
-                return
+                a, b = k.strip("()").split(",")
+                self.coactivation_counter[(int(a), int(b))] = v
+            except Exception:
+                pass
 
-            self.dim = data["dim"]
-            self.step_counter = data["step_counter"]
-            self.coactivation_counter = defaultdict(int)
-            for k, v in data.get("coactivation_counter", {}).items():
-                try:
-                    a, b = k.strip("()").split(",")
-                    self.coactivation_counter[(int(a), int(b))] = v
-                except Exception:
-                    pass
+        self.neurons.clear()
+        self.synapses.clear()
+        self.edge_index.clear()
+        self.concept_index.clear()
+        self.knowledge_base.clear()
 
-            self.neurons.clear()
-            self.synapses.clear()
-            self.edge_index.clear()
-            self.concept_index.clear()
-            self.knowledge_base.clear()
+        for nd in data["neurons"]:
+            n = Neuron(embedding=np.array(nd["embedding"]), cluster=nd["cluster"],
+                       layer=nd.get("layer", 0), importance=nd["importance"], energy=nd["energy"])
+            n.id = nd["id"]
+            n.label = nd["label"]
+            n.utility_score = nd.get("utility_score", 0.0)
+            self.neurons[n.id] = n
+            if n.cluster == 'output' and n.label:
+                self.concept_index[self.normalize_text(n.label)] = n.id
 
-            max_seen_id = 0
-            for nd in data["neurons"]:
-                n = Neuron(embedding=np.array(nd["embedding"]), cluster=nd["cluster"],
-                           layer=nd.get("layer", 0), importance=nd["importance"], energy=nd["energy"])
-                n.id = nd["id"]
-                n.label = nd["label"]
-                n.utility_score = nd.get("utility_score", 0.0)
-                self.neurons[n.id] = n
-                max_seen_id = max(max_seen_id, n.id)
-                if n.cluster == 'output' and n.label:
-                    self.concept_index[self.normalize_text(n.label)] = n.id
+        for sd in data["synapses"]:
+            s = Synapse(
+                sd["from"], sd["to"], weight=sd["weight"],
+                plasticity=sd["plasticity"], confidence=sd["confidence"],
+                frequency=sd["frequency"], energy=sd["energy"],
+                context_vector=np.array(sd["context_vector"]),
+                semantic_vector=np.array(sd["semantic_vector"]),
+                episodic_vector=np.array(sd["episodic_vector"]),
+                is_inhibitory=sd.get("is_inhibitory", False)
+            )
+            s.id = sd["id"]
+            s.reward = sd["reward"]
+            s.usage_count = sd.get("usage_count", 0)
+            if "key_vectors" in sd:
+                s.key_vectors = [np.array(kv) for kv in sd["key_vectors"]]
+            if "value_vectors" in sd:
+                s.value_vectors = [np.array(vv) for vv in sd["value_vectors"]]
+            self.synapses[s.id] = s
+            self.edge_index[(sd["from"], sd["to"])] = s.id
+            if sd["from"] in self.neurons:
+                self.neurons[sd["from"]].add_outgoing(s.id)
+            if sd["to"] in self.neurons:
+                self.neurons[sd["to"]].add_incoming(s.id)
 
-            for sd in data["synapses"]:
-                s = Synapse(
-                    sd["from"], sd["to"], weight=sd["weight"],
-                    plasticity=sd["plasticity"], confidence=sd["confidence"],
-                    frequency=sd["frequency"], energy=sd["energy"],
-                    context_vector=np.array(sd["context_vector"]),
-                    semantic_vector=np.array(sd["semantic_vector"]),
-                    episodic_vector=np.array(sd["episodic_vector"]),
-                    is_inhibitory=sd.get("is_inhibitory", False)
-                )
-                s.id = sd["id"]
-                s.reward = sd["reward"]
-                s.usage_count = sd.get("usage_count", 0)
-                if "key_vectors" in sd:
-                    s.key_vectors = [np.array(kv) for kv in sd["key_vectors"]]
-                if "value_vectors" in sd:
-                    s.value_vectors = [np.array(vv) for vv in sd["value_vectors"]]
-                self.synapses[s.id] = s
-                self.edge_index[(sd["from"], sd["to"])] = s.id
-                max_seen_id = max(max_seen_id, s.id)
-                if sd["from"] in self.neurons:
-                    self.neurons[sd["from"]].add_outgoing(s.id)
-                if sd["to"] in self.neurons:
-                    self.neurons[sd["to"]].add_incoming(s.id)
+        for kb in data.get("knowledge_base", []):
+            self.knowledge_base.append({
+                "q": kb["q"], "a": kb["a"], "emb": np.array(kb["emb"]), "time": kb["time"]
+            })
 
-            for kb in data.get("knowledge_base", []):
-                self.knowledge_base.append({
-                    "q": kb["q"], "a": kb["a"], "emb": np.array(kb["emb"]), "time": kb["time"]
-                })
-
-            # ФИКС: восстанавливаем счётчик ID так, чтобы новые нейроны/синапсы
-            # никогда не пересекались с загруженными. Приоритет -- сохранённое
-            # значение next_id (если файл новой версии), иначе -- максимум
-            # увиденных ID + 1 (обратная совместимость со старыми файлами).
-            saved_next_id = data.get("next_id")
-            if saved_next_id is not None:
-                self._next_id = max(saved_next_id, max_seen_id + 1)
-            else:
-                self._next_id = max_seen_id + 1
-
-            print(f"[Загружено] {filename} - нейронов: {len(self.neurons)}, синапсов: {len(self.synapses)}, "
-                  f"понятий: {len(self.concept_index)}, фактов: {len(self.knowledge_base)}, "
-                  f"next_id: {self._next_id}")
+        print(f"[Загружено] {filename} - нейронов: {len(self.neurons)}, синапсов: {len(self.synapses)}, "
+              f"понятий: {len(self.concept_index)}, фактов: {len(self.knowledge_base)}")
 
 
     # Внутри класса Brain:
@@ -1471,7 +1303,7 @@ class Brain:
         # Используем LLM для извлечения ключевых тем
         prompt = f"На основе следующих вопросов пользователя: '{combined}', предложи {limit} кратких тем для продолжения диалога (каждая тема одной фразой или словом, разделённых запятой)."
         try:
-            resp = self.llm_client.chat.completions.create(
+            resp = client.chat.completions.create(
                 model="local-model",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=50,
@@ -1501,7 +1333,7 @@ class Brain:
         # Используем LLM для извлечения ключевых тем (существительные, фразы)
         prompt = f"Из текста: '{combined}' выдели {limit} главных тем (существительные или короткие фразы), разделённых запятой. Только темы, без пояснений."
         try:
-            resp = self.llm_client.chat.completions.create(
+            resp = client.chat.completions.create(
                 model="local-model",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=30,
@@ -1579,7 +1411,7 @@ class Brain:
         )
 
         try:
-            resp = self.llm_client.chat.completions.create(
+            resp = client.chat.completions.create(
                 model="local-model",
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -1620,9 +1452,7 @@ class Brain:
 # Класс Teacher (без изменений)
 # ============================
 class Teacher:
-    def __init__(self, llm_client: Optional[OpenAI] = None):
-        # ФИКС: реально используем переданный клиент вместо игнорируемого параметра
-        self.llm_client = llm_client or client
+    def __init__(self):
         self.system_prompt = (
             "Ты - критический эксперт. Оцени ответ ассистента на вопрос пользователя.\n"
             "Оценка: число от 0 до 1 (0 - полный бред, 1 - идеально).\n"
@@ -1637,7 +1467,7 @@ class Teacher:
             {"role": "user", "content": f"Вопрос: {question}\nОтвет: {brain_answer}\nОценка:"}
         ]
         try:
-            response = self.llm_client.chat.completions.create(
+            response = client.chat.completions.create(
                 model="local-model", messages=messages, max_tokens=100, temperature=0.2,
             )
             raw = response.choices[0].message.content.strip()
