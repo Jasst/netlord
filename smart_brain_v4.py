@@ -812,6 +812,7 @@ class Brain:
             "Если есть релевантные факты из памяти - используй их. "
             "Если фактов нет - отвечай на основе общих знаний. "
             "Ответ должен быть связным и развернутым (1-3 предложения)."
+            "Если ответ должен содержать код не ограничивайся напиши полностью развернутый ответ"
         )
 
         context_parts = []
@@ -836,7 +837,7 @@ class Brain:
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_prompt}
                 ],
-                max_tokens=256,
+                max_tokens=2048,
                 temperature=temperature,
             )
             answer_text = response.choices[0].message.content.strip()
