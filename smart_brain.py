@@ -8,6 +8,15 @@ import zlib
 from collections import defaultdict, deque
 from typing import List, Dict, Set, Tuple, Optional, Any
 import copy
+from openai import OpenAI
+
+# ============================
+# Настройка подключения к LM Studio
+# ============================
+client = OpenAI(
+    base_url="http://192.168.0.13:1234/v1",
+    api_key="not-needed",  # LM Studio не требует ключа
+)
 
 # ============================
 # Вспомогательные функции
@@ -45,14 +54,15 @@ class Signal:
         return f"Signal(id={self.id}, source={self.source}, dest={self.destination}, energy={self.energy:.2f})"
 
 # ============================
-# Класс Synapse
+# Класс Synapse (с поддержкой отрицательных весов)
 # ============================
 class Synapse:
     def __init__(self, from_neuron, to_neuron, weight: float = 0.1, plasticity: float = 0.5,
                  confidence: float = 0.1, frequency: float = 0.0, energy: float = 1.0,
                  context_vector: Optional[np.ndarray] = None,
                  semantic_vector: Optional[np.ndarray] = None,
-                 episodic_vector: Optional[np.ndarray] = None):
+                 episodic_vector: Optional[np.ndarray] = None,
+                 is_inhibitory: bool = False):
         self.id = id(self)
         self.from_neuron = from_neuron
         self.to_neuron = to_neuron
@@ -70,10 +80,11 @@ class Synapse:
         self.reward = 0.0
         self.prediction_error = 0.0
         self.history = []
+        self.is_inhibitory = is_inhibitory
 
     def update(self, delta_weight: float, delta_plasticity: float = 0.0,
                delta_confidence: float = 0.0, delta_frequency: float = 0.0):
-        self.weight = float(np.clip(self.weight + delta_weight, 0.0, 2.0))
+        self.weight = float(np.clip(self.weight + delta_weight, -2.0, 2.0))
         self.plasticity = float(np.clip(self.plasticity + delta_plasticity, 0.0, 1.0))
         self.confidence = float(np.clip(self.confidence + delta_confidence, 0.0, 1.0))
         self.frequency += delta_frequency
@@ -82,20 +93,23 @@ class Synapse:
         self.energy = min(1.0, self.energy + 0.01)
 
     def decay(self, decay_rate: float = 0.001):
-        self.weight = max(0.0, self.weight - decay_rate)
+        if self.weight > 0:
+            self.weight = max(0.0, self.weight - decay_rate)
+        elif self.weight < 0:
+            self.weight = min(0.0, self.weight + decay_rate)
         self.confidence = max(0.0, self.confidence - decay_rate * 0.5)
         self.energy = max(0.0, self.energy - decay_rate * 0.2)
         self.frequency *= 0.999
 
     def is_dead(self, weight_threshold=0.01, max_age_seconds=3600*24*30) -> bool:
-        if self.weight < weight_threshold and (time.time() - self.last_used) > max_age_seconds:
+        if abs(self.weight) < weight_threshold and (time.time() - self.last_used) > max_age_seconds:
             return True
         if self.usage_count == 0 and (time.time() - self.creation_time) > max_age_seconds:
             return True
         return False
 
     def __repr__(self):
-        return f"Synapse(id={self.id}, {self.from_neuron}->{self.to_neuron}, w={self.weight:.3f})"
+        return f"Synapse(id={self.id}, {self.from_neuron}->{self.to_neuron}, w={self.weight:.3f}, inhib={self.is_inhibitory})"
 
 # ============================
 # Класс Neuron
@@ -130,6 +144,7 @@ class Neuron:
             self.outgoing_synapses.append(synapse_id)
 
     def receive_signal(self, signal: Signal, synapse_weight: float):
+        # отрицательный вес уменьшает потенциал
         self.potential += signal.energy * synapse_weight * signal.importance
         sim = cosine_similarity(self.embedding, signal.embedding)
         self.potential += sim * 0.1
@@ -187,7 +202,7 @@ class LongMemory(Memory):
         super().__init__(max_size=1000000)
 
 # ============================
-# Главный класс Brain
+# Класс Brain (доработанный)
 # ============================
 class Brain:
     def __init__(self, dim_embedding: int = 64, input_neurons: int = 30, output_neurons: int = 30,
@@ -216,6 +231,7 @@ class Brain:
         self._learn_counter = 0
         self._model_path = model_path
 
+        # Инициализация нейронов
         for _ in range(input_neurons):
             n = Neuron(embedding=random_vector(self.dim), cluster='input')
             self.neurons[n.id] = n
@@ -253,7 +269,7 @@ class Brain:
 
     # -------------------- Управление синапсами/нейронами --------------------
     def _create_synapse(self, from_id: int, to_id: int, weight: float = None,
-                        context_vec: np.ndarray = None) -> Optional[int]:
+                        context_vec: np.ndarray = None, is_inhibitory: bool = False) -> Optional[int]:
         if from_id not in self.neurons or to_id not in self.neurons:
             return None
         key = (from_id, to_id)
@@ -267,7 +283,8 @@ class Brain:
         syn = Synapse(from_id, to_id, weight=weight,
                       context_vector=context_vec,
                       semantic_vector=random_vector(self.dim),
-                      episodic_vector=random_vector(self.dim))
+                      episodic_vector=random_vector(self.dim),
+                      is_inhibitory=is_inhibitory)
         self.synapses[syn.id] = syn
         self.edge_index[key] = syn.id
         self.neurons[from_id].add_outgoing(syn.id)
@@ -324,9 +341,10 @@ class Brain:
                 syn_id = self.edge_index.get((a, b)) or self.edge_index.get((b, a))
                 if syn_id is not None and syn_id in self.synapses:
                     syn = self.synapses[syn_id]
-                    delta = 0.01 * (1.0 - min(1.0, syn.weight))
-                    syn.update(delta_weight=delta, delta_plasticity=0.001, delta_confidence=0.001, delta_frequency=0.001)
-                    syn.energy = min(1.0, syn.energy + 0.01)
+                    if not syn.is_inhibitory:
+                        delta = 0.01 * (1.0 - min(1.0, syn.weight))
+                        syn.update(delta_weight=delta, delta_plasticity=0.001, delta_confidence=0.001, delta_frequency=0.001)
+                        syn.energy = min(1.0, syn.energy + 0.01)
                 else:
                     pair = tuple(sorted((a, b)))
                     self.coactivation_counter[pair] += 1
@@ -361,7 +379,7 @@ class Brain:
         for sid in to_remove:
             self._remove_synapse(sid)
 
-    # -------------------- Распространение сигнала --------------------
+    # -------------------- Распространение сигнала (исправлено) --------------------
     def propagate_signal(self, input_signal: Signal, max_steps: int = 15) -> List[int]:
         self.working_memory.add(input_signal)
 
@@ -392,13 +410,16 @@ class Brain:
                 activated.append(nid)
                 for syn_id in neuron.outgoing_synapses:
                     syn = self.synapses.get(syn_id)
-                    if syn is None or syn.weight < 0.01:
+                    if syn is None or abs(syn.weight) < 0.01:
+                        continue
+                    # ИСПРАВЛЕНИЕ: тормозные синапсы не создают новые сигналы
+                    if syn.weight < 0:
                         continue
                     target = self.neurons.get(syn.to_neuron)
                     if target is None or target.energy < 0.2:
                         continue
                     new_signal = copy.deepcopy(input_signal)
-                    new_signal.energy *= syn.weight
+                    new_signal.energy *= syn.weight  # теперь только положительные
                     new_signal.source = nid
                     new_signal.destination = syn.to_neuron
                     new_signal.confidence = syn.confidence
@@ -439,12 +460,12 @@ class Brain:
                 neuron.importance += reward * 0.02
                 for syn_id in neuron.incoming_synapses:
                     syn = self.synapses.get(syn_id)
-                    if syn:
+                    if syn and not syn.is_inhibitory:
                         syn.reward += reward
                         syn.update(delta_weight=reward * 0.005, delta_confidence=reward * 0.005)
                 for syn_id in neuron.outgoing_synapses:
                     syn = self.synapses.get(syn_id)
-                    if syn:
+                    if syn and not syn.is_inhibitory:
                         syn.reward += reward
                         syn.update(delta_weight=reward * 0.005, delta_confidence=reward * 0.005)
 
@@ -505,8 +526,9 @@ class Brain:
     def get_or_create_output_neuron(self, word: str) -> int:
         return self.get_or_create_concept_neuron(word)
 
-    # -------------------- Обучение пары --------------------
+    # -------------------- Обучение с положительным и отрицательным подкреплением --------------------
     def learn_pair(self, input_text: str, output_text: str, reinforce_boost: float = 0.12):
+        """Положительное обучение – укрепляем связь."""
         input_norm = input_text.strip().lower()
         output_norm = output_text.strip().lower()
         if input_norm == output_norm:
@@ -540,8 +562,40 @@ class Brain:
 
         self.step(sig, target_neuron_id=output_id)
 
-        print(f"Обучение: «{input_text}» → «{output_text}» (вес связи: {syn.weight:.3f}, "
-              f"повторений: {syn.usage_count})")
+        print(f"[+] Положительное обучение: «{input_text}» → «{output_text}» (вес: {syn.weight:.3f}, повторов: {syn.usage_count})")
+
+        self._learn_counter += 1
+        if self._learn_counter % self.AUTO_SAVE_EVERY == 0:
+            self.save(self._model_path)
+            print(f"[Автосохранение] Модель сохранена в {self._model_path}")
+
+    def learn_negative_pair(self, input_text: str, output_text: str, penalty: float = 0.15):
+        """
+        Отрицательное обучение – ослабляем связь или создаём тормозную.
+        """
+        input_norm = input_text.strip().lower()
+        output_norm = output_text.strip().lower()
+        if input_norm == output_norm:
+            return
+
+        input_id = self.get_or_create_concept_neuron(input_text)
+        output_id = self.get_or_create_concept_neuron(output_text)
+
+        syn_id = self.edge_index.get((input_id, output_id))
+        if syn_id is not None and syn_id in self.synapses:
+            syn = self.synapses[syn_id]
+            new_weight = syn.weight - penalty
+            if new_weight < -2.0:
+                new_weight = -2.0
+            syn.update(delta_weight=new_weight - syn.weight)
+            if syn.weight < 0:
+                syn.is_inhibitory = True
+            print(f"[-] Отрицательное обучение: уменьшен вес связи «{input_text}» → «{output_text}» до {syn.weight:.3f}")
+        else:
+            weight = -random.uniform(0.1, 0.3)
+            syn_id = self._create_synapse(input_id, output_id, weight=weight, is_inhibitory=True)
+            syn = self.synapses[syn_id]
+            print(f"[-] Отрицательное обучение: создан тормозной синапс «{input_text}» → «{output_text}» (вес: {syn.weight:.3f})")
 
         self._learn_counter += 1
         if self._learn_counter % self.AUTO_SAVE_EVERY == 0:
@@ -566,30 +620,23 @@ class Brain:
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates[:top_k]
 
-    # -------------------- Случайное понятие (НОВОЕ) --------------------
+    # -------------------- Случайное понятие --------------------
     def get_random_concept(self) -> Optional[str]:
-        """Возвращает случайное понятие (метку) из всех output-нейронов."""
         output_neurons = [n for n in self.neurons.values() if n.cluster == 'output' and n.label]
         if not output_neurons:
             return None
         return random.choice(output_neurons).label
 
-    # -------------------- Генерация ответа (с temperature и mode) --------------------
+    # -------------------- Генерация ответа --------------------
     def generate_answer(self, input_text: str, max_hops: int = 6,
                         min_weight: float = 0.02, temperature: float = 0.0,
                         mode: str = 'chain') -> Dict[str, Any]:
-        """
-        Генерирует цепочку ассоциаций.
-        mode: 'chain' - строит цепочку от запроса
-              'random' - возвращает случайное понятие из всей сети
-        """
         if mode == 'random':
             concept = self.get_random_concept()
             if concept is None:
                 return {"chain": [], "text": "В сети пока нет выученных понятий.", "known": False, "fallback": False}
             return {"chain": [concept], "text": concept, "known": True, "fallback": False}
 
-        # --- chain mode (оригинальный код) ---
         normalized = input_text.strip().lower()
         if not normalized:
             return {"chain": [], "text": "Пустой запрос.", "known": False, "fallback": False}
@@ -626,6 +673,8 @@ class Brain:
                 if target is None or target.cluster != 'output' or not target.label:
                     continue
                 if syn.to_neuron in visited:
+                    continue
+                if syn.weight <= 0:
                     continue
                 score = syn.weight + syn.confidence * 0.1
                 if score >= min_weight:
@@ -669,14 +718,15 @@ class Brain:
             target = self.neurons.get(syn.to_neuron)
             if target is None or not target.label:
                 continue
-            links.append((target.label, syn.weight, syn.usage_count, syn.confidence))
+            links.append((target.label, syn.weight, syn.usage_count, syn.confidence, syn.is_inhibitory))
         links.sort(key=lambda x: x[1], reverse=True)
         if not links:
             print(f"У «{text}» пока нет исходящих связей.")
             return
         print(f"Связи «{text}»:")
-        for label, weight, count, conf in links[:top_k]:
-            print(f"  → {label}   (вес={weight:.3f}, повторов={count}, уверенность={conf:.2f})")
+        for label, weight, count, conf, inhib in links[:top_k]:
+            inhib_str = " (тормозная)" if inhib else ""
+            print(f"  → {label}   (вес={weight:.3f}, повторов={count}, уверенность={conf:.2f}){inhib_str}")
 
     # -------------------- Сон --------------------
     def sleep(self, duration_steps: int = 10):
@@ -740,6 +790,7 @@ class Brain:
                 "context_vector": s.context_vector.tolist(),
                 "semantic_vector": s.semantic_vector.tolist(),
                 "episodic_vector": s.episodic_vector.tolist(),
+                "is_inhibitory": s.is_inhibitory,
             })
         tmp_filename = filename + ".tmp"
         with open(tmp_filename, 'w', encoding='utf-8') as f:
@@ -802,6 +853,7 @@ class Brain:
                 context_vector=np.array(sd["context_vector"]) if "context_vector" in sd else None,
                 semantic_vector=np.array(sd["semantic_vector"]) if "semantic_vector" in sd else None,
                 episodic_vector=np.array(sd["episodic_vector"]) if "episodic_vector" in sd else None,
+                is_inhibitory=sd.get("is_inhibitory", False)
             )
             s.id = sd["id"]
             s.reward = sd["reward"]
@@ -818,144 +870,126 @@ class Brain:
               f"понятий: {len(self.concept_index)})")
 
 # ============================
-# Интерактивный режим (с поддержкой температуры и режима)
+# Класс Teacher – оценка ответов через LLM (исправлен)
 # ============================
-def interactive_mode(brain: Brain):
-    current_temperature = 0.0
-    current_mode = 'chain'   # 'chain' или 'random'
+class Teacher:
+    def __init__(self):
+        self.system_prompt = (
+            "Ты — строгий, но справедливый учитель. Твоя задача — оценить ответ, данный нейросетью на вопрос пользователя.\n"
+            "Оцени ответ по шкале от 0 до 1, где 0 — совершенно неверно, 1 — идеально правильно.\n"
+            "Также, если ответ можно улучшить, предложи свой улучшенный вариант (коротко, 1–3 слова или фразу).\n"
+            "Формат вывода: <оценка>|<улучшенный ответ>\n"
+            "Например: 0.8|звезда\n"
+            "Если ответ уже хорош, просто укажи высокую оценку и повтори его."
+        )
 
-    print("\n=== Интерактивный режим ===")
-    print("Введите слово или фразу — сеть сгенерирует цепочку ассоциаций.")
+    def evaluate(self, question: str, brain_answer: str) -> Tuple[float, str]:
+        """
+        Отправляет запрос к LLM и возвращает оценку (0..1) и улучшенный ответ.
+        """
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": f"Вопрос: {question}\nОтвет нейросети: {brain_answer}\nОценка и улучшенный ответ:"}
+        ]
+        try:
+            response = client.chat.completions.create(
+                model="local-model",  # LM Studio использует эту модель
+                messages=messages,
+                max_tokens=100,
+                temperature=0.3,
+            )
+            raw = response.choices[0].message.content.strip()
+            # Парсим: ищем число с плавающей точкой и текст после разделителя
+            score = 0.5
+            improved = brain_answer
+            # Ищем число в начале или после "оценка"
+            match_num = re.search(r'(\d+\.?\d*)', raw)
+            if match_num:
+                score = float(match_num.group(1))
+                # Убираем число и разделитель, остальное считаем улучшенным ответом
+                rest = raw.replace(match_num.group(1), '').strip()
+                if rest.startswith('|'):
+                    rest = rest[1:].strip()
+                if rest:
+                    improved = rest
+                else:
+                    improved = brain_answer
+            else:
+                # Если числа нет, возможно LLM выдала только текст
+                # тогда считаем оценку 0.5, а ответ берём как улучшенный
+                improved = raw
+            score = max(0.0, min(1.0, score))
+            return score, improved
+        except Exception as e:
+            print(f"Ошибка при оценке LLM: {e}")
+            return 0.5, brain_answer
+
+# ============================
+# Интерактивный режим с учителем
+# ============================
+def interactive_with_teacher(brain: Brain):
+    teacher = Teacher()
+    print("\n=== Интерактивный режим с учителем (LM Studio) ===")
+    print("Введите вопрос, Brain ответит, учитель оценит и обучит.")
     print("Команды:")
-    print("  learn <фраза1> => <фраза2>  – выучить связь (разделитель: =>, -> или --)")
-    print("  links <фраза>               – показать связи понятия")
-    print("  stats                       – статистика сети")
-    print("  save                        – сохранить модель")
-    print("  load                        – перезагрузить модель")
-    print("  sleep                       – запустить 'сон'")
-    print("  set_temp <значение>         – установить температуру (0 = детерм., >0 = случайность)")
-    print("  set_mode <chain|random>     – установить режим генерации")
-    print("  random                      – получить случайное понятие (однократно)")
-    print("  help                        – показать команды")
-    print("  exit                        – сохранить и выйти")
+    print("  stats   – статистика")
+    print("  save    – сохранить модель")
+    print("  sleep   – запустить 'сон'")
+    print("  exit    – сохранить и выйти")
+    print("  (любой другой текст – вопрос)")
 
     try:
         while True:
-            text = input("\n> ").strip()
-            if not text:
+            user_input = input("\n> ").strip()
+            if not user_input:
                 continue
 
-            lower_text = text.lower()
-
-            if lower_text == 'exit':
+            lower = user_input.lower()
+            if lower == 'exit':
                 brain.save()
                 print("Выход.")
                 break
-
-            if lower_text == 'help':
-                print("Команды:")
-                print("  learn <фраза1> => <фраза2>")
-                print("  links <фраза>")
-                print("  stats | save | load | sleep | set_temp | set_mode | random | exit")
-                continue
-
-            if lower_text.startswith('learn '):
-                rest = text[len('learn '):]
-                found_sep = False
-                for sep in ('=>', '->', '--'):
-                    if sep in rest:
-                        in_phrase, out_phrase = rest.split(sep, 1)
-                        in_phrase, out_phrase = in_phrase.strip(), out_phrase.strip()
-                        if in_phrase and out_phrase:
-                            brain.learn_pair(in_phrase, out_phrase)
-                        else:
-                            print("Использование: learn <фраза1> => <фраза2>")
-                        found_sep = True
-                        break
-                if not found_sep:
-                    print("Использование: learn <фраза1> => <фраза2>")
-                continue
-
-            if lower_text.startswith('links '):
-                query = text[len('links '):].strip()
-                brain.show_links(query)
-                continue
-
-            if lower_text == 'stats':
+            if lower == 'stats':
                 ic = sum(1 for n in brain.neurons.values() if n.cluster == 'input')
                 oc = sum(1 for n in brain.neurons.values() if n.cluster == 'output')
                 hc = sum(1 for n in brain.neurons.values() if n.cluster == 'hidden')
                 print(f"Нейронов: {len(brain.neurons)} (input: {ic}, output/понятия: {oc}, hidden: {hc})")
                 print(f"Синапсов: {len(brain.synapses)}")
-                print(f"Выученных понятий с именем: {len(brain.concept_index)}")
-                print(f"Текущая температура: {current_temperature}")
-                print(f"Текущий режим: {current_mode}")
+                print(f"Выученных понятий: {len(brain.concept_index)}")
                 continue
-
-            if lower_text == 'save':
+            if lower == 'save':
                 brain.save()
                 continue
-
-            if lower_text == 'load':
-                brain.load()
-                continue
-
-            if lower_text == 'sleep':
+            if lower == 'sleep':
                 brain.sleep(duration_steps=5)
                 continue
 
-            if lower_text == 'random':
-                result = brain.generate_answer("", mode='random')
-                print(f"Случайный ответ: {result['text']}")
-                continue
+            # Генерация ответа Brain со случайной температурой
+            temp = random.uniform(0.2, 1.0)
+            print(f"Температура: {temp:.2f}")
+            result = brain.generate_answer(user_input, temperature=temp, mode='chain')
+            brain_answer = result['text']
+            print(f"Brain: {brain_answer}")
 
-            if lower_text.startswith('set_temp '):
-                try:
-                    val = float(text[len('set_temp '):].strip())
-                    if val < 0:
-                        print("Температура не может быть отрицательной, установлена 0.0")
-                        val = 0.0
-                    current_temperature = val
-                    print(f"Температура установлена на {current_temperature}")
-                except ValueError:
-                    print("Ошибка: введите число (например, 0.5)")
-                continue
+            # Оценка учителем
+            score, improved = teacher.evaluate(user_input, brain_answer)
+            print(f"Оценка учителя: {score:.2f}, улучшенный ответ: {improved}")
 
-            if lower_text.startswith('set_mode '):
-                mode = text[len('set_mode '):].strip().lower()
-                if mode in ('chain', 'random'):
-                    current_mode = mode
-                    print(f"Режим генерации установлен на '{current_mode}'")
+            # Принимаем решение об обучении
+            if score >= 0.7:
+                if improved and improved.lower() != brain_answer.lower() and improved.lower() != user_input.lower():
+                    brain.learn_pair(user_input, improved)
                 else:
-                    print("Допустимые режимы: chain, random")
-                continue
-
-            # Обычный запрос – генерация ответа с учётом температуры и режима
-            result = brain.generate_answer(text, temperature=current_temperature, mode=current_mode)
-            print(f"Ответ: {result['text']}")
-
-            if not result["known"]:
-                print("Введите правильное продолжение (или Enter, чтобы пропустить):")
-                correct = input("> ").strip()
-                if correct and correct.lower() != text.lower():
-                    brain.learn_pair(text, correct)
-                continue
-
-            print("Это верно/полезно? (да / нет / свой вариант продолжения)")
-            response = input("> ").strip()
-            if response.lower() == 'да':
-                if len(result["chain"]) > 1:
-                    brain.learn_pair(text, result["chain"][1])
+                    brain.learn_pair(user_input, brain_answer)
+            elif score <= 0.3:
+                if improved and improved.lower() != brain_answer.lower() and improved.lower() != user_input.lower():
+                    brain.learn_negative_pair(user_input, brain_answer)
+                    brain.learn_pair(user_input, improved)
                 else:
-                    print("Пока нечего укреплять — у ответа нет продолжения.")
-            elif response.lower() == 'нет':
-                print("Введите правильный ответ/продолжение:")
-                correct = input("> ").strip()
-                if correct and correct.lower() != text.lower():
-                    brain.learn_pair(text, correct)
+                    brain.learn_negative_pair(user_input, brain_answer)
             else:
-                if response and response.lower() != text.lower():
-                    brain.learn_pair(text, response)
+                print("Оценка нейтральная – обучение пропущено.")
+
     except (KeyboardInterrupt, EOFError):
         print("\nПрерывание — сохраняю модель...")
     finally:
@@ -970,4 +1004,4 @@ if __name__ == "__main__":
     brain = Brain(dim_embedding=64, input_neurons=30, output_neurons=30, hidden_neurons=140,
                   model_path=MODEL_PATH)
     brain.load(MODEL_PATH)
-    interactive_mode(brain)
+    interactive_with_teacher(brain)
