@@ -199,6 +199,10 @@
             border-bottom-left-radius: 6px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.05);
         }
+        .message.bot.agent-question {
+            border-left: 4px solid #f39c12;
+            background: #fef9e7;
+        }
         .message .time {
             font-size: 11px;
             opacity: 0.7;
@@ -213,6 +217,25 @@
             display: inline-block;
             margin-top: 6px;
             color: #2c3e50;
+        }
+        .message.typing {
+            background: #e8eaed;
+            color: #555;
+            font-style: italic;
+            border: 1px solid #d0d7de;
+            border-bottom-left-radius: 6px;
+            min-width: 60px;
+            text-align: center;
+        }
+        .message.typing .dots::after {
+            content: '';
+            animation: dots 1.2s steps(3, end) infinite;
+        }
+        @keyframes dots {
+            0% { content: ''; }
+            33% { content: '.'; }
+            66% { content: '..'; }
+            100% { content: '...'; }
         }
 
         .input-area {
@@ -310,7 +333,27 @@
             <div id="factsList"><p style="color:#999; font-size:14px;">Факты появятся здесь после ответа.</p></div>
         </div>
 
-        <!-- Блок автообучения с полем "Эпохи" -->
+        <!-- Блок "Режим диалога" с настройкой задержки -->
+        <div class="train-section">
+            <h3>💬 Режим диалога</h3>
+            <label><input type="checkbox" id="allowClarifying" checked> Задавать уточняющие вопросы</label>
+            <label>Задержка перед вопросом (сек)</label>
+            <input type="range" id="clarifyingDelay" min="0.5" max="5" step="0.1" value="1.5">
+            <span id="delayDisplay">1.5</span> сек
+            <p style="font-size:12px; color:#666; margin-top:4px;">Если начнёте печатать, вопрос не появится.</p>
+        </div>
+
+        <!-- Блок управления интерактивным агентом (НОВЫЙ) -->
+        <div class="train-section">
+            <h3>🤖 Интерактивный агент</h3>
+            <label><input type="checkbox" id="interactiveMode"> Агент задаёт вопросы</label>
+            <label>Таймаут ответа (сек)</label>
+            <input type="number" id="userTimeout" value="30" min="5" max="120">
+            <button onclick="updateAgentInteractiveConfig()">Применить настройки</button>
+            <div class="log" id="interactiveLog">Интерактивный режим выключен.</div>
+        </div>
+
+        <!-- Блок автообучения на тему -->
         <div class="train-section">
             <h3>🤖 Автообучение на тему</h3>
             <label>Тема</label>
@@ -328,7 +371,7 @@
             <div class="log" id="trainLog">Готов к обучению.</div>
         </div>
 
-        <!-- Блок обучения пары -->
+        <!-- Блок обучения конкретной пары -->
         <div class="train-section">
             <h3>📝 Обучение конкретной пары</h3>
             <label>Вопрос</label>
@@ -339,6 +382,29 @@
             <input type="number" id="pairEpochs" min="1" max="20" value="3">
             <button onclick="trainPair()">🧠 Обучить пару</button>
             <div class="log" id="pairLog">Готов к обучению пары.</div>
+        </div>
+
+        <!-- Блок сна -->
+        <div class="train-section">
+            <h3>💤 Сон и консолидация</h3>
+            <p style="font-size:12px; color:#666; margin-bottom:6px;">Запуск сна удаляет шумовые нейроны, укрепляет синапсы и переносит память в долгосрочное хранилище.</p>
+            <button onclick="sleepBrain()">💤 Запустить сон</button>
+            <div class="log" id="sleepLog">Готов к запуску сна.</div>
+        </div>
+
+        <!-- Блок управления агентом-исследователем (существующий) -->
+        <div class="train-section">
+            <h3>🤖 Агент-исследователь</h3>
+            <p style="font-size:12px; color:#666; margin-bottom:6px;">Агент сам генерирует вопросы и обучает мозг новым фактам.</p>
+            <button id="agentToggleBtn" onclick="toggleAgent()">⏸ Остановить</button>
+            <label>Темы (через запятую)</label>
+            <input type="text" id="agentTopics" value="наука, природа, технологии, история, искусство, философия">
+            <label>Интервал (сек)</label>
+            <input type="number" id="agentInterval" value="120" min="10">
+            <label>Вопросов за цикл</label>
+            <input type="number" id="agentQCount" value="2" min="1" max="10">
+            <button onclick="updateAgentConfig()">⚙️ Обновить настройки</button>
+            <div class="log" id="agentLog">Агент активен.</div>
         </div>
     </div>
 
@@ -363,12 +429,100 @@
     let lastAnswer = '';
     let lastFacts = [];
 
+    // --- Управление задержкой и индикатором ---
+    let clarifyingTimeoutId = null;
+    let typingMessageId = null;
+
+    // --- Переменные для интерактивного агента ---
+    let pollIntervalId = null;
+    let interactiveMode = false;
+    let currentAgentQuestion = null;
+
+    // --- Элементы DOM ---
     const tempSlider = document.getElementById('tempSlider');
     const tempDisplay = document.getElementById('tempDisplay');
     tempSlider.addEventListener('input', function() {
         tempDisplay.textContent = parseFloat(tempSlider.value).toFixed(1);
     });
 
+    const delaySlider = document.getElementById('clarifyingDelay');
+    const delayDisplay = document.getElementById('delayDisplay');
+    delaySlider.addEventListener('input', function() {
+        delayDisplay.textContent = parseFloat(delaySlider.value).toFixed(1);
+    });
+
+    const questionInput = document.getElementById('questionInput');
+    questionInput.addEventListener('input', function() {
+        if (clarifyingTimeoutId) {
+            clearTimeout(clarifyingTimeoutId);
+            clarifyingTimeoutId = null;
+            if (typingMessageId) {
+                const typingEl = document.getElementById(typingMessageId);
+                if (typingEl) typingEl.remove();
+                typingMessageId = null;
+            }
+        }
+    });
+
+    // --- Чекбокс интерактивного режима ---
+    document.getElementById('interactiveMode').addEventListener('change', function() {
+        interactiveMode = this.checked;
+        if (interactiveMode) {
+            document.getElementById('interactiveLog').textContent = 'Интерактивный режим включён. Агент будет задавать вопросы.';
+            startPolling();
+        } else {
+            document.getElementById('interactiveLog').textContent = 'Интерактивный режим выключен.';
+            stopPolling();
+            currentAgentQuestion = null;
+        }
+        updateAgentInteractiveConfig();
+    });
+
+    function startPolling() {
+        if (pollIntervalId) return;
+        pollIntervalId = setInterval(async function() {
+            if (!interactiveMode) return;
+            try {
+                const res = await fetch('/agent/next_question');
+                const data = await res.json();
+                if (data.question) {
+                    currentAgentQuestion = data.question;
+                    addMessage('🤖 Агент спрашивает: ' + data.question, 'bot', null, true);
+                    document.getElementById('interactiveLog').textContent = 'Ожидается ваш ответ на вопрос агента.';
+                }
+            } catch(e) {
+                console.error('Polling error', e);
+            }
+        }, 5000); // опрос каждые 5 секунд
+    }
+
+    function stopPolling() {
+        if (pollIntervalId) {
+            clearInterval(pollIntervalId);
+            pollIntervalId = null;
+        }
+    }
+
+    async function updateAgentInteractiveConfig() {
+        const interactive = document.getElementById('interactiveMode').checked;
+        const timeout = parseInt(document.getElementById('userTimeout').value) || 30;
+        try {
+            const res = await fetch('/agent/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    interactive_mode: interactive,
+                    user_question_timeout: timeout
+                })
+            });
+            const data = await res.json();
+            console.log('Agent config updated:', data);
+        } catch(e) {
+            console.error('Error updating agent config:', e);
+        }
+    }
+
+    // --- Остальные функции (статистика, обучение, сон, агент-исследователь) ---
     let sidebarOpen = true;
     function toggleSidebar() {
         sidebarOpen = !sidebarOpen;
@@ -465,34 +619,148 @@
         }
     }
 
+    async function sleepBrain() {
+        logMessage('sleepLog', '⏳ Запуск сна...');
+        try {
+            const res = await fetch('/sleep', { method: 'POST' });
+            const data = await res.json();
+            if (res.ok) {
+                logMessage('sleepLog', '✅ Сон завершен. Модель оптимизирована.');
+                loadStats();
+            } else {
+                logMessage('sleepLog', '❌ Ошибка: ' + (data.detail || 'неизвестная'));
+            }
+        } catch(e) {
+            logMessage('sleepLog', '❌ Ошибка: ' + e.message);
+        }
+    }
+
+    // Управление агентом-исследователем (старый)
+    let agentRunning = true;
+    async function toggleAgent() {
+        const btn = document.getElementById('agentToggleBtn');
+        const action = agentRunning ? 'stop' : 'start';
+        try {
+            const res = await fetch('/agent/' + action, { method: 'POST' });
+            if (res.ok) {
+                agentRunning = !agentRunning;
+                btn.textContent = agentRunning ? '⏸ Остановить' : '▶️ Запустить';
+                logMessage('agentLog', 'Агент ' + (agentRunning ? 'запущен' : 'остановлен'));
+            } else {
+                logMessage('agentLog', '❌ Ошибка при переключении агента');
+            }
+        } catch(e) {
+            logMessage('agentLog', '❌ Ошибка: ' + e.message);
+        }
+    }
+
+    async function updateAgentConfig() {
+        const topics = document.getElementById('agentTopics').value.split(',').map(s => s.trim()).filter(Boolean);
+        const interval = parseInt(document.getElementById('agentInterval').value);
+        const qCount = parseInt(document.getElementById('agentQCount').value);
+        if (!topics.length || interval < 1 || qCount < 1) {
+            alert('Проверьте корректность настроек');
+            return;
+        }
+        try {
+            const res = await fetch('/agent/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ topics, interval, questions_per_cycle: qCount })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                logMessage('agentLog', '✅ Настройки обновлены: темы=' + data.topics.join(', ') + ', интервал=' + data.interval + 'с, вопросов=' + data.questions_per_cycle);
+            } else {
+                logMessage('agentLog', '❌ Ошибка: ' + (data.detail || 'неизвестная'));
+            }
+        } catch(e) {
+            logMessage('agentLog', '❌ Ошибка: ' + e.message);
+        }
+    }
+
+    // --- Отправка сообщения (основная функция) ---
     async function sendMessage() {
         var input = document.getElementById('questionInput');
-        var question = input.value.trim();
-        if (!question) return;
+        var text = input.value.trim();
+        if (!text) return;
         input.value = '';
 
-        addMessage(question, 'user');
+        // Если есть активный вопрос от агента, отправляем как ответ
+        if (interactiveMode && currentAgentQuestion) {
+            const q = currentAgentQuestion;
+            currentAgentQuestion = null;
+            document.getElementById('interactiveLog').textContent = 'Ответ отправлен агенту.';
+            try {
+                await fetch('/agent/submit_answer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ question: q, answer: text })
+                });
+                addMessage(text, 'user');
+                // Подтверждение обучения
+                addMessage('✅ Ответ принят и изучен.', 'bot', null, false);
+                loadStats();
+            } catch(e) {
+                addMessage('❌ Ошибка при отправке ответа: ' + e.message, 'bot');
+            }
+            return;
+        }
+
+        // Иначе обычный режим
+        addMessage(text, 'user');
         var sendBtn = document.getElementById('sendBtn');
         sendBtn.disabled = true;
 
         try {
             var temp = parseFloat(tempSlider.value);
+            var allowClarifying = document.getElementById('allowClarifying').checked;
+
             var res = await fetch('/ask', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ question: question, temperature: temp })
+                body: JSON.stringify({
+                    question: text,
+                    temperature: temp,
+                    allow_clarifying: allowClarifying
+                })
             });
             var data = await res.json();
             if (!res.ok) throw new Error(data.detail || 'Ошибка');
 
             var answer = data.answer || 'Нет ответа.';
-            lastQuestion = question;
+            lastQuestion = text;
             lastAnswer = answer;
             lastFacts = data.facts || [];
 
+            // Показываем основной ответ
             addMessage(answer, 'bot', lastFacts);
             renderFacts(lastFacts);
             loadStats();
+
+            // Если есть уточняющий вопрос и чекбокс включён – планируем показ с задержкой
+            if (data.clarifying_question && allowClarifying) {
+                var delay = parseFloat(delaySlider.value) * 1000;
+
+                var typingDiv = document.createElement('div');
+                typingDiv.className = 'message bot typing';
+                typingDiv.id = 'typing-' + Date.now();
+                typingDiv.innerHTML = '<span class="dots">печатает</span>';
+                document.getElementById('messages').appendChild(typingDiv);
+                typingMessageId = typingDiv.id;
+                var messagesContainer = document.getElementById('messages');
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+                clarifyingTimeoutId = setTimeout(function() {
+                    if (typingMessageId) {
+                        const typingEl = document.getElementById(typingMessageId);
+                        if (typingEl) typingEl.remove();
+                        typingMessageId = null;
+                    }
+                    addMessage('🤔 ' + data.clarifying_question, 'bot', null, true);
+                    clarifyingTimeoutId = null;
+                }, delay);
+            }
 
             document.getElementById('learnPosBtn').style.display = 'inline-block';
             document.getElementById('learnNegBtn').style.display = 'inline-block';
@@ -503,10 +771,13 @@
         }
     }
 
-    function addMessage(text, sender, facts) {
+    function addMessage(text, sender, facts, isAgentOrClarifying) {
         var container = document.getElementById('messages');
         var div = document.createElement('div');
         div.className = 'message ' + sender;
+        if (isAgentOrClarifying) {
+            div.classList.add('agent-question');
+        }
         var html = text;
         if (sender === 'bot' && facts && facts.length > 0) {
             html += '<div class="facts-indicator">📚 использовано фактов: ' + facts.length + '</div>';
@@ -517,6 +788,7 @@
         container.scrollTop = container.scrollHeight;
     }
 
+    // --- Обучение последней пары ---
     async function learnLastPair() {
         if (!lastQuestion || !lastAnswer) { alert('Нет пары для обучения.'); return; }
         await doLearn(lastQuestion, lastAnswer, 'positive');
@@ -550,18 +822,29 @@
         }
     }
 
-    // Глобальное присвоение
+    // Глобальные переменные для вызова из HTML
     window.sendMessage = sendMessage;
     window.loadStats = loadStats;
     window.trainTopic = trainTopic;
     window.trainPair = trainPair;
+    window.sleepBrain = sleepBrain;
     window.toggleSidebar = toggleSidebar;
     window.learnLastPair = learnLastPair;
     window.learnLastPairNeg = learnLastPairNeg;
     window.doLearn = doLearn;
+    window.toggleAgent = toggleAgent;
+    window.updateAgentConfig = updateAgentConfig;
+    window.updateAgentInteractiveConfig = updateAgentInteractiveConfig;
 
     loadStats();
     if (window.innerWidth < 768) toggleSidebar();
+
+    // Если интерактивный режим был включён при загрузке (по умолчанию выключен)
+    if (document.getElementById('interactiveMode').checked) {
+        interactiveMode = true;
+        startPolling();
+        document.getElementById('interactiveLog').textContent = 'Интерактивный режим включён.';
+    }
 </script>
 </body>
 </html>

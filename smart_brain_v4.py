@@ -11,6 +11,7 @@ from collections import defaultdict, deque
 from typing import List, Dict, Set, Tuple, Optional, Any
 from openai import OpenAI
 
+
 # ============================
 # Настройка подключения к LM Studio
 # ============================
@@ -333,6 +334,7 @@ class Brain:
                  max_synapses: int = 8000):
         if hidden_layers is None:
             hidden_layers = [100, 80, 60]
+        self.llm_client = client  # или llm_client, если передаёте извне
         self.dim = dim_embedding
         self.embedder = EmbeddingProvider(dim=dim_embedding)
         self.neurons: Dict[int, Neuron] = {}
@@ -1215,6 +1217,214 @@ class Brain:
         print(f"[Загружено] {filename} - нейронов: {len(self.neurons)}, синапсов: {len(self.synapses)}, "
               f"понятий: {len(self.concept_index)}, фактов: {len(self.knowledge_base)}")
 
+
+    # Внутри класса Brain:
+    def generate_context_question(self, user_input: str, answer: str,
+                                  history: List[Dict], facts: List[Dict]) -> Optional[str]:
+        """
+        Генерирует уточняющий/обобщающий вопрос на основе контекста.
+        Возвращает строку вопроса или None, если вопрос не нужен.
+        """
+        # Если фактов достаточно – можно пропустить
+        if len(facts) >= 3:
+            return None
+
+        # Формируем историю для промпта
+        history_text = ""
+        for turn in history[-3:]:
+            history_text += f"Пользователь: {turn['user']}\nАссистент: {turn['assistant']}\n"
+
+        system_prompt = (
+            "Ты – ассистент, который помогает пользователю уточнить или расширить его запрос. "
+            "На основе истории диалога и только что данного ответа, сформулируй один уточняющий, "
+            "разъясняющий или обобщающий вопрос, который поможет лучше понять, что именно нужно пользователю. "
+            "Вопрос должен быть естественным, вежливым, на русском языке. "
+            "Если уточнение не требуется – ответь 'НЕТ'."
+        )
+        user_prompt = (
+            f"История диалога (последние сообщения):\n{history_text}\n\n"
+            f"Вопрос пользователя: {user_input}\n"
+            f"Ответ ассистента: {answer}\n"
+            f"Найденные факты: {[f['q'] + ' -> ' + f['a'] for f in facts]}\n\n"
+            f"Уточняющий вопрос:"
+        )
+
+        try:
+            # Используем тот же llm_client, который уже есть в brain (или создаём, если нет)
+            # Важно: в brain должен быть self.llm_client, иначе добавить.
+            response = self.llm_client.chat.completions.create(
+                model="local-model",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=60,
+                temperature=0.6,
+            )
+            reply = response.choices[0].message.content.strip()
+            if reply.upper() == "НЕТ" or not reply:
+                return None
+            return reply
+        except Exception as e:
+            print(f"[ContextQ] Ошибка: {e}")
+            return None
+
+    def get_weak_concepts(self, threshold: float = 0.2, limit: int = 5) -> List[str]:
+        """Возвращает список понятий с низкой связностью (слабые знания)."""
+        weak = []
+        for nid, neuron in self.neurons.items():
+            if neuron.cluster == 'output' and neuron.label:
+                total = 0.0
+                count = 0
+                for syn_id in neuron.outgoing_synapses:
+                    syn = self.synapses.get(syn_id)
+                    if syn:
+                        total += abs(syn.weight)
+                        count += 1
+                avg = total / count if count > 0 else 0.0
+                if avg < threshold and count < 3:
+                    weak.append(neuron.label)
+        random.shuffle(weak)
+        return weak[:limit]
+
+    def suggest_next_topic(self, limit: int = 3) -> List[str]:
+        """
+        Анализирует историю диалога и предлагает темы для продолжения.
+        """
+        if not self.dialog_memory.items:
+            return []
+        # Берём последние 3 вопроса пользователя
+        last_questions = [turn.get("user", "") for turn in self.dialog_memory.items[-3:] if turn.get("user")]
+        if not last_questions:
+            return []
+        combined = " ".join(last_questions)
+        # Используем LLM для извлечения ключевых тем
+        prompt = f"На основе следующих вопросов пользователя: '{combined}', предложи {limit} кратких тем для продолжения диалога (каждая тема одной фразой или словом, разделённых запятой)."
+        try:
+            resp = client.chat.completions.create(
+                model="local-model",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50,
+                temperature=0.7
+            )
+            raw = resp.choices[0].message.content.strip()
+            topics = [t.strip() for t in raw.split(',') if t.strip()]
+            return topics[:limit]
+        except Exception as e:
+            print(f"[SuggestTopics] Ошибка: {e}")
+            return []
+
+    def get_recent_user_topics(self, limit: int = 3) -> List[str]:
+        """
+        Извлекает ключевые темы из последних сообщений пользователя.
+        Возвращает список существительных/фраз (до limit).
+        """
+        if not self.dialog_memory.items:
+            return []
+        user_messages = []
+        for turn in self.dialog_memory.items[-10:]:
+            if "user" in turn and turn["user"]:
+                user_messages.append(turn["user"])
+        if not user_messages:
+            return []
+        combined = " ".join(user_messages)
+        # Используем LLM для извлечения ключевых тем (существительные, фразы)
+        prompt = f"Из текста: '{combined}' выдели {limit} главных тем (существительные или короткие фразы), разделённых запятой. Только темы, без пояснений."
+        try:
+            resp = client.chat.completions.create(
+                model="local-model",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=30,
+                temperature=0.3,
+            )
+            raw = resp.choices[0].message.content.strip()
+            topics = [t.strip() for t in raw.split(',') if t.strip()]
+            return topics[:limit]
+        except Exception as e:
+            print(f"[Topics] Ошибка: {e}")
+            # fallback: просто берём слова из последнего сообщения
+            last_msg = user_messages[-1] if user_messages else ""
+            words = [w for w in last_msg.split() if len(w) > 3]
+            return words[:limit]
+
+    def get_uncertain_concepts(self, threshold: float = 0.3, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Находит понятия (выходные нейроны), у которых низкая уверенность или слабые связи.
+        Возвращает список словарей: {'label': str, 'score': float}
+        """
+        uncertain = []
+        for nid, neuron in self.neurons.items():
+            if neuron.cluster != 'output' or not neuron.label:
+                continue
+            # Вычисляем средний вес входящих синапсов (чем меньше, тем слабее понятие)
+            in_weights = []
+            for syn_id in neuron.incoming_synapses:
+                syn = self.synapses.get(syn_id)
+                if syn:
+                    in_weights.append(abs(syn.weight))
+            avg_in = sum(in_weights) / len(in_weights) if in_weights else 0.0
+
+            # Считаем количество исходящих связей
+            out_count = len(neuron.outgoing_synapses)
+
+            # Если мало входящих весов или мало исходящих связей – неопределённость
+            if avg_in < threshold or out_count < 2:
+                # Также учитываем частоту активации (usage_counter)
+                activation_freq = neuron.usage_counter / (neuron.age + 1) if neuron.age > 0 else 0
+                score = (1.0 - avg_in) * 0.5 + (1.0 - min(1.0, out_count / 5)) * 0.3 + (1.0 - activation_freq) * 0.2
+                uncertain.append({
+                    "label": neuron.label,
+                    "score": score,
+                    "avg_in": avg_in,
+                    "out_count": out_count,
+                    "activation_freq": activation_freq
+                })
+        uncertain.sort(key=lambda x: x["score"], reverse=True)
+        return uncertain[:limit]
+
+    def generate_contextual_question(self, user_topics: List[str], uncertain_concepts: List[Dict]) -> Optional[str]:
+        """
+        Генерирует вопрос, связывая темы пользователя и неопределённые понятия.
+        """
+        if not user_topics and not uncertain_concepts:
+            return None
+
+        # Строим промпт для LLM
+        topics_str = ", ".join(user_topics) if user_topics else "общая тема"
+        weak_str = ", ".join([c["label"] for c in uncertain_concepts[:3]]) if uncertain_concepts else "нет явных слабых мест"
+
+        system_prompt = (
+            "Ты — ассистент, который помогает пользователю углубиться в тему, но при этом "
+            "не перегружает его сложными вопросами. На основе интересов пользователя и "
+            "некоторых пробелов в твоих знаниях, сформулируй один естественный, уточняющий "
+            "или развивающий вопрос. Вопрос должен быть простым, понятным и не требовать "
+            "специальных знаний. Если удастся, свяжи тему пользователя с чем-то, что тебе "
+            "не совсем ясно. Ответь только вопросом, без пояснений."
+        )
+        user_prompt = (
+            f"Темы, которые интересовали пользователя: {topics_str}.\n"
+            f"Понятия, которые я знаю слабо: {weak_str}.\n"
+            f"Сформулируй один вопрос, который поможет мне лучше понять эту тему, "
+            f"а также прояснить слабые места. Вопрос должен быть интересным и не слишком сложным."
+        )
+
+        try:
+            resp = client.chat.completions.create(
+                model="local-model",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=50,
+                temperature=0.7,
+            )
+            question = resp.choices[0].message.content.strip()
+            if question and '?' in question:
+                return question
+            return None
+        except Exception as e:
+            print(f"[ContextualQ] Ошибка: {e}")
+            return None
 
 # ============================
 # Класс Teacher (без изменений)
