@@ -1426,6 +1426,26 @@ class Brain:
             print(f"[ContextualQ] Ошибка: {e}")
             return None
 
+    def save_dialog_history(self, filename: str = "dialog_history.json"):
+        """Сохраняет историю диалога в файл."""
+        data = []
+        for item in self.dialog_memory.items:
+            # Копируем, чтобы не было проблем с numpy
+            data.append({"user": item.get("user", ""), "assistant": item.get("assistant", ""), "time": item.get("time", 0)})
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def load_dialog_history(self, filename: str = "dialog_history.json"):
+        """Загружает историю диалога из файла."""
+        if os.path.exists(filename):
+            try:
+                with open(filename, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                for item in data:
+                    # Добавляем в память (DialogMemory.add ожидает словарь)
+                    self.dialog_memory.add(item)
+            except Exception as e:
+                print(f"Ошибка загрузки истории: {e}")
 # ============================
 # Класс Teacher (без изменений)
 # ============================

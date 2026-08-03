@@ -26,6 +26,8 @@ brain = Brain(
     max_synapses=8000
 )
 brain.load()
+# Загружаем историю диалога (если есть)
+brain.load_dialog_history()
 
 teacher = Teacher()
 llm_client = OpenAI(
@@ -34,13 +36,14 @@ llm_client = OpenAI(
 )
 
 # ============================================================
-#  Сохранение при завершении
+#  Сохранение при завершении (включая историю)
 # ============================================================
 def save_brain():
-    print("\n💾 Сохраняю модель перед завершением...")
+    print("\n💾 Сохраняю модель и историю перед завершением...")
     try:
         brain.save()
-        print("✅ Модель сохранена.")
+        brain.save_dialog_history()
+        print("✅ Модель и история сохранены.")
     except Exception as e:
         print(f"❌ Ошибка при сохранении: {e}")
 
@@ -53,7 +56,7 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# --- Инициализация агента (с интерактивным режимом по умолчанию выключен) ---
+# --- Инициализация агента ---
 agent = BrainAgent(
     brain=brain,
     teacher=teacher,
@@ -63,7 +66,7 @@ agent = BrainAgent(
     questions_per_cycle=2,
     temperature=0.7,
     enabled=True,
-    interactive_mode=False,          # по умолчанию выключен, включается через API
+    interactive_mode=False,
     user_question_timeout=30
 )
 agent.start()
@@ -101,7 +104,7 @@ class AgentConfigRequest(BaseModel):
     user_question_timeout: int = None
 
 # ============================================================
-# Вспомогательные функции (запомни/забудь) – без изменений
+# Вспомогательные функции (запомни/забудь)
 # ============================================================
 def normalize_text(text: str) -> str:
     return re.sub(r'\s+', ' ', text.strip().lower())
@@ -175,7 +178,7 @@ def handle_forget_command(text: str) -> tuple[bool, str]:
     return True, response_text
 
 # ============================================================
-# Функции автообучения (без изменений)
+# Функции автообучения
 # ============================================================
 def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float = 0.7) -> list:
     system_prompt = (
@@ -311,6 +314,8 @@ async def ask(req: AskRequest):
                 req.question, answer_text, history, result.get("facts", [])
             )
         brain.dialog_memory.add_turn(req.question, answer_text, brain.text_to_embedding(req.question))
+        # Сохраняем историю после каждого сообщения (для надёжности)
+        brain.save_dialog_history()
         return {
             "question": req.question,
             "answer": answer_text,
@@ -380,7 +385,7 @@ async def sleep_brain():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Эндпоинты управления агентом (дополнены) ---
+# --- Эндпоинты управления агентом ---
 @app.post("/agent/start")
 async def agent_start():
     agent.start()
@@ -412,7 +417,6 @@ async def agent_config(req: AgentConfigRequest):
         "user_question_timeout": agent.user_question_timeout
     }
 
-# Новые эндпоинты для интерактивного опроса пользователя
 @app.get("/agent/next_question")
 async def get_next_question():
     q = agent.get_next_question()
@@ -422,6 +426,31 @@ async def get_next_question():
 async def submit_answer(question: str, answer: str):
     agent.submit_answer(question, answer)
     return {"status": "ok"}
+
+# ============================================================
+# НОВЫЕ ЭНДПОИНТЫ ДЛЯ ИСТОРИИ ЧАТА
+# ============================================================
+@app.get("/chat/messages")
+async def get_chat_messages(limit: int = 50):
+    """Возвращает последние сообщения из истории диалога."""
+    items = brain.dialog_memory.items[-limit:] if brain.dialog_memory.items else []
+    messages = []
+    for item in items:
+        if "user" in item and "assistant" in item:
+            messages.append({"role": "user", "content": item["user"]})
+            messages.append({"role": "assistant", "content": item["assistant"]})
+        elif "user" in item:
+            messages.append({"role": "user", "content": item["user"]})
+        elif "assistant" in item:
+            messages.append({"role": "assistant", "content": item["assistant"]})
+    return {"messages": messages}
+
+@app.post("/chat/clear")
+async def clear_chat():
+    """Очищает историю диалога."""
+    brain.dialog_memory.clear()
+    brain.save_dialog_history()
+    return {"status": "cleared"}
 
 # --- Главная страница ---
 @app.get("/", response_class=HTMLResponse)
