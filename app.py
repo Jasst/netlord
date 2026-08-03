@@ -1,9 +1,9 @@
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from smart_brain_v4 import Brain
 import uvicorn
-import time
+import re
 
 app = FastAPI(title="Smart Brain v4")
 
@@ -19,7 +19,6 @@ brain = Brain(
 )
 brain.load()
 
-# Модели данных
 class AskRequest(BaseModel):
     question: str
     temperature: float = 0.7
@@ -28,14 +27,114 @@ class LearnRequest(BaseModel):
     question: str
     answer: str
 
+# --- Вспомогательные функции ---
+
+def normalize_text(text: str) -> str:
+    """Приводит текст к единому формату для сравнения."""
+    return re.sub(r'\s+', ' ', text.strip().lower())
+
+def handle_remember_command(text: str) -> tuple[bool, str]:
+    """
+    Обрабатывает команду "запомни ..."
+    Возвращает (была_обработана, ответ_бота)
+    """
+    pattern = r'^(?:запомни|запомнить)\s+(.+)$'
+    match = re.match(pattern, text.strip(), re.IGNORECASE)
+    if not match:
+        return False, ""
+
+    fact = match.group(1).strip()
+    if not fact:
+        return False, ""
+
+    # Сохраняем в память (в knowledge_base и нейросеть)
+    brain.learn_pair(text, fact)
+    brain.save()
+
+    # Сохраняем диалог в историю, чтобы следующий вопрос знал о запоминании
+    response_text = f"✅ Я запомнил: «{fact}»."
+    brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
+
+    return True, response_text
+
+def handle_forget_command(text: str) -> tuple[bool, str]:
+    """
+    Обрабатывает команду "забудь ..."
+    Возвращает (была_обработана, ответ_бота)
+    """
+    pattern = r'^(?:забудь|забыть)\s+(.+)$'
+    match = re.match(pattern, text.strip(), re.IGNORECASE)
+    if not match:
+        return False, ""
+
+    phrase = match.group(1).strip()
+    if not phrase:
+        return False, ""
+
+    norm_phrase = normalize_text(phrase)
+    removed = False
+
+    # Ищем в knowledge_base по вопросу (q) или по ответу (a)
+    new_kb = []
+    for item in brain.knowledge_base:
+        if normalize_text(item["q"]) == norm_phrase or normalize_text(item["a"]) == norm_phrase:
+            removed = True
+            continue
+        new_kb.append(item)
+
+    if not removed:
+        # Пробуем частичное совпадение
+        for item in brain.knowledge_base:
+            if norm_phrase in normalize_text(item["q"]) or norm_phrase in normalize_text(item["a"]):
+                removed = True
+                continue
+            new_kb.append(item)
+
+    if removed:
+        brain.knowledge_base = new_kb
+        brain.save()
+        response_text = f"✅ Я забыл: «{phrase}»."
+        brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
+        return True, response_text
+    else:
+        response_text = f"❌ Я не нашёл, что забыть: «{phrase}»."
+        brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
+        return True, response_text
+
 # --- API ---
+
 @app.post("/ask")
 async def ask(req: AskRequest):
     try:
+        # Проверяем команды
+        handled, response = handle_remember_command(req.question)
+        if handled:
+            return {
+                "question": req.question,
+                "answer": response,
+                "facts": [],
+                "known": True
+            }
+
+        handled, response = handle_forget_command(req.question)
+        if handled:
+            return {
+                "question": req.question,
+                "answer": response,
+                "facts": [],
+                "known": True
+            }
+
+        # Обычный вопрос
         result = brain.generate_answer(req.question, temperature=req.temperature, use_rag=True)
+        answer_text = result["text"]
+
+        # Сохраняем диалог в историю
+        brain.dialog_memory.add_turn(req.question, answer_text, brain.text_to_embedding(req.question))
+
         return {
             "question": req.question,
-            "answer": result["text"],
+            "answer": answer_text,
             "facts": result.get("facts", []),
             "known": result.get("known", False)
         }
@@ -51,6 +150,15 @@ async def learn(req: LearnRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/learn_neg")
+async def learn_neg(req: LearnRequest):
+    try:
+        brain.learn_negative_pair(req.question, req.answer)
+        brain.save()
+        return {"status": "learned_negative", "question": req.question, "answer": req.answer}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/stats")
 async def stats():
     return {
@@ -61,7 +169,7 @@ async def stats():
         "memory_entries": len(brain.long_memory.items) + len(brain.short_memory.items)
     }
 
-# --- Веб-интерфейс ---
+# --- Веб-интерфейс (без изменений) ---
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -78,7 +186,6 @@ HTML_PAGE = """
             display: flex;
             flex-direction: column;
         }
-        /* Хедер */
         .header {
             background: #2c3e50;
             color: white;
@@ -126,14 +233,12 @@ HTML_PAGE = """
         }
         .menu-btn:hover { opacity: 0.7; }
 
-        /* Основной контейнер */
         .app-container {
             display: flex;
             flex: 1;
             overflow: hidden;
         }
 
-        /* Боковая панель */
         .sidebar {
             width: 320px;
             background: #ffffff;
@@ -184,7 +289,6 @@ HTML_PAGE = """
         .sidebar .fact-item .a { color: #555; }
         .sidebar .fact-item .score { font-size: 12px; color: #888; float: right; }
 
-        /* Чат */
         .chat {
             flex: 1;
             display: flex;
@@ -297,7 +401,6 @@ HTML_PAGE = """
             to { opacity: 1; transform: translateY(0); }
         }
 
-        /* Адаптив */
         @media (max-width: 768px) {
             .sidebar { width: 260px; }
             .chat { padding: 10px; }
@@ -320,7 +423,6 @@ HTML_PAGE = """
 </div>
 
 <div class="app-container">
-    <!-- Боковая панель -->
     <div class="sidebar" id="sidebar">
         <h3>📊 Статистика</h3>
         <div id="statsContainer">
@@ -337,7 +439,6 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- Чат -->
     <div class="chat">
         <div class="messages" id="messages">
             <div class="message bot">Привет! Я Smart Brain. Задай мне вопрос.</div>
@@ -359,21 +460,18 @@ HTML_PAGE = """
     let lastAnswer = '';
     let lastFacts = [];
 
-    // Температура
     const tempSlider = document.getElementById('tempSlider');
     const tempDisplay = document.getElementById('tempDisplay');
     tempSlider.addEventListener('input', () => {
         tempDisplay.textContent = parseFloat(tempSlider.value).toFixed(1);
     });
 
-    // Переключение панели
     let sidebarOpen = true;
     function toggleSidebar() {
         sidebarOpen = !sidebarOpen;
         document.getElementById('sidebar').classList.toggle('closed', !sidebarOpen);
     }
 
-    // Загрузка статистики
     async function loadStats() {
         try {
             const res = await fetch('/stats');
@@ -386,7 +484,6 @@ HTML_PAGE = """
         } catch(e) { console.error('Stats error', e); }
     }
 
-    // Отображение фактов в панели
     function renderFacts(facts) {
         const container = document.getElementById('factsList');
         if (!facts || facts.length === 0) {
@@ -400,14 +497,12 @@ HTML_PAGE = """
         container.innerHTML = html;
     }
 
-    // Отправить сообщение
     async function sendMessage() {
         const input = document.getElementById('questionInput');
         const question = input.value.trim();
         if (!question) return;
         input.value = '';
 
-        // Добавляем сообщение пользователя
         addMessage(question, 'user');
         const sendBtn = document.getElementById('sendBtn');
         sendBtn.disabled = true;
@@ -431,7 +526,6 @@ HTML_PAGE = """
             renderFacts(lastFacts);
             loadStats();
 
-            // Показываем кнопки обучения
             document.getElementById('learnPosBtn').style.display = 'inline-block';
             document.getElementById('learnNegBtn').style.display = 'inline-block';
         } catch(e) {
@@ -455,7 +549,6 @@ HTML_PAGE = """
         container.scrollTop = container.scrollHeight;
     }
 
-    // Обучение на последнем ответе (положительное)
     async function learnLastPair() {
         if (!lastQuestion || !lastAnswer) return alert('Нет пары для обучения.');
         await doLearn(lastQuestion, lastAnswer, 'positive');
@@ -468,13 +561,6 @@ HTML_PAGE = """
 
     async function doLearn(q, a, type) {
         try {
-            const endpoint = '/learn';
-            const body = { question: q, answer: a };
-            // Для отрицания мы не передаём отдельный эндпоинт, используем learn_negative_pair
-            // Поэтому добавим параметр? Но в API у нас только learn. Модифицируем? 
-            // Сделаем два эндпоинта: /learn и /learn_neg. Добавим ниже.
-            // Временно: для отрицания вызовем /learn_neg (добавим позже)
-            // Для простоты здесь используем отдельный вызов.
             let url = '/learn';
             if (type === 'negative') url = '/learn_neg';
             const res = await fetch(url, {
@@ -486,7 +572,6 @@ HTML_PAGE = """
             if (res.ok) {
                 alert(`✅ ${type === 'positive' ? 'Обучено' : 'Отрицание обучено'}: ${q} → ${a}`);
                 loadStats();
-                // Скрываем кнопки
                 document.getElementById('learnPosBtn').style.display = 'none';
                 document.getElementById('learnNegBtn').style.display = 'none';
             } else {
@@ -495,26 +580,12 @@ HTML_PAGE = """
         } catch(e) { alert('Ошибка: ' + e.message); }
     }
 
-    // Добавим эндпоинт /learn_neg в Python позже
-
-    // Инициализация
     loadStats();
-    // Автоматически открыть панель на десктопе
     if (window.innerWidth < 768) toggleSidebar();
 </script>
 </body>
 </html>
 """
-
-# Добавляем эндпоинт для отрицательного обучения
-@app.post("/learn_neg")
-async def learn_neg(req: LearnRequest):
-    try:
-        brain.learn_negative_pair(req.question, req.answer)
-        brain.save()
-        return {"status": "learned_negative", "question": req.question, "answer": req.answer}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/", response_class=HTMLResponse)
 async def index():

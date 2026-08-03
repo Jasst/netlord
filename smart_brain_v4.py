@@ -44,12 +44,10 @@ def softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum()
 
 # ============================
-# Провайдер эмбеддингов (через LM Studio или локальный fallback)
+# Провайдер эмбеддингов
 # ============================
 class EmbeddingProvider:
-    """Получает реальные семантические эмбеддинги через API LM Studio.
-    При недоступности API - использует улучшенный локальный хеш с n-граммами."""
-
+    # (без изменений)
     def __init__(self, dim: int = 128, api_model: str = "local-model"):
         self.dim = dim
         self.api_model = api_model
@@ -58,17 +56,14 @@ class EmbeddingProvider:
         self._api_available = True
 
     def _local_embedding(self, text: str) -> np.ndarray:
-        """Улучшенный локальный эмбеддинг: n-граммы + позиционное кодирование."""
         text = text.lower().strip()
         text = re.sub(r"[^\w\s]", " ", text)
         tokens = text.split()
         if not tokens:
             return random_vector(self.dim)
-
         ngrams = tokens[:]
         for i in range(len(tokens) - 1):
             ngrams.append(tokens[i] + "_" + tokens[i+1])
-
         vec = np.zeros(self.dim, dtype=np.float32)
         for idx, token in enumerate(ngrams):
             h = zlib.adler32(token.encode("utf-8")) + idx * 31
@@ -76,18 +71,15 @@ class EmbeddingProvider:
             tok_vec = rng.randn(self.dim).astype(np.float32)
             weight = 1.0 / (1.0 + idx * 0.1)
             vec += tok_vec * weight
-
         norm = np.linalg.norm(vec)
         return vec / norm if norm > 0 else random_vector(self.dim)
 
     def get_embedding(self, text: str) -> np.ndarray:
         if not text:
             return random_vector(self.dim)
-
         with self._cache_lock:
             if text in self._cache:
                 return self._cache[text].copy()
-
         if self._api_available:
             try:
                 resp = client.embeddings.create(
@@ -102,16 +94,16 @@ class EmbeddingProvider:
                 return vec
             except Exception:
                 self._api_available = False
-
         vec = self._local_embedding(text)
         with self._cache_lock:
             self._cache[text] = vec.copy()
         return vec
 
 # ============================
-# Класс Signal
+# Классы Signal, Synapse, Neuron (без изменений)
 # ============================
 class Signal:
+    # (без изменений)
     def __init__(self, embedding: np.ndarray, energy: float = 1.0, importance: float = 0.5,
                  context: Optional[np.ndarray] = None, source=None, destination=None,
                  confidence: float = 0.5, text: str = ""):
@@ -126,14 +118,11 @@ class Signal:
         self.confidence = confidence
         self.history = []
         self.text = text
-
     def __repr__(self):
         return f"Signal(id={self.id}, energy={self.energy:.2f}, text={self.text[:30]!r})"
 
-# ============================
-# Класс Synapse с Attention-весом
-# ============================
 class Synapse:
+    # (без изменений)
     def __init__(self, from_neuron, to_neuron, weight: float = 0.1, plasticity: float = 0.5,
                  confidence: float = 0.1, frequency: float = 0.0, energy: float = 1.0,
                  context_vector: Optional[np.ndarray] = None,
@@ -205,10 +194,8 @@ class Synapse:
     def __repr__(self):
         return f"Synapse({self.from_neuron}->{self.to_neuron}, w={self.weight:.3f})"
 
-# ============================
-# Класс Neuron
-# ============================
 class Neuron:
+    # (без изменений)
     def __init__(self, embedding: Optional[np.ndarray] = None, activation: float = 0.0,
                  potential: float = 0.0, energy: float = 1.0, importance: float = 0.5,
                  cluster: str = 'hidden', layer: int = 0):
@@ -230,7 +217,6 @@ class Neuron:
         self.persistent_state = {}
         self.label = None
         self.refractory_period = 0
-        # Для оценки полезности
         self.utility_score = 0.0
 
     def add_incoming(self, synapse_id):
@@ -260,7 +246,6 @@ class Neuron:
             self.energy = max(0.0, self.energy - 0.01)
             self.potential *= 0.3
             self.refractory_period = 2
-            # Обновляем полезность
             self.utility_score = 0.7 * self.utility_score + 0.3 * self.activation
             return True
         else:
@@ -276,21 +261,18 @@ class Neuron:
         return f"Neuron(id={self.id}, layer={self.layer}, cluster={self.cluster}, act={self.activation:.2f})"
 
 # ============================
-# Память разных уровней
+# Классы памяти (без изменений)
 # ============================
 class Memory:
     def __init__(self, max_size: int = 100):
         self.items = []
         self.max_size = max_size
-
     def add(self, item):
         self.items.append(item)
         if len(self.items) > self.max_size:
             self.items.pop(0)
-
     def get_recent(self, n: int = 10):
         return self.items[-n:]
-
     def clear(self):
         self.items = []
 
@@ -298,7 +280,6 @@ class WorkingMemory(Memory):
     def __init__(self):
         super().__init__(max_size=50)
         self.context_embedding = None
-
     def update_context(self, embedding: np.ndarray, decay: float = 0.7):
         if self.context_embedding is None:
             self.context_embedding = embedding.copy()
@@ -312,13 +293,11 @@ class DialogMemory(Memory):
     def __init__(self, max_turns: int = 10):
         super().__init__(max_size=max_turns)
         self.turn_embeddings = []
-
     def add_turn(self, user_text: str, assistant_text: str, embedding: np.ndarray):
         self.add({"user": user_text, "assistant": assistant_text, "time": time.time()})
         self.turn_embeddings.append(embedding.copy())
         if len(self.turn_embeddings) > self.max_size:
             self.turn_embeddings.pop(0)
-
     def get_context_string(self, n: int = 3) -> str:
         recent = self.get_recent(n)
         parts = []
@@ -326,7 +305,6 @@ class DialogMemory(Memory):
             parts.append(f"Пользователь: {turn['user']}")
             parts.append(f"Ассистент: {turn['assistant']}")
         return "\n".join(parts)
-
     def get_context_embedding(self) -> Optional[np.ndarray]:
         if not self.turn_embeddings:
             return None
@@ -343,7 +321,7 @@ class LongMemory(Memory):
         super().__init__(max_size=1000000)
 
 # ============================
-# Многослойный Brain с Attention и RAG, с ограничениями роста
+# Основной класс Brain (УЛУЧШЕННЫЙ)
 # ============================
 class Brain:
     def __init__(self, dim_embedding: int = 128,
@@ -351,8 +329,8 @@ class Brain:
                  output_neurons: int = 40,
                  hidden_layers: List[int] = None,
                  model_path: str = "brain_model_trained.json",
-                 max_neurons: int = 800,          # Глобальный лимит нейронов
-                 max_synapses: int = 8000):       # Глобальный лимит синапсов
+                 max_neurons: int = 800,
+                 max_synapses: int = 8000):
         if hidden_layers is None:
             hidden_layers = [100, 80, 60]
         self.dim = dim_embedding
@@ -387,11 +365,10 @@ class Brain:
         self.knowledge_base: List[Dict[str, Any]] = []
         self.max_kb_size = 2000
 
-        # Параметры регуляризации
         self.max_neurons = max_neurons
         self.max_synapses = max_synapses
-        self.prune_every = 25          # Шагов между прунингом
-        self.similarity_threshold_new_neuron = 0.85  # Порог для использования существующего нейрона
+        self.prune_every = 25
+        self.similarity_threshold_new_neuron = 0.85
 
         self._init_architecture(input_neurons, hidden_layers, output_neurons)
 
@@ -440,6 +417,7 @@ class Brain:
             b = random.choice(output_ids)
             self._create_synapse(a, b, weight=random.uniform(0.005, 0.02))
 
+    # -------------------- УЛУЧШЕННЫЙ _create_synapse --------------------
     def _create_synapse(self, from_id: int, to_id: int, weight: float = None,
                         context_vec: np.ndarray = None, is_inhibitory: bool = False) -> Optional[int]:
         if from_id not in self.neurons or to_id not in self.neurons:
@@ -447,18 +425,20 @@ class Brain:
         key = (from_id, to_id)
         existing_id = self.edge_index.get(key)
         if existing_id is not None and existing_id in self.synapses:
+            # УЛУЧШЕНИЕ: обновляем вес, если передан новый
+            if weight is not None:
+                self.synapses[existing_id].weight = weight
             return existing_id
+
         if weight is None:
             weight = random.uniform(0.01, 0.1)
         if context_vec is None:
             context_vec = random_vector(self.dim)
 
-        # Проверка лимита синапсов
         if len(self.synapses) >= self.max_synapses:
-            # Удаляем наименее полезные синапсы
             self._prune_synapses(force=True)
             if len(self.synapses) >= self.max_synapses:
-                # Если всё равно переполнены, не создаём новый
+                print("[WARN] Достигнут лимит синапсов, новый не создан.")
                 return None
 
         syn = Synapse(from_id, to_id, weight=weight,
@@ -485,7 +465,6 @@ class Brain:
             del self.synapses[synapse_id]
 
     def _find_most_similar_neuron(self, embedding: np.ndarray, cluster: str = None, threshold: float = 0.85) -> Optional[int]:
-        """Ищет нейрон с максимальной схожестью, превышающей порог."""
         best_id = None
         best_sim = threshold
         for nid, n in self.neurons.items():
@@ -502,22 +481,18 @@ class Brain:
         if embedding is None:
             embedding = random_vector(self.dim)
 
-        # Проверяем, нет ли уже очень похожего нейрона
         if cluster in ('input', 'output'):
             existing = self._find_most_similar_neuron(embedding, cluster=cluster, threshold=self.similarity_threshold_new_neuron)
             if existing is not None:
-                # Обновляем его важность и метку (если есть)
                 if label and not self.neurons[existing].label:
                     self.neurons[existing].label = label
                 return existing
 
-        # Проверка лимита нейронов
         if len(self.neurons) >= self.max_neurons:
             self._prune_neurons(force=True)
             if len(self.neurons) >= self.max_neurons:
-                # Если всё равно переполнены, возвращаем случайный существующий
-                nid = random.choice(list(self.neurons.keys()))
-                return nid
+                print("[WARN] Достигнут лимит нейронов, возвращаем случайный.")
+                return random.choice(list(self.neurons.keys()))
 
         if layer is None:
             layer = self.num_hidden_layers // 2 + 1
@@ -548,23 +523,16 @@ class Brain:
         return n.id
 
     def _prune_neurons(self, force=False):
-        """Удаляет нейроны с низкой полезностью, если превышен лимит или принудительно."""
         if not force and len(self.neurons) < self.max_neurons * 0.9:
             return
-        # Оцениваем полезность каждого нейрона
         utility = {}
         for nid, n in self.neurons.items():
-            # Не удаляем входные/выходные, если у них есть метки
             if n.cluster in ('input', 'output') and n.label:
-                utility[nid] = float('inf')  # защищаем
+                utility[nid] = float('inf')
             else:
-                # Комбинация энергии, важности, частоты активации и полезности
                 score = n.energy * 0.3 + n.importance * 0.3 + n.utility_score * 0.3 + (n.usage_counter / (n.age+1)) * 0.1
                 utility[nid] = score
-
-        # Сортируем по возрастанию полезности
         sorted_neurons = sorted(utility.items(), key=lambda x: x[1])
-        # Удаляем самые низкие, пока не достигнем 80% от лимита
         target = int(self.max_neurons * 0.8)
         to_remove = []
         for nid, score in sorted_neurons:
@@ -573,13 +541,10 @@ class Brain:
             if utility[nid] == float('inf'):
                 continue
             to_remove.append(nid)
-
         for nid in to_remove:
             neuron = self.neurons[nid]
-            # Удаляем все синапсы
             for syn_id in list(neuron.incoming_synapses) + list(neuron.outgoing_synapses):
                 self._remove_synapse(syn_id)
-            # Удаляем из индекса понятий
             if neuron.label:
                 for key, val in list(self.concept_index.items()):
                     if val == nid:
@@ -587,9 +552,7 @@ class Brain:
             del self.neurons[nid]
 
     def _prune_synapses(self, force=False):
-        """Удаляет синапсы с низким весом или устаревшие."""
         if not force and len(self.synapses) < self.max_synapses * 0.9:
-            # Также удаляем явно мёртвые
             to_remove = []
             for sid, syn in self.synapses.items():
                 syn.decay(decay_rate=0.0005)
@@ -599,10 +562,7 @@ class Brain:
             for sid in to_remove:
                 self._remove_synapse(sid)
             return
-
-        # Принудительный прунинг до 70% лимита
         target = int(self.max_synapses * 0.7)
-        # Оцениваем синапсы по весу, частоте, уверенности
         scored = []
         for sid, syn in self.synapses.items():
             score = abs(syn.weight) * 0.4 + syn.frequency * 0.3 + syn.confidence * 0.2 + (syn.usage_count / (time.time()-syn.creation_time+1)) * 0.1
@@ -670,11 +630,9 @@ class Brain:
                 sim = cosine_similarity(neuron.embedding, input_signal.embedding)
                 similarities.append((sim, nid))
         similarities.sort(reverse=True)
-        # Понижаем порог для использования существующих, чтобы реже создавать новые
         start_neurons = [nid for sim, nid in similarities[:7] if sim > 0.1]
 
         if not start_neurons:
-            # Пытаемся найти похожий нейрон в любом кластере
             existing = self._find_most_similar_neuron(input_signal.embedding, cluster='input', threshold=0.3)
             if existing is not None:
                 start_neurons = [existing]
@@ -770,7 +728,7 @@ class Brain:
         self.global_time = time.time()
         return activated
 
-    # ----- Текстовые методы (остаются без изменений) -----
+    # ----- Текстовые методы с улучшениями -----
     def normalize_text(self, text: str) -> str:
         text = text.lower().strip()
         text = re.sub(r"[^\w\s]", " ", text)
@@ -882,7 +840,8 @@ class Brain:
             answer_text = response.choices[0].message.content.strip()
         except Exception as e:
             print(f"[LLM Error] {e}")
-            answer_text = self._fallback_chain_answer(input_text)
+            # УЛУЧШЕНИЕ: передаём temperature в fallback
+            answer_text = self._fallback_chain_answer(input_text, temperature=temperature)
 
         return {
             "text": answer_text,
@@ -891,13 +850,14 @@ class Brain:
             "fallback": len(facts) == 0,
         }
 
-    def _fallback_chain_answer(self, input_text: str) -> str:
+    # УЛУЧШЕНИЕ: добавлен параметр temperature
+    def _fallback_chain_answer(self, input_text: str, temperature: float = 0.5) -> str:
         concepts = self.extract_concepts(input_text)
         chains = []
         for c in concepts:
             nid = self.concept_index.get(c)
             if nid:
-                chain = self._generate_chain_from_node(nid, max_hops=4)
+                chain = self._generate_chain_from_node(nid, max_hops=4, temperature=temperature)
                 if len(chain) > 1:
                     chains.append(" -> ".join(chain))
         if chains:
@@ -943,7 +903,8 @@ class Brain:
         return chain
 
     def get_or_create_concept_neuron(self, text: str) -> int:
-        normalized = text.strip().lower()
+        # УЛУЧШЕНИЕ: используем normalize_text для единообразия
+        normalized = self.normalize_text(text)
         nid = self.concept_index.get(normalized)
         if nid is not None and nid in self.neurons:
             return nid
@@ -959,9 +920,10 @@ class Brain:
         print(f"[Новый узел] {nid}: '{label}'")
         return nid
 
+    # -------------------- УЛУЧШЕННЫЙ learn_pair --------------------
     def learn_pair(self, input_text: str, output_text: str, reinforce_boost: float = 0.15):
-        input_norm = input_text.strip().lower()
-        output_norm = output_text.strip().lower()
+        input_norm = self.normalize_text(input_text)
+        output_norm = self.normalize_text(output_text)
         if input_norm == output_norm:
             print("[Пропуск] Вход и выход совпадают.")
             return
@@ -986,13 +948,17 @@ class Brain:
 
         sig = self.text_to_signal(input_text)
         activated, _ = self.propagate_signal(sig, max_steps=15)
-        for nid in activated:
-            neuron = self.neurons.get(nid)
-            if neuron is None or neuron.cluster == 'output':
-                continue
-            hsyn_id = self._create_synapse(nid, output_id, weight=0.05)
-            if hsyn_id is not None:
-                self.synapses[hsyn_id].update(delta_weight=0.03)
+
+        # УЛУЧШЕНИЕ: создаём дополнительные синапсы только для топ-3 нейронов по важности
+        if activated:
+            sorted_activated = sorted(activated, key=lambda nid: self.neurons[nid].importance, reverse=True)
+            for nid in sorted_activated[:3]:
+                neuron = self.neurons.get(nid)
+                if neuron is None or neuron.cluster == 'output':
+                    continue
+                hsyn_id = self._create_synapse(nid, output_id, weight=0.05)
+                if hsyn_id is not None:
+                    self.synapses[hsyn_id].update(delta_weight=0.03)
 
         self.step(sig, target_neuron_id=output_id)
 
@@ -1005,15 +971,20 @@ class Brain:
             self.save(self._model_path)
             print(f"[Автосохранение] {self._model_path}")
 
+    # УЛУЧШЕНИЕ: предотвращение дублирования фактов
     def _add_to_knowledge_base(self, q: str, a: str):
+        # Проверяем, нет ли уже такой пары
+        for item in self.knowledge_base:
+            if item["q"] == q and item["a"] == a:
+                return
         emb = self.text_to_embedding(q + " " + a)
         self.knowledge_base.append({"q": q, "a": a, "emb": emb, "time": time.time()})
         if len(self.knowledge_base) > self.max_kb_size:
             self.knowledge_base.pop(0)
 
     def learn_negative_pair(self, input_text: str, output_text: str, penalty: float = 0.15):
-        input_norm = input_text.strip().lower()
-        output_norm = output_text.strip().lower()
+        input_norm = self.normalize_text(input_text)
+        output_norm = self.normalize_text(output_text)
         if input_norm == output_norm:
             return
 
@@ -1040,8 +1011,39 @@ class Brain:
         if self._learn_counter % self.AUTO_SAVE_EVERY == 0:
             self.save(self._model_path)
 
+    # -------------------- НОВЫЙ МЕТОД: forget_concept --------------------
+    def forget_concept(self, text: str) -> bool:
+        """
+        Удаляет понятие из сети и из knowledge_base.
+        Возвращает True, если понятие было найдено и удалено.
+        """
+        normalized = self.normalize_text(text)
+        nid = self.concept_index.get(normalized)
+        if nid is None or nid not in self.neurons:
+            return False
+
+        neuron = self.neurons[nid]
+        # Удаляем все синапсы
+        for syn_id in list(neuron.incoming_synapses) + list(neuron.outgoing_synapses):
+            self._remove_synapse(syn_id)
+        # Удаляем из concept_index
+        del self.concept_index[normalized]
+        # Удаляем сам нейрон
+        del self.neurons[nid]
+
+        # Удаляем из knowledge_base записи, где вопрос или ответ содержат этот текст (частичное совпадение)
+        new_kb = []
+        for item in self.knowledge_base:
+            if normalized not in self.normalize_text(item["q"]) and normalized not in self.normalize_text(item["a"]):
+                new_kb.append(item)
+        self.knowledge_base = new_kb
+
+        print(f"[Забыто] Понятие '{text}' удалено из сети и из KB.")
+        return True
+
+    # -------------------- Остальные методы без изменений --------------------
     def show_links(self, text: str, top_k: int = 10):
-        normalized = text.strip().lower()
+        normalized = self.normalize_text(text)
         if not normalized:
             print("Пустой запрос.")
             return
@@ -1070,7 +1072,6 @@ class Brain:
     def sleep(self, duration_steps: int = 10):
         print("=== Сон ===")
         for _ in range(duration_steps):
-            # Удаляем шумовые нейроны
             to_remove = []
             for nid, neuron in self.neurons.items():
                 if neuron.energy < 0.05 and neuron.importance < 0.1 and neuron.cluster not in ('output', 'input'):
@@ -1082,7 +1083,6 @@ class Brain:
                 del self.neurons[nid]
                 print(f"  Удален шумовой нейрон {nid}")
 
-            # Укрепляем часто используемые синапсы
             for syn in self.synapses.values():
                 if syn.frequency > 0.5:
                     syn.update(delta_weight=0.01, delta_confidence=0.01)
@@ -1090,7 +1090,6 @@ class Brain:
                     syn.update(delta_weight=0.02, delta_confidence=0.02)
                 syn.reward *= 0.9
 
-        # Консолидируем память
         for item in self.short_memory.get_recent(50):
             self.long_memory.add(item)
         self.short_memory.clear()
@@ -1172,7 +1171,7 @@ class Brain:
             n.utility_score = nd.get("utility_score", 0.0)
             self.neurons[n.id] = n
             if n.cluster == 'output' and n.label:
-                self.concept_index[n.label.strip().lower()] = n.id
+                self.concept_index[self.normalize_text(n.label)] = n.id
 
         for sd in data["synapses"]:
             s = Synapse(
@@ -1205,6 +1204,7 @@ class Brain:
 
         print(f"[Загружено] {filename} - нейронов: {len(self.neurons)}, синапсов: {len(self.synapses)}, "
               f"понятий: {len(self.concept_index)}, фактов: {len(self.knowledge_base)}")
+
 
 # ============================
 # Класс Teacher (без изменений)
@@ -1245,20 +1245,23 @@ class Teacher:
             print(f"[Ошибка учителя] {e}")
             return 0.5, brain_answer
 
+
 # ============================
-# Интерактивный режим (без изменений)
+# Интерактивный режим (с использованием нового метода forget)
 # ============================
 LEARN_PATTERN = re.compile(r'^learn\s+(.+?)\s*=>\s*(.+)$', re.IGNORECASE)
 NEG_PATTERN = re.compile(r'^neg\s+(.+?)\s*=>\s*(.+)$', re.IGNORECASE)
 LINKS_PATTERN = re.compile(r'^links\s+(.+)$', re.IGNORECASE)
+FORGET_PATTERN = re.compile(r'^forget\s+(.+)$', re.IGNORECASE)  # Новая команда
 
 def interactive_with_teacher(brain: Brain):
     teacher = Teacher()
-    print("\n=== Smart Brain v3 - Ассоциативная память + LLM (с регуляризацией) ===")
+    print("\n=== Smart Brain v4 - Ассоциативная память + LLM (улучшенная) ===")
     print("Команды:")
     print("  learn <вопрос> => <ответ>  - обучить")
     print("  neg <вопрос> => <ответ>    - отрицательное обучение")
     print("  links <понятие>            - показать связи")
+    print("  forget <понятие>           - забыть понятие (удалить из сети и KB)")
     print("  stats / save / sleep / exit")
     print("  (любой текст - вопрос к Brain)\n")
 
@@ -1306,6 +1309,15 @@ def interactive_with_teacher(brain: Brain):
                 brain.show_links(m_links.group(1).strip())
                 continue
 
+            m_forget = FORGET_PATTERN.match(user_input)
+            if m_forget:
+                concept = m_forget.group(1).strip()
+                if brain.forget_concept(concept):
+                    print(f"Понятие '{concept}' забыто.")
+                else:
+                    print(f"Понятие '{concept}' не найдено.")
+                continue
+
             # Основной диалог
             temp = random.uniform(0.5, 1.0)
             result = brain.generate_answer(user_input, temperature=temp, use_rag=True)
@@ -1350,6 +1362,6 @@ if __name__ == "__main__":
     MODEL_PATH = "brain_model_trained.json"
     brain = Brain(dim_embedding=128, input_neurons=40, output_neurons=40,
                   hidden_layers=[100, 80, 60], model_path=MODEL_PATH,
-                  max_neurons=800, max_synapses=8000)  # Ограничения
+                  max_neurons=800, max_synapses=8000)
     brain.load(MODEL_PATH)
     interactive_with_teacher(brain)
