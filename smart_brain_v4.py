@@ -921,52 +921,62 @@ class Brain:
         return nid
 
     # -------------------- УЛУЧШЕННЫЙ learn_pair --------------------
-    def learn_pair(self, input_text: str, output_text: str, reinforce_boost: float = 0.15):
-        input_norm = self.normalize_text(input_text)
-        output_norm = self.normalize_text(output_text)
-        if input_norm == output_norm:
-            print("[Пропуск] Вход и выход совпадают.")
-            return
+    def learn_pair(self, input_text: str, output_text: str, reinforce_boost: float = 0.15, epochs: int = 1):
+        """
+        Обучает модель на паре (вопрос→ответ). При epochs > 1 повторяет обучение
+        для закрепления связи (усиливает синапс).
+        """
+        for epoch in range(epochs):
+            input_norm = self.normalize_text(input_text)
+            output_norm = self.normalize_text(output_text)
+            if input_norm == output_norm:
+                print("[Пропуск] Вход и выход совпадают.")
+                return
 
-        input_id = self.get_or_create_concept_neuron(input_text)
-        output_id = self.get_or_create_concept_neuron(output_text)
+            input_id = self.get_or_create_concept_neuron(input_text)
+            output_id = self.get_or_create_concept_neuron(output_text)
 
-        sim = cosine_similarity(self.neurons[input_id].embedding, self.neurons[output_id].embedding)
-        sim_bonus = max(0.0, sim) * 0.05
+            sim = cosine_similarity(self.neurons[input_id].embedding, self.neurons[output_id].embedding)
+            sim_bonus = max(0.0, sim) * 0.05
 
-        syn_id = self._create_synapse(input_id, output_id, weight=0.2 + sim_bonus)
-        if syn_id is None:
-            print("[Ошибка] Не удалось создать синапс (лимит).")
-            return
-        syn = self.synapses[syn_id]
+            # Создаём или получаем существующий синапс
+            syn_id = self._create_synapse(input_id, output_id, weight=0.2 + sim_bonus)
+            if syn_id is None:
+                print("[Ошибка] Не удалось создать синапс (лимит).")
+                return
+            syn = self.synapses[syn_id]
 
-        if syn.usage_count > 0:
-            syn.update(delta_weight=reinforce_boost, delta_plasticity=0.02,
-                       delta_confidence=0.05, delta_frequency=0.02)
-        else:
-            syn.update(delta_weight=0.0, delta_confidence=0.05)
+            if syn.usage_count > 0:
+                syn.update(delta_weight=reinforce_boost, delta_plasticity=0.02,
+                           delta_confidence=0.05, delta_frequency=0.02)
+            else:
+                syn.update(delta_weight=0.0, delta_confidence=0.05)
 
-        sig = self.text_to_signal(input_text)
-        activated, _ = self.propagate_signal(sig, max_steps=15)
+            # Распространение сигнала и создание дополнительных связей (только на первой эпохе,
+            # чтобы избежать дублирования)
+            if epoch == 0:
+                sig = self.text_to_signal(input_text)
+                activated, _ = self.propagate_signal(sig, max_steps=15)
+                if activated:
+                    sorted_activated = sorted(activated, key=lambda nid: self.neurons[nid].importance, reverse=True)
+                    for nid in sorted_activated[:3]:
+                        neuron = self.neurons.get(nid)
+                        if neuron is None or neuron.cluster == 'output':
+                            continue
+                        hsyn_id = self._create_synapse(nid, output_id, weight=0.05)
+                        if hsyn_id is not None:
+                            self.synapses[hsyn_id].update(delta_weight=0.03)
 
-        # УЛУЧШЕНИЕ: создаём дополнительные синапсы только для топ-3 нейронов по важности
-        if activated:
-            sorted_activated = sorted(activated, key=lambda nid: self.neurons[nid].importance, reverse=True)
-            for nid in sorted_activated[:3]:
-                neuron = self.neurons.get(nid)
-                if neuron is None or neuron.cluster == 'output':
-                    continue
-                hsyn_id = self._create_synapse(nid, output_id, weight=0.05)
-                if hsyn_id is not None:
-                    self.synapses[hsyn_id].update(delta_weight=0.03)
+                self.step(sig, target_neuron_id=output_id)
 
-        self.step(sig, target_neuron_id=output_id)
+            # Добавляем в knowledge_base только один раз (защита от дублирования уже есть)
+            if epoch == 0:
+                self._add_to_knowledge_base(input_text, output_text)
 
-        self._add_to_knowledge_base(input_text, output_text)
+            print(
+                f"[+] Обучение (эпоха {epoch + 1}/{epochs}): '{input_text}' -> '{output_text}' (вес: {syn.weight:.3f})")
 
-        print(f"[+] Обучение: '{input_text}' -> '{output_text}' (вес: {syn.weight:.3f})")
-
-        self._learn_counter += 1
+        self._learn_counter += epochs
         if self._learn_counter % self.AUTO_SAVE_EVERY == 0:
             self.save(self._model_path)
             print(f"[Автосохранение] {self._model_path}")
