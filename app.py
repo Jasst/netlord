@@ -7,7 +7,7 @@ import re
 
 app = FastAPI(title="Smart Brain v4")
 
-# Инициализация мозга
+# Инициализация мозга (используем улучшенную версию, где есть forget_concept)
 brain = Brain(
     dim_embedding=128,
     input_neurons=40,
@@ -33,17 +33,41 @@ def normalize_text(text: str) -> str:
     """Приводит текст к единому формату для сравнения."""
     return re.sub(r'\s+', ' ', text.strip().lower())
 
+def extract_fact_from_command(text: str, patterns: list) -> str | None:
+    """
+    Пытается извлечь факт (то, что нужно запомнить/забыть) из текста,
+    используя список шаблонов. Возвращает извлечённую строку или None.
+    """
+    for pattern in patterns:
+        match = re.match(pattern, text.strip(), re.IGNORECASE)
+        if match:
+            fact = match.group(1).strip()
+            if fact:
+                return fact
+    return None
+
+# Расширенные шаблоны для запоминания
+REMEMBER_PATTERNS = [
+    r'^(?:запомни|запомнить)\s+(.+)$',                     # запомни ...
+    r'^(?:можешь|не мог бы ты|не могли бы вы)?\s*запомни(?:ть)?\s+(.+)$',  # можешь запомнить ...
+    r'^(?:я хочу|хочу|давай|давайте)\s+запомни(?:ть)?\s+(.+)$',          # я хочу запомнить ...
+    r'^запомни(?:ть)?,\s*пожалуйста,\s+(.+)$',            # запомни, пожалуйста, ...
+]
+
+# Шаблоны для забывания (аналогично)
+FORGET_PATTERNS = [
+    r'^(?:забудь|забыть)\s+(.+)$',
+    r'^(?:можешь|не мог бы ты)?\s*забудь(?:ть)?\s+(.+)$',
+    r'^(?:я хочу|хочу)\s+забыть\s+(.+)$',
+    r'^забудь(?:ть)?,\s*пожалуйста,\s+(.+)$',
+]
+
 def handle_remember_command(text: str) -> tuple[bool, str]:
     """
-    Обрабатывает команду "запомни ..."
+    Обрабатывает команду "запомни ..." (в разных формулировках).
     Возвращает (была_обработана, ответ_бота)
     """
-    pattern = r'^(?:запомни|запомнить)\s+(.+)$'
-    match = re.match(pattern, text.strip(), re.IGNORECASE)
-    if not match:
-        return False, ""
-
-    fact = match.group(1).strip()
+    fact = extract_fact_from_command(text, REMEMBER_PATTERNS)
     if not fact:
         return False, ""
 
@@ -55,58 +79,63 @@ def handle_remember_command(text: str) -> tuple[bool, str]:
     response_text = f"✅ Я запомнил: «{fact}»."
     brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
 
+    print(f"[CMD] Запомнил: '{fact}'")
     return True, response_text
 
 def handle_forget_command(text: str) -> tuple[bool, str]:
     """
-    Обрабатывает команду "забудь ..."
+    Обрабатывает команду "забудь ..." (в разных формулировках).
+    Удаляет все понятия, которые содержат искомую фразу (частичное совпадение).
     Возвращает (была_обработана, ответ_бота)
     """
-    pattern = r'^(?:забудь|забыть)\s+(.+)$'
-    match = re.match(pattern, text.strip(), re.IGNORECASE)
-    if not match:
-        return False, ""
-
-    phrase = match.group(1).strip()
+    phrase = extract_fact_from_command(text, FORGET_PATTERNS)
     if not phrase:
         return False, ""
 
     norm_phrase = normalize_text(phrase)
-    removed = False
+    removed_any = False
 
-    # Ищем в knowledge_base по вопросу (q) или по ответу (a)
+    # 1. Ищем в concept_index по частичному совпадению
+    to_delete = []
+    for key, nid in brain.concept_index.items():
+        if norm_phrase in key or key in norm_phrase:
+            to_delete.append((key, nid))
+
+    # Удаляем найденные нейроны и записи из concept_index
+    for key, nid in to_delete:
+        if nid in brain.neurons:
+            neuron = brain.neurons[nid]
+            for syn_id in list(neuron.incoming_synapses) + list(neuron.outgoing_synapses):
+                brain._remove_synapse(syn_id)
+            del brain.neurons[nid]
+        del brain.concept_index[key]
+        removed_any = True
+
+    # 2. Удаляем из knowledge_base записи, где вопрос или ответ содержат norm_phrase
     new_kb = []
     for item in brain.knowledge_base:
-        if normalize_text(item["q"]) == norm_phrase or normalize_text(item["a"]) == norm_phrase:
-            removed = True
+        if norm_phrase in normalize_text(item["q"]) or norm_phrase in normalize_text(item["a"]):
+            removed_any = True
             continue
         new_kb.append(item)
+    brain.knowledge_base = new_kb
 
-    if not removed:
-        # Пробуем частичное совпадение
-        for item in brain.knowledge_base:
-            if norm_phrase in normalize_text(item["q"]) or norm_phrase in normalize_text(item["a"]):
-                removed = True
-                continue
-            new_kb.append(item)
-
-    if removed:
-        brain.knowledge_base = new_kb
-        brain.save()
-        response_text = f"✅ Я забыл: «{phrase}»."
-        brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
-        return True, response_text
+    if removed_any:
+        response_text = f"✅ Я забыл всё, что связано с «{phrase}»."
     else:
-        response_text = f"❌ Я не нашёл, что забыть: «{phrase}»."
-        brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
-        return True, response_text
+        response_text = f"❌ Я не нашёл ничего, что можно забыть по запросу «{phrase}»."
+
+    brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
+    brain.save()
+    print(f"[CMD] Забыл: '{phrase}' -> {response_text}")
+    return True, response_text
 
 # --- API ---
 
 @app.post("/ask")
 async def ask(req: AskRequest):
     try:
-        # Проверяем команды
+        # Проверяем команды (сначала запомнить, потом забыть)
         handled, response = handle_remember_command(req.question)
         if handled:
             return {
@@ -169,7 +198,7 @@ async def stats():
         "memory_entries": len(brain.long_memory.items) + len(brain.short_memory.items)
     }
 
-# --- Веб-интерфейс (без изменений) ---
+# --- Веб-интерфейс ---
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="ru">
