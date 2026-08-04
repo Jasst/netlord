@@ -59,8 +59,8 @@ config = BrainConfig(
     output_neurons=40,
     hidden_layers=[100, 80, 60],
     model_path="brain_model_trained.json",
-    max_neurons=800,
-    max_synapses=8000,
+    max_neurons=2000,
+    max_synapses=20000,
 )
 brain = Brain(config=config, llm_client=llm_client)
 brain.load()
@@ -103,7 +103,7 @@ agent = BrainAgent(
     interactive_mode=False,
     user_question_timeout=30
 )
-agent.start()
+#agent.start()
 
 # ============================================================
 # Pydantic модели
