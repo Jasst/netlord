@@ -446,17 +446,17 @@ async def sleep_brain(_auth: bool = Depends(require_admin_key)):
 
 # --- Эндпоинты управления агентом ---
 @app.post("/agent/start")
-async def agent_start(_auth: bool = Depends(require_admin_key)):
+async def agent_start():
     agent.start()
     return {"status": "agent started"}
 
 @app.post("/agent/stop")
-async def agent_stop(_auth: bool = Depends(require_admin_key)):
+async def agent_stop():
     agent.stop()
     return {"status": "agent stopped"}
 
 @app.post("/agent/config")
-async def agent_config(req: AgentConfigRequest, _auth: bool = Depends(require_admin_key)):
+async def agent_config(req: AgentConfigRequest):
     if req.topics is not None:
         agent.topics = req.topics
     if req.interval is not None and req.interval > 0:
