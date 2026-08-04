@@ -2,7 +2,7 @@ import asyncio
 from fastapi import FastAPI, Request, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from smart_brain_v4 import Brain, cosine_similarity, Teacher
+from smart_brain_v5 import Brain, cosine_similarity, Teacher, BrainConfig
 import uvicorn
 import re
 import random
@@ -53,7 +53,7 @@ def require_admin_key(x_admin_key: str = Header(default="")):
 # Инициализация мозга -- ФИКС: передаём единый llm_client явно,
 # чтобы Brain/Teacher/EmbeddingProvider не полагались на глобальный
 # клиент из smart_brain_v4.py с другим (потенциально) хостом.
-brain = Brain(
+config = BrainConfig(
     dim_embedding=128,
     input_neurons=40,
     output_neurons=40,
@@ -61,8 +61,8 @@ brain = Brain(
     model_path="brain_model_trained.json",
     max_neurons=800,
     max_synapses=8000,
-    llm_client=llm_client,
 )
+brain = Brain(config=config, llm_client=llm_client)
 brain.load()
 # Загружаем историю диалога (если есть)
 brain.load_dialog_history()
@@ -369,7 +369,7 @@ async def ask(req: AskRequest):
         if req.allow_clarifying and len(result.get("facts", [])) < 3:
             history = brain.dialog_memory.items[-5:] if brain.dialog_memory.items else []
             clarifying = await asyncio.to_thread(
-                brain.generate_context_question, req.question, answer_text, history, result.get("facts", [])
+              brain._generate_clarifying_question, req.question, answer_text, history, result.get("facts", [])
             )
         brain.dialog_memory.add_turn(req.question, answer_text, brain.text_to_embedding(req.question))
         # Сохраняем историю после каждого сообщения (для надёжности)

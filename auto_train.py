@@ -20,7 +20,7 @@ from dotenv import load_dotenv   # <-- добавить
 # Загружаем переменные из .env (если есть)
 load_dotenv()
 
-from smart_brain_v4 import Brain, cosine_similarity
+from smart_brain_v5 import Brain, cosine_similarity
 
 # ============================
 # Настройка подключения к LM Studio – теперь через окружение

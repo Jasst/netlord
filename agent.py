@@ -4,7 +4,7 @@ import threading
 import random
 from typing import List, Optional
 from openai import OpenAI
-from smart_brain_v4 import Brain, Teacher
+from smart_brain_v5 import Brain, Teacher
 
 class BrainAgent:
     def __init__(
@@ -121,7 +121,7 @@ class BrainAgent:
                 break
             result = self.brain.generate_answer(q, temperature=self.temperature, use_rag=True)
             answer = result["text"]
-            score, improved = self.teacher.evaluate(q, answer)
+            score, improved, details = self.teacher.evaluate(q, answer)
             if score >= 0.7:
                 target = improved if improved != answer else answer
                 if target.lower() != q.lower():
