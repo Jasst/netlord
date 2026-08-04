@@ -13,22 +13,27 @@ import time
 import random
 import argparse
 import numpy as np
+import os
 from openai import OpenAI
+from dotenv import load_dotenv   # <-- добавить
 
-# Используем улучшенную версию Brain из smart_brain_v3.py
+# Загружаем переменные из .env (если есть)
+load_dotenv()
+
 from smart_brain_v4 import Brain, cosine_similarity
 
-# Настройка подключения к LM Studio (должен быть запущен локально)
+# ============================
+# Настройка подключения к LM Studio – теперь через окружение
+# ============================
+LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
+LM_STUDIO_API_KEY = os.environ.get("LM_STUDIO_API_KEY", "not-needed")
+
 client = OpenAI(
-    base_url="http://192.168.0.13:1234/v1",
-    api_key="not-needed",
+    base_url=LM_STUDIO_BASE_URL,
+    api_key=LM_STUDIO_API_KEY,
 )
 
 def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float = 0.7) -> list:
-    """
-    Генерирует список пар (вопрос, ответ) по заданной теме с помощью LLM.
-    Возвращает список кортежей (question, answer).
-    """
     system_prompt = (
         "Ты — генератор обучающих данных для нейросети. "
         "Твоя задача — создать список пар 'вопрос|ответ' на русском языке, "
@@ -36,7 +41,6 @@ def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float 
         "Формат вывода: каждая пара на новой строке, разделена символом '|'. "
         "Не добавляй никаких пояснений, только список пар."
     )
-
     user_prompt = (
         f"Сгенерируй {num_pairs} пар (вопрос|ответ) по теме '{topic}'. "
         "Вопросы должны быть разнообразными: от прямых ('что такое ...') до контекстных ('как ...', 'почему ...', 'в каком случае ...'). "
@@ -44,7 +48,6 @@ def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float 
         "Включай синонимы и связанные понятия, чтобы модель научилась ассоциировать разные формулировки с одним понятием. "
         "Примеры: 'солнце|звезда', 'солнечный день|ясно и жарко', 'что дает солнце|свет и тепло'."
     )
-
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
@@ -76,69 +79,48 @@ def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float 
 
 
 def integrate_new_concept(brain: Brain, concept_text: str, top_k: int = 5):
-    """
-    Интегрирует новое понятие в существующую сеть:
-    находит top_k наиболее похожих выходных нейронов (понятий) и создаёт
-    двусторонние синапсы между ними и новым нейроном.
-    """
     nid = brain.concept_index.get(concept_text.strip().lower())
     if nid is None:
         return
-
     emb = brain.neurons[nid].embedding
-    # Ищем похожие выходные нейроны (кроме самого себя)
     similarities = []
     for other_nid, neuron in brain.neurons.items():
         if other_nid == nid:
             continue
         if neuron.cluster == 'output' and neuron.label:
             sim = cosine_similarity(emb, neuron.embedding)
-            if sim > 0.3:  # порог схожести
+            if sim > 0.3:
                 similarities.append((sim, other_nid))
     similarities.sort(reverse=True)
     for sim, other_nid in similarities[:top_k]:
-        # Создаём взаимные связи
-        syn1 = brain._create_synapse(nid, other_nid, weight=0.1 + 0.2 * sim)
-        syn2 = brain._create_synapse(other_nid, nid, weight=0.1 + 0.2 * sim)
-        if syn1 and syn2:
-            print(f"  Интеграция: '{concept_text}' <-> '{brain.neurons[other_nid].label}' (sim={sim:.2f})")
+        brain._create_synapse(nid, other_nid, weight=0.1 + 0.2 * sim)
+        brain._create_synapse(other_nid, nid, weight=0.1 + 0.2 * sim)
 
 
 def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
                          negative_ratio: float = 0.2, temperature: float = 0.7,
                          integrate: bool = True):
-    """
-    Обучает модель на сгенерированных парах.
-    Если integrate=True, после обучения каждой пары выполняется интеграция
-    новых понятий с существующими.
-    """
     print(f"\n=== Автоматическое обучение на тему '{topic}' ===\n")
 
-    # 1. Генерация положительных пар
     print("Генерация положительных обучающих пар...")
     pairs = generate_training_pairs(topic, num_pairs, temperature)
     if not pairs:
         print("Не удалось сгенерировать пары. Проверьте работу LM Studio.")
         return
 
-    # 2. Обучение на положительных парах с интеграцией
     print(f"Обучение на {len(pairs)} положительных парах...")
     for idx, (q, a) in enumerate(pairs, 1):
         print(f"  {idx}/{len(pairs)}: {q} -> {a}")
         brain.learn_pair(q, a)
         if integrate:
-            # Интегрируем выходное понятие (a) с существующей сетью
             integrate_new_concept(brain, a, top_k=5)
-            # Также можно интегрировать входное, но оно обычно не является понятием
         time.sleep(0.05)
 
-    # 3. Генерация отрицательных пар (неправильные ответы)
     if negative_ratio > 0:
         neg_count = int(len(pairs) * negative_ratio)
         print(f"\nГенерация {neg_count} отрицательных пар для коррекции...")
         correct_answers = set(a.lower() for _, a in pairs)
         other_topics = ["луна", "звезда", "планета", "облако", "дождь", "ветер", "снег", "тепло", "холод", "ночь", "утро", "вечер"]
-
         neg_pairs = []
         all_answers = [a for _, a in pairs]
         for i in range(neg_count):
@@ -152,8 +134,6 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
             if not candidates:
                 candidates = [a for a in all_answers if a.lower() != correct_for_this_q]
             if not candidates:
-                candidates = [t for t in other_topics if t.lower() != correct_for_this_q]
-            if not candidates:
                 candidates = ["неизвестно"]
             wrong = random.choice(candidates)
             neg_pairs.append((q, wrong))
@@ -163,12 +143,8 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
             brain.learn_negative_pair(q, w)
             time.sleep(0.05)
 
-    # 4. Запуск "сна" для консолидации и интеграции
     print("\nЗапуск сна для консолидации памяти...")
-    # Увеличим длительность сна, чтобы укрепить новые связи
     brain.sleep(duration_steps=5)
-
-    # 5. Сохранение модели
     brain.save()
     print(f"\nОбучение завершено. Модель сохранена в {brain._model_path}")
 
@@ -190,10 +166,17 @@ def main():
     num_pairs = max(10, min(200, args.num_pairs))
 
     MODEL_PATH = "brain_model_trained.json"
-    # Используем улучшенную версию Brain с регуляризацией (smart_brain_v3)
-    brain = Brain(dim_embedding=128, input_neurons=40, output_neurons=40,
-                  hidden_layers=[100, 80, 60], model_path=MODEL_PATH,
-                  max_neurons=800, max_synapses=8000)  # ограничения
+    # ФИКС: передаём llm_client явно, чтобы Brain использовал тот же клиент, что и скрипт
+    brain = Brain(
+        dim_embedding=128,
+        input_neurons=40,
+        output_neurons=40,
+        hidden_layers=[100, 80, 60],
+        model_path=MODEL_PATH,
+        max_neurons=800,
+        max_synapses=8000,
+        llm_client=client,          # <-- передаём клиент
+    )
     brain.load(MODEL_PATH)
 
     train_model_on_topic(brain, args.topic, num_pairs, args.negative_ratio,
