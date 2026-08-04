@@ -385,7 +385,7 @@ async def ask(req: AskRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/learn")
-async def learn(req: LearnRequest, _auth: bool = Depends(require_admin_key)):
+async def learn(req: LearnRequest):
     try:
         await asyncio.to_thread(brain.learn_pair, req.question, req.answer)
         await asyncio.to_thread(brain.save)
@@ -394,7 +394,7 @@ async def learn(req: LearnRequest, _auth: bool = Depends(require_admin_key)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/learn_neg")
-async def learn_neg(req: LearnRequest, _auth: bool = Depends(require_admin_key)):
+async def learn_neg(req: LearnRequest):
     try:
         await asyncio.to_thread(brain.learn_negative_pair, req.question, req.answer)
         await asyncio.to_thread(brain.save)
@@ -403,7 +403,7 @@ async def learn_neg(req: LearnRequest, _auth: bool = Depends(require_admin_key))
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/train_topic")
-async def train_topic(req: TrainTopicRequest, _auth: bool = Depends(require_admin_key)):
+async def train_topic(req: TrainTopicRequest):
     try:
         result = await asyncio.to_thread(
             train_model_on_topic, brain, req.topic, req.num_pairs, req.negative_ratio,
@@ -414,7 +414,7 @@ async def train_topic(req: TrainTopicRequest, _auth: bool = Depends(require_admi
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/train_pair")
-async def train_pair(req: TrainPairRequest, _auth: bool = Depends(require_admin_key)):
+async def train_pair(req: TrainPairRequest):
     try:
         def _run():
             for _ in range(req.epochs):
@@ -437,7 +437,7 @@ async def stats():
     }
 
 @app.post("/sleep")
-async def sleep_brain(_auth: bool = Depends(require_admin_key)):
+async def sleep_brain():
     try:
         await asyncio.to_thread(brain.sleep, 5)
         return {"status": "ok", "message": "Сон завершен"}
@@ -505,7 +505,7 @@ async def get_chat_messages(limit: int = 50):
     return {"messages": messages}
 
 @app.post("/chat/clear")
-async def clear_chat(_auth: bool = Depends(require_admin_key)):
+async def clear_chat():
     """Очищает историю диалога."""
     brain.dialog_memory.clear()
     await asyncio.to_thread(brain.save_dialog_history)
@@ -521,7 +521,7 @@ async def index():
 
 if __name__ == "__main__":
     try:
-        uvicorn.run(app, host="127.0.0.1", port=5000)
+        uvicorn.run(app, host="127.0.0.1", port=8000)
     except KeyboardInterrupt:
         save_brain()
     finally:
