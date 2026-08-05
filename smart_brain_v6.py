@@ -1747,7 +1747,7 @@ class Brain:
             if reward != 0:
                 self._meta_learn(reward)
 
-            # ===== УБИРАЕМ вызов _create_new_synapses_from_coactivation =====
+            # ===== УБИРАЕМ вызов _create_new_synapses_from_coactivation (закомментирован) =====
             # if self.step_counter % 10 == 0:
             #     self._create_new_synapses_from_coactivation()
 
@@ -1757,16 +1757,7 @@ class Brain:
                 self.graph._prune_synapses()
                 self.graph._prune_neurons()
 
-            # ===== ПЕРЕНАПРАВЛЯЕМ short_memory в HierarchicalMemory =====
-            # self.short_memory.add((input_signal, activated))   # заменяем:
-            # Добавляем:
-            self.memory.add(
-                content={"signal": input_signal, "activated": activated},
-                embedding=input_signal.embedding,
-                memory_level=MemoryLevel.WORKING,
-                importance=0.3
-            )
-            # И добавляем в short_memory для replay:
+            # ===== СОХРАНЯЕМ В short_memory ДЛЯ REPLAY =====
             self.short_memory.add((input_signal, activated))
             self.global_time = time.time()
             return activated
