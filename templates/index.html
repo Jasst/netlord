@@ -872,16 +872,32 @@
     }
 
     function autoRenameChat(chatId, firstMessage) {
-        const chat = chats.find(c => c.id === chatId);
-        if (!chat) return;
-        if (chat.name !== 'Новый чат') return;
-        let newName = firstMessage.trim();
-        if (newName.length > 25) newName = newName.substring(0, 25) + '...';
-        if (newName.length === 0) return;
-        chat.name = newName;
-        saveChats();
-        renderChatList();
+    const chat = chats.find(c => c.id === chatId);
+    if (!chat) return;
+    if (chat.name !== 'Новый чат') return;
+
+    let newName = firstMessage.trim();
+    if (!newName) return;
+
+    // Удаляем временные метки вида ЧЧ:ММ или ЧЧ:ММ:СС (в любом месте строки)
+    newName = newName.replace(/\d{1,2}:\d{2}(:\d{2})?/g, '').trim();
+
+    // Если после удаления времени осталось несколько слов, берём первое слово
+    const words = newName.split(/\s+/);
+    if (words.length > 0) {
+        newName = words[0];
     }
+
+    // Обрезаем, если слишком длинно
+    const MAX_LEN = 40;
+    if (newName.length > MAX_LEN) {
+        newName = newName.substring(0, MAX_LEN) + '…';
+    }
+
+    chat.name = newName || 'Новый чат';
+    saveChats();
+    renderChatList();
+}
 
     // --- Подсветка кода ---
     function highlightCodeBlocks() {

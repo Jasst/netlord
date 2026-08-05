@@ -120,10 +120,11 @@ def random_vector_torch(dim: int, seed: Optional[int] = None) -> torch.Tensor:
 
 
 def cosine_similarity_torch(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Косинусное сходство для torch тензоров."""
     if a is None or b is None:
         return 0.0
-    a = a.flatten().float().detach()   # <-- добавлен .detach()
-    b = b.flatten().float().detach()   # <-- добавлен .detach()
+    a = a.flatten().float()
+    b = b.flatten().float()
     na = torch.norm(a)
     nb = torch.norm(b)
     if na < 1e-8 or nb < 1e-8:
@@ -152,69 +153,29 @@ def hash_text(text: str) -> str:
 
 
 # ============================
-# Embedding Provider (sentence-transformers, torch)
+# Embedding Provider (torch)
 # ============================
-DEFAULT_EMBEDDING_MODEL = os.environ.get(
-    "EMBEDDING_MODEL",
-    "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
-)
-
-
 class EmbeddingProvider:
     """
-    Провайдер эмбеддингов на sentence-transformers (локально, без похода в LM Studio).
-    Модель мультиязычная (50+ языков, включая русский) — семантически осмысленные
-    векторы вместо hash-based шума. Кэш и проекция в config.dim_embedding сохранены,
-    чтобы не трогать размерность графа/attention в остальном коде.
-
-    api_model / llm_client оставлены в сигнатуре только для обратной совместимости
-    с существующими вызовами `EmbeddingProvider(dim=..., llm_client=...)` — сама
-    эмбеддинг-модель их больше не использует.
+    Провайдер эмбеддингов на torch с LRU-кэшем.
+    Возвращает torch.Tensor вместо numpy.ndarray.
     """
     def __init__(self, dim: int = 128, api_model: str = "local-model",
-                 llm_client: Optional[OpenAI] = None, cache_ttl: int = 3600,
-                 model_name: str = None, device: str = None):
+                 llm_client: Optional[OpenAI] = None, cache_ttl: int = 3600):
         self.dim = dim
         self.api_model = api_model
-        self.llm_client = llm_client  # не используется для эмбеддингов, оставлен для совместимости
+        self.llm_client = llm_client
         self._cache: Dict[str, Tuple[torch.Tensor, float]] = {}
         self._cache_lock = threading.Lock()
-        self._model_lock = threading.Lock()
+        self._api_available = True
         self._projection: Optional[torch.Tensor] = None
         self.cache_ttl = cache_ttl
         self._cache_hits = 0
         self._cache_misses = 0
 
-        self.model_name = model_name or DEFAULT_EMBEDDING_MODEL
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self._st_model = None  # ленивая загрузка при первом обращении
-        self._model_load_failed = False
-
-    def _ensure_model(self):
-        if self._st_model is not None or self._model_load_failed:
-            return
-        with self._model_lock:
-            if self._st_model is not None or self._model_load_failed:
-                return
-            try:
-                from sentence_transformers import SentenceTransformer
-                logger.info(f"Загрузка embedding-модели '{self.model_name}' на {self.device}...")
-                self._st_model = SentenceTransformer(self.model_name, device=self.device)
-                logger.info(
-                    f"Embedding-модель загружена. Нативная размерность: "
-                    f"{self._st_model.get_sentence_embedding_dimension()}"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Не удалось загрузить sentence-transformers модель '{self.model_name}': {e}. "
-                    f"Используется locale hash-fallback."
-                )
-                self._model_load_failed = True
-
     def _local_embedding(self, text: str) -> torch.Tensor:
-        """Резервный вариант (без семантики), используется только если модель не загрузилась."""
         text = text.lower().strip()
-        text = re.sub(r"[^\w\s]", " ", text)
+        text = re.sub(r"[^\\w\\s]", " ", text)
         tokens = text.split()
         if not tokens:
             return random_vector_torch(self.dim)
@@ -247,25 +208,6 @@ class EmbeddingProvider:
         projected = vec @ self._projection
         return F.normalize(projected.unsqueeze(0), p=2, dim=1).squeeze(0)
 
-    def _encode(self, texts: List[str]) -> torch.Tensor:
-        with self._model_lock:
-            raw = self._st_model.encode(
-                texts, convert_to_numpy=True, normalize_embeddings=True,
-                show_progress_bar=False, batch_size=32,
-            )
-        raw_t = torch.from_numpy(raw.astype(np.float32))  # [N, native_dim]
-        if raw_t.shape[1] == self.dim:
-            return raw_t
-        src_dim = raw_t.shape[1]
-        if self._projection is None or self._projection.shape[0] != src_dim:
-            rng = np.random.RandomState(1234567)
-            proj = rng.randn(src_dim, self.dim).astype(np.float32) / np.sqrt(self.dim)
-            self._projection = torch.from_numpy(proj)
-        # ПРИВЕДЕНИЕ ТИПА ПЕРЕД УМНОЖЕНИЕМ
-        projection = self._projection.to(dtype=torch.float32)
-        projected = raw_t @ projection
-        return F.normalize(projected, p=2, dim=1)
-
     def get_embedding(self, text: str) -> torch.Tensor:
         if not text:
             return random_vector_torch(self.dim)
@@ -281,52 +223,30 @@ class EmbeddingProvider:
                     del self._cache[cache_key]
 
         self._cache_misses += 1
-        self._ensure_model()
 
-        if self._st_model is not None:
-            vec = self._encode([text])[0]
-        else:
-            vec = self._local_embedding(text)
+        if self._api_available and self.llm_client is not None:
+            try:
+                resp = self.llm_client.embeddings.create(
+                    model=self.api_model,
+                    input=[text]
+                )
+                vec = torch.tensor(resp.data[0].embedding, dtype=torch.float32)
+                if vec.shape[0] != self.dim:
+                    vec = self._project_to_dim(vec)
+                with self._cache_lock:
+                    self._cache[cache_key] = (vec.clone(), time.time())
+                return vec
+            except Exception as e:
+                logger.warning(f"API embedding failed: {e}, switching to local")
+                self._api_available = False
 
+        vec = self._local_embedding(text)
         with self._cache_lock:
             self._cache[cache_key] = (vec.clone(), time.time())
         return vec
 
     def get_embeddings_batch(self, texts: List[str]) -> List[torch.Tensor]:
-        if not texts:
-            return []
-        self._ensure_model()
-
-        results: List[Optional[torch.Tensor]] = [None] * len(texts)
-        to_encode_idx, to_encode_txt = [], []
-
-        with self._cache_lock:
-            for i, t in enumerate(texts):
-                if not t:
-                    results[i] = random_vector_torch(self.dim)
-                    continue
-                key = hash_text(t)
-                cached = self._cache.get(key)
-                if cached and (time.time() - cached[1] < self.cache_ttl):
-                    results[i] = cached[0].clone()
-                    self._cache_hits += 1
-                else:
-                    to_encode_idx.append(i)
-                    to_encode_txt.append(t)
-
-        if to_encode_txt:
-            self._cache_misses += len(to_encode_txt)
-            if self._st_model is not None:
-                encoded = self._encode(to_encode_txt)
-                vecs = [encoded[j] for j in range(len(to_encode_txt))]
-            else:
-                vecs = [self._local_embedding(t) for t in to_encode_txt]
-            with self._cache_lock:
-                for i, t, v in zip(to_encode_idx, to_encode_txt, vecs):
-                    results[i] = v
-                    self._cache[hash_text(t)] = (v.clone(), time.time())
-
-        return results
+        return [self.get_embedding(t) for t in texts]
 
     def get_cache_stats(self) -> Dict[str, Any]:
         total = self._cache_hits + self._cache_misses
@@ -335,9 +255,7 @@ class EmbeddingProvider:
             "hits": self._cache_hits,
             "misses": self._cache_misses,
             "hit_rate": hit_rate,
-            "size": len(self._cache),
-            "model": self.model_name,
-            "model_loaded": self._st_model is not None,
+            "size": len(self._cache)
         }
 
 
@@ -1279,7 +1197,6 @@ class Brain:
         self.device = device
         self.dim = self.config.dim_embedding
         self.embedder = EmbeddingProvider(dim=self.dim, llm_client=self.llm_client)
-        self.embedder._ensure_model()
 
         # Neural graph
         self.graph = NeuralGraph(
@@ -2672,3 +2589,4 @@ if __name__ == "__main__":
     brain = Brain(config=config)
     brain.load(MODEL_DIR)
     interactive_with_teacher(brain)
+

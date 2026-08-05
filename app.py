@@ -15,6 +15,9 @@ import sys
 import secrets
 from agent import BrainAgent
 from dotenv import load_dotenv
+from fastapi import File, UploadFile, Form
+import csv
+import io
 
 load_dotenv()
 
@@ -376,6 +379,76 @@ async def ask(req: AskRequest):
             "facts": result.get("facts", []),
             "known": result.get("known", False),
             "clarifying_question": clarifying
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/train_from_file")
+async def train_from_file(
+        file: UploadFile = File(...),
+        delimiter: str = Form("|"),  # разделитель: "|" или ","
+        negative_ratio: float = Form(0.2),
+        epochs: int = Form(1),
+        integrate: bool = Form(True)
+):
+    """Загружает файл с парами вопрос|ответ и обучает мозг."""
+    try:
+        content = await file.read()
+        text = content.decode("utf-8")
+        lines = text.splitlines()
+        pairs = []
+
+        # Определяем разделитель (если не задан явно)
+        if delimiter not in [",", "|"]:
+            delimiter = "|"  # по умолчанию
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Пропускаем заголовки, если они есть (например, "question|answer")
+            if line.lower().startswith("question") or line.lower().startswith("вопрос"):
+                continue
+            parts = line.split(delimiter, 1)
+            if len(parts) == 2:
+                q, a = parts[0].strip(), parts[1].strip()
+                if q and a:
+                    pairs.append((q, a))
+
+        if not pairs:
+            return {"status": "error", "message": "Не найдено ни одной пары (проверьте разделитель)."}
+
+        # Обучаем
+        learned = 0
+        for q, a in pairs:
+            brain.learn_pair(q, a)
+            learned += 1
+            if integrate:
+                integrate_new_concept(brain, a, top_k=3)
+
+        # Отрицательные примеры (если нужно)
+        negatives = 0
+        if negative_ratio > 0:
+            import random
+            neg_count = int(len(pairs) * negative_ratio)
+            # Простой способ: для каждой пары берём случайный неправильный ответ
+            all_answers = [a for _, a in pairs]
+            for _ in range(neg_count):
+                q, a_correct = random.choice(pairs)
+                wrong = random.choice([x for x in all_answers if x != a_correct] or ["неизвестно"])
+                brain.learn_negative_pair(q, wrong)
+                negatives += 1
+
+        brain.sleep(duration_steps=2)
+        brain.save()
+
+        return {
+            "status": "ok",
+            "total_pairs": len(pairs),
+            "learned": learned,
+            "negatives": negatives,
+            "message": f"Обучено {learned} пар, {negatives} отрицательных примеров."
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
