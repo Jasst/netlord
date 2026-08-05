@@ -478,9 +478,13 @@ async def get_next_question():
     q = agent.get_next_question()
     return {"question": q}
 
+class SubmitAnswerRequest(BaseModel):
+    question: str
+    answer: str
+
 @app.post("/agent/submit_answer")
-async def submit_answer(question: str, answer: str):
-    await asyncio.to_thread(agent.submit_answer, question, answer)
+async def submit_answer(req: SubmitAnswerRequest):
+    await asyncio.to_thread(agent.submit_answer, req.question, req.answer)
     return {"status": "ok"}
 
 # ============================================================
@@ -513,6 +517,7 @@ async def index():
     with open(html_path, "r", encoding="utf-8") as f:
         html_content = f.read()
     return HTMLResponse(content=html_content)
+
 
 if __name__ == "__main__":
     try:
