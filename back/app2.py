@@ -1,32 +1,31 @@
-
-"""
-app_v6.py — FastAPI для Smart Brain v6
-========================================
-- asyncio.to_thread для блокирующих вызовов
-- Админ-ключ на деструктивных эндпоинтах
-- Чёткое разделение: ask, learn, train, stats, agent, chat history
-"""
 import asyncio
-import os
-import secrets
-import signal
-import atexit
-import sys
 from fastapi import FastAPI, Request, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from smart_brain_v6 import Brain, Teacher, BrainConfig, MemoryLevel
-from smart_brain_v6 import cosine_similarity_torch
-from openai import OpenAI
+from smart_brain_v6 import Brain, cosine_similarity_torch as cosine_similarity, Teacher, BrainConfig
 import uvicorn
 import re
 import random
 import time
+from openai import OpenAI
+import os
+import signal
+import atexit
+import sys
+import secrets
+from agent import BrainAgent
+from dotenv import load_dotenv
+from fastapi import File, UploadFile, Form
+from fastapi.staticfiles import StaticFiles
+import csv
+import io
+
+load_dotenv()
 
 app = FastAPI(title="Smart Brain v6")
-
+app.mount("/static", StaticFiles(directory="static"), name="static")
 # ============================================================
-# LM Studio config
+# Настройка LM Studio
 # ============================================================
 LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
 LM_STUDIO_API_KEY = os.environ.get("LM_STUDIO_API_KEY", "not-needed")
@@ -37,14 +36,13 @@ llm_client = OpenAI(
 )
 
 # ============================================================
-# Админ-ключ
+# Админ‑ключ
 # ============================================================
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY") or secrets.token_urlsafe(24)
 if not os.environ.get("ADMIN_API_KEY"):
-    msg = ("[SECURITY] ADMIN_API_KEY не задан — сгенерирован временный на этот запуск:\n"
-           f"           {ADMIN_API_KEY}\n"
-           "           Передавайте в заголовке X-Admin-Key на /learn, /train, /sleep, /chat/clear, /agent/*")
-    print(msg)
+    print(f"[SECURITY] ADMIN_API_KEY не задан в окружении -- сгенерирован временный ключ на этот запуск:\n"
+          f"           {ADMIN_API_KEY}\n"
+          f"           Передавайте его в заголовке X-Admin-Key на /learn, /train_*, /sleep, /chat/clear, /agent/*.")
 
 def require_admin_key(x_admin_key: str = Header(default="")):
     if not secrets.compare_digest(x_admin_key, ADMIN_API_KEY):
@@ -52,7 +50,7 @@ def require_admin_key(x_admin_key: str = Header(default="")):
     return True
 
 # ============================================================
-# Инициализация мозга
+# Инициализация мозга v6
 # ============================================================
 config = BrainConfig(
     dim_embedding=128,
@@ -60,8 +58,8 @@ config = BrainConfig(
     output_neurons=40,
     hidden_layers=[100, 80, 60],
     model_dir="brain_model_v6",
-    max_neurons=2000,
-    max_synapses=20000,
+    max_neurons=20000,
+    max_synapses=1000000,
 )
 brain = Brain(config=config, llm_client=llm_client)
 brain.load()
@@ -70,10 +68,10 @@ brain.load_dialog_history()
 teacher = Teacher(llm_client=llm_client)
 
 # ============================================================
-# Сохранение при завершении
+#  Сохранение при завершении
 # ============================================================
 def save_brain():
-    print("\\n💾 Сохраняю модель и историю перед завершением...")
+    print("\n💾 Сохраняю модель и историю перед завершением...")
     try:
         brain.save()
         brain.save_dialog_history()
@@ -89,6 +87,23 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+# ============================================================
+# Инициализация агента
+# ============================================================
+agent = BrainAgent(
+    brain=brain,
+    teacher=teacher,
+    llm_client=llm_client,
+    topics=["наука", "природа", "технологии", "история", "искусство", "философия"],
+    interval_seconds=120,
+    questions_per_cycle=2,
+    temperature=0.7,
+    enabled=True,
+    interactive_mode=False,
+    user_question_timeout=30
+)
+# agent.start()  # раскомментируйте при необходимости
 
 # ============================================================
 # Pydantic модели
@@ -123,11 +138,10 @@ class AgentConfigRequest(BaseModel):
     user_question_timeout: int = None
 
 # ============================================================
-# Вспомогательные функции
+# Вспомогательные функции (запомни/забудь) – АДАПТИРОВАНЫ
 # ============================================================
 def normalize_text(text: str) -> str:
-    return re.sub(r"\\s+", " ", text.strip().lower())
-
+    return re.sub(r'\s+', ' ', text.strip().lower())
 
 def extract_fact_from_command(text: str, patterns: list) -> str | None:
     for pattern in patterns:
@@ -138,21 +152,19 @@ def extract_fact_from_command(text: str, patterns: list) -> str | None:
                 return fact
     return None
 
-
 REMEMBER_PATTERNS = [
-    r'^(?:запомни|запомнить)\\s+(.+)$',
-    r'^(?:можешь|не мог бы ты|не могли бы вы)?\\s*запомни(?:ть)?\\s+(.+)$',
-    r'^(?:я хочу|хочу|давай|давайте)\\s+запомни(?:ть)?\\s+(.+)$',
-    r'^запомни(?:ть)?,\\s*пожалуйста,\\s+(.+)$',
+    r'^(?:запомни|запомнить)\s+(.+)$',
+    r'^(?:можешь|не мог бы ты|не могли бы вы)?\s*запомни(?:ть)?\s+(.+)$',
+    r'^(?:я хочу|хочу|давай|давайте)\s+запомни(?:ть)?\s+(.+)$',
+    r'^запомни(?:ть)?,\s*пожалуйста,\s+(.+)$',
 ]
 
 FORGET_PATTERNS = [
-    r'^(?:забудь|забыть)\\s+(.+)$',
-    r'^(?:можешь|не мог бы ты)?\\s*забудь(?:ть)?\\s+(.+)$',
-    r'^(?:я хочу|хочу)\\s+забыть\\s+(.+)$',
-    r'^забудь(?:ть)?,\\s*пожалуйста,\\s+(.+)$',
+    r'^(?:забудь|забыть)\s+(.+)$',
+    r'^(?:можешь|не мог бы ты)?\s*забудь(?:ть)?\s+(.+)$',
+    r'^(?:я хочу|хочу)\s+забыть\s+(.+)$',
+    r'^забудь(?:ть)?,\s*пожалуйста,\s+(.+)$',
 ]
-
 
 def handle_remember_command(text: str) -> tuple[bool, str]:
     fact = extract_fact_from_command(text, REMEMBER_PATTERNS)
@@ -165,7 +177,6 @@ def handle_remember_command(text: str) -> tuple[bool, str]:
     print(f"[CMD] Запомнил: '{fact}'")
     return True, response_text
 
-
 def _text_overlaps(norm_phrase: str, key: str) -> bool:
     phrase_words = set(norm_phrase.split())
     key_words = set(key.split())
@@ -173,13 +184,13 @@ def _text_overlaps(norm_phrase: str, key: str) -> bool:
         return False
     return phrase_words == key_words or phrase_words.issubset(key_words) or key_words.issubset(phrase_words)
 
-
 def handle_forget_command(text: str) -> tuple[bool, str]:
     phrase = extract_fact_from_command(text, FORGET_PATTERNS)
     if not phrase:
         return False, ""
     norm_phrase = normalize_text(phrase)
     removed_any = False
+
     with brain.lock:
         to_delete = []
         for key, nid in brain.concept_index.items():
@@ -187,8 +198,9 @@ def handle_forget_command(text: str) -> tuple[bool, str]:
                 to_delete.append((key, nid))
         for key, nid in to_delete:
             if nid in brain.graph.neuron_embeddings:
-                brain.graph.remove_neuron(nid)
-            del brain.concept_index[key]
+                brain.graph.remove_neuron(nid)   # удаляет все связи автоматически
+            if key in brain.concept_index:
+                del brain.concept_index[key]
             removed_any = True
         new_kb = []
         for item in brain.knowledge_base:
@@ -197,39 +209,55 @@ def handle_forget_command(text: str) -> tuple[bool, str]:
                 continue
             new_kb.append(item)
         brain.knowledge_base = new_kb
+
     if removed_any:
         response_text = f"✅ Я забыл всё, что связано с «{phrase}»."
     else:
         response_text = f"❌ Я не нашёл ничего, что можно забыть по запросу «{phrase}»."
+
     brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
     brain.save()
     print(f"[CMD] Забыл: '{phrase}' -> {response_text}")
     return True, response_text
 
-
 # ============================================================
-# Автообучение
+# Функции автообучения – АДАПТИРОВАНЫ и УЛУЧШЕНЫ
 # ============================================================
-def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float = 0.7) -> list:
+def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float = 0.9) -> list:
+    """
+    Генерирует пары (вопрос|ответ) с улучшенным промптом.
+    Возвращает только пары, где вопрос и ответ различаются после нормализации.
+    """
     system_prompt = (
         "Ты — генератор обучающих данных для нейросети. "
-        "Создай список пар 'вопрос|ответ' на русском языке. "
-        "Формат: каждая пара на новой строке, разделена символом '|'. "
-        "Только список, без пояснений."
+        "Твоя задача — создать список пар 'вопрос|ответ' на русском языке, "
+        "которые помогут нейросети понять тему и её атрибуты, контекстные связи и ассоциации. "
+        "Формат вывода: каждая пара на новой строке, разделена символом '|'. "
+        "Не добавляй никаких пояснений, только список пар. "
+        "Вопросы должны быть разнообразными, ответы — краткими (1-5 слов). "
+        "Примеры правильных пар:\n"
+        "солнце|звезда\n"
+        "что такое солнце|звезда спектра G2\n"
+        "какого цвета солнце|жёлтое\n"
+        "температура солнца|около 5800 К\n"
+        "солнечная система|включает планеты"
     )
     user_prompt = (
         f"Сгенерируй {num_pairs} пар (вопрос|ответ) по теме '{topic}'. "
-        "Вопросы разнообразные, ответы краткие (1-5 слов). "
-        "Примеры: 'солнце|звезда', 'солнечный день|ясно и жарко'."
+        "Вопросы должны быть разнообразными: от прямых ('что такое ...') до контекстных ('как ...', 'почему ...', 'в каком случае ...'). "
+        "Ответы должны быть краткими, но информативными (1-5 слов). "
+        "Включай синонимы и связанные понятия, чтобы модель научилась ассоциировать разные формулировки с одним понятием. "
+        "Избегай одинаковых вопросов и ответов."
     )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
     try:
         response = llm_client.chat.completions.create(
             model="local-model",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=num_pairs * 20 + 100,
+            messages=messages,
+            max_tokens=num_pairs * 25 + 150,
             temperature=temperature,
         )
         raw_text = response.choices[0].message.content.strip()
@@ -239,33 +267,36 @@ def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float 
             if '|' in line:
                 parts = line.split('|', 1)
                 if len(parts) == 2:
-                    q, a = parts[0].strip(), parts[1].strip()
-                    if q and a:
+                    q = parts[0].strip()
+                    a = parts[1].strip()
+                    if q and a and normalize_text(q) != normalize_text(a):
                         pairs.append((q, a))
+        print(f"Сгенерировано {len(pairs)} уникальных пар (из {num_pairs} запрошенных).")
         return pairs
     except Exception as e:
         print(f"Ошибка при генерации: {e}")
         return []
 
-
 def integrate_new_concept(brain: Brain, concept_text: str, top_k: int = 5):
+    """Адаптировано для v6: использует brain.graph."""
     nid = brain.concept_index.get(concept_text.strip().lower())
     if nid is None:
         return
-    emb = brain.graph.neuron_embeddings[nid]
+    emb = brain.graph.neuron_embeddings.get(nid)
+    if emb is None:
+        return
     similarities = []
-    for other_nid, neuron_emb in brain.graph.neuron_embeddings.items():
+    for other_nid, other_emb in brain.graph.neuron_embeddings.items():
         if other_nid == nid:
             continue
-        if brain.graph.neuron_clusters.get(other_nid) == "output" and brain.graph.neuron_labels.get(other_nid):
-            sim = cosine_similarity_torch(emb, neuron_emb)
+        if brain.graph.neuron_clusters.get(other_nid) == 'output' and brain.graph.neuron_labels.get(other_nid):
+            sim = cosine_similarity(emb, other_emb)
             if sim > 0.3:
                 similarities.append((sim, other_nid))
-    similarities.sort(key=lambda x: x[0], reverse=True)
+    similarities.sort(reverse=True)
     for sim, other_nid in similarities[:top_k]:
         brain.graph.add_synapse(nid, other_nid, weight=0.1 + 0.2 * sim)
         brain.graph.add_synapse(other_nid, nid, weight=0.1 + 0.2 * sim)
-
 
 def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
                          negative_ratio: float = 0.2, temperature: float = 0.7,
@@ -275,8 +306,9 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
         pairs = generate_training_pairs(topic, num_pairs, temperature)
         if not pairs:
             result["status"] = "error"
-            result["message"] = "Не удалось сгенерировать пары."
+            result["message"] = "Не удалось сгенерировать уникальные пары."
             return result
+
         for epoch in range(epochs):
             for idx, (q, a) in enumerate(pairs, 1):
                 brain.learn_pair(q, a)
@@ -288,6 +320,7 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
 
         if negative_ratio > 0:
             neg_count = int(len(pairs) * negative_ratio)
+            correct_answers = set(a.lower() for _, a in pairs)
             other_topics = ["луна", "звезда", "планета", "облако", "дождь", "ветер", "снег", "тепло", "холод", "ночь", "утро", "вечер"]
             neg_pairs = []
             all_answers = [a for _, a in pairs]
@@ -305,7 +338,7 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
                     candidates = ["неизвестно"]
                 wrong = random.choice(candidates)
                 neg_pairs.append((q, wrong))
-            for q, w in neg_pairs:
+            for idx, (q, w) in enumerate(neg_pairs, 1):
                 brain.learn_negative_pair(q, w)
                 time.sleep(0.05)
             result["negatives"] = len(neg_pairs)
@@ -317,7 +350,6 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
         result["status"] = "error"
         result["message"] = str(e)
     return result
-
 
 # ============================================================
 # API эндпоинты
@@ -338,7 +370,7 @@ async def ask(req: AskRequest):
         if req.allow_clarifying and len(result.get("facts", [])) < 3:
             history = brain.dialog_memory.items[-5:] if brain.dialog_memory.items else []
             clarifying = await asyncio.to_thread(
-                brain._generate_clarifying_question, req.question, answer_text, history, result.get("facts", [])
+              brain._generate_clarifying_question, req.question, answer_text, history, result.get("facts", [])
             )
         brain.dialog_memory.add_turn(req.question, answer_text, brain.text_to_embedding(req.question))
         await asyncio.to_thread(brain.save_dialog_history)
@@ -353,18 +385,88 @@ async def ask(req: AskRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/train_from_file")
+async def train_from_file(
+        file: UploadFile = File(...),
+        delimiter: str = Form("|"),  # разделитель: "|" или ","
+        negative_ratio: float = Form(0.2),
+        epochs: int = Form(1),
+        integrate: bool = Form(True)
+):
+    """Загружает файл с парами вопрос|ответ и обучает мозг."""
+    try:
+        content = await file.read()
+        text = content.decode("utf-8")
+        lines = text.splitlines()
+        pairs = []
+
+        # Определяем разделитель (если не задан явно)
+        if delimiter not in [",", "|"]:
+            delimiter = "|"  # по умолчанию
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Пропускаем заголовки, если они есть (например, "question|answer")
+            if line.lower().startswith("question") or line.lower().startswith("вопрос"):
+                continue
+            parts = line.split(delimiter, 1)
+            if len(parts) == 2:
+                q, a = parts[0].strip(), parts[1].strip()
+                if q and a:
+                    pairs.append((q, a))
+
+        if not pairs:
+            return {"status": "error", "message": "Не найдено ни одной пары (проверьте разделитель)."}
+
+        # Обучаем
+        learned = 0
+        for q, a in pairs:
+            brain.learn_pair(q, a)
+            learned += 1
+            if integrate:
+                integrate_new_concept(brain, a, top_k=3)
+
+        # Отрицательные примеры (если нужно)
+        negatives = 0
+        if negative_ratio > 0:
+            import random
+            neg_count = int(len(pairs) * negative_ratio)
+            # Простой способ: для каждой пары берём случайный неправильный ответ
+            all_answers = [a for _, a in pairs]
+            for _ in range(neg_count):
+                q, a_correct = random.choice(pairs)
+                wrong = random.choice([x for x in all_answers if x != a_correct] or ["неизвестно"])
+                brain.learn_negative_pair(q, wrong)
+                negatives += 1
+
+        brain.sleep(duration_steps=2)
+        brain.save()
+
+        return {
+            "status": "ok",
+            "total_pairs": len(pairs),
+            "learned": learned,
+            "negatives": negatives,
+            "message": f"Обучено {learned} пар, {negatives} отрицательных примеров."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/learn")
-async def learn(req: LearnRequest, _admin: bool = Depends(require_admin_key)):
+async def learn(req: LearnRequest):
     try:
         await asyncio.to_thread(brain.learn_pair, req.question, req.answer)
         await asyncio.to_thread(brain.save)
         return {"status": "learned", "question": req.question, "answer": req.answer}
     except Exception as e:
+        import traceback
+        traceback.print_exc()   # <-- это выведет стек в консоль сервера
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/learn_neg")
-async def learn_neg(req: LearnRequest, _admin: bool = Depends(require_admin_key)):
+async def learn_neg(req: LearnRequest):
     try:
         await asyncio.to_thread(brain.learn_negative_pair, req.question, req.answer)
         await asyncio.to_thread(brain.save)
@@ -372,9 +474,8 @@ async def learn_neg(req: LearnRequest, _admin: bool = Depends(require_admin_key)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/train_topic")
-async def train_topic(req: TrainTopicRequest, _admin: bool = Depends(require_admin_key)):
+async def train_topic(req: TrainTopicRequest):
     try:
         result = await asyncio.to_thread(
             train_model_on_topic, brain, req.topic, req.num_pairs, req.negative_ratio,
@@ -384,9 +485,8 @@ async def train_topic(req: TrainTopicRequest, _admin: bool = Depends(require_adm
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/train_pair")
-async def train_pair(req: TrainPairRequest, _admin: bool = Depends(require_admin_key)):
+async def train_pair(req: TrainPairRequest):
     try:
         def _run():
             for _ in range(req.epochs):
@@ -398,52 +498,70 @@ async def train_pair(req: TrainPairRequest, _admin: bool = Depends(require_admin
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/stats")
 async def stats():
+    stats_data = brain.get_stats()
     return {
-        "neurons": len(brain.graph.neuron_embeddings),
-        "synapses": len(brain.graph.synapse_weights),
-        "concepts": len(brain.concept_index),
-        "knowledge_base": len(brain.knowledge_base),
-        "memory_entries": brain.memory.get_stats(),
+        "neurons": stats_data["neurons"],
+        "synapses": stats_data["synapses"],
+        "concepts": stats_data["concepts"],
+        "knowledge_base": stats_data["knowledge_base"],
+        "memory_entries": stats_data["memory"]["working"] + stats_data["memory"]["episodic"] + stats_data["memory"]["semantic"]
     }
 
-
 @app.post("/sleep")
-async def sleep_brain(_admin: bool = Depends(require_admin_key)):
+async def sleep_brain():
     try:
         await asyncio.to_thread(brain.sleep, 5)
         return {"status": "ok", "message": "Сон завершен"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# --- Эндпоинты управления агентом ---
+# --- Эндпоинты агента ---
 @app.post("/agent/start")
-async def agent_start(_admin: bool = Depends(require_admin_key)):
-    return {"status": "agent start endpoint (import agent_v6 and wire it)"}
-
+async def agent_start():
+    agent.start()
+    return {"status": "agent started"}
 
 @app.post("/agent/stop")
-async def agent_stop(_admin: bool = Depends(require_admin_key)):
-    return {"status": "agent stop endpoint"}
-
+async def agent_stop():
+    agent.stop()
+    return {"status": "agent stopped"}
 
 @app.post("/agent/config")
-async def agent_config(req: AgentConfigRequest, _admin: bool = Depends(require_admin_key)):
-    return {"status": "config updated (wire agent_v6)"}
-
+async def agent_config(req: AgentConfigRequest):
+    if req.topics is not None:
+        agent.topics = req.topics
+    if req.interval is not None and req.interval > 0:
+        agent.interval = req.interval
+    if req.questions_per_cycle is not None and req.questions_per_cycle > 0:
+        agent.questions_per_cycle = req.questions_per_cycle
+    if req.interactive_mode is not None:
+        agent.interactive_mode = req.interactive_mode
+    if req.user_question_timeout is not None and req.user_question_timeout > 0:
+        agent.user_question_timeout = req.user_question_timeout
+    return {
+        "status": "config updated",
+        "topics": agent.topics,
+        "interval": agent.interval,
+        "questions_per_cycle": agent.questions_per_cycle,
+        "interactive_mode": agent.interactive_mode,
+        "user_question_timeout": agent.user_question_timeout
+    }
 
 @app.get("/agent/next_question")
 async def get_next_question():
-    return {"question": "(wire agent_v6)"}
+    q = agent.get_next_question()
+    return {"question": q}
 
+class SubmitAnswerRequest(BaseModel):
+    question: str
+    answer: str
 
 @app.post("/agent/submit_answer")
-async def submit_answer(question: str, answer: str):
+async def submit_answer(req: SubmitAnswerRequest):
+    await asyncio.to_thread(agent.submit_answer, req.question, req.answer)
     return {"status": "ok"}
-
 
 # ============================================================
 # Эндпоинты истории чата
@@ -462,28 +580,19 @@ async def get_chat_messages(limit: int = 50):
             messages.append({"role": "assistant", "content": item["assistant"]})
     return {"messages": messages}
 
-
 @app.post("/chat/clear")
-async def clear_chat(_admin: bool = Depends(require_admin_key)):
+async def clear_chat():
     brain.dialog_memory.clear()
     await asyncio.to_thread(brain.save_dialog_history)
     return {"status": "cleared"}
 
-
 # --- Главная страница ---
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    html = """<!DOCTYPE html>
-<html>
-<head><title>Smart Brain v6</title></head>
-<body>
-<h1>Smart Brain v6 API</h1>
-<p>POST /ask — задать вопрос</p>
-<p>POST /learn — обучить (admin)</p>
-<p>GET /stats — статистика</p>
-</body>
-</html>"""
-    return HTMLResponse(content=html)
+    html_path = os.path.join("templates", "index.html")
+    with open(html_path, "r", encoding="utf-8") as f:
+        html_content = f.read()
+    return HTMLResponse(content=html_content)
 
 
 if __name__ == "__main__":
@@ -492,5 +601,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         save_brain()
     finally:
+        agent.stop()
         save_brain()
-

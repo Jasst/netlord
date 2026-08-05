@@ -1,18 +1,25 @@
-# agent.py (полностью исправленный для v6)
+# agent.py – версия для Smart Brain v7
 import time
 import threading
 import random
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from openai import OpenAI
-from smart_brain_v6 import Brain, Teacher
+
+# Импорты из пакета brain (v7)
+from brain import Brain
+from brain.teacher import Teacher
+
 
 class BrainAgent:
+    """
+    Агент для автономного обучения и интерактивного опроса пользователя.
+    """
     def __init__(
         self,
         brain: Brain,
         teacher: Teacher,
         llm_client: OpenAI,
-        topics: List[str] = None,
+        topics: Optional[List[str]] = None,
         interval_seconds: int = 120,
         questions_per_cycle: int = 2,
         temperature: float = 0.7,
@@ -34,7 +41,7 @@ class BrainAgent:
         self._stop_flag = False
         self._thread = None
 
-        # Очередь вопроса для пользователя
+        # Для интерактивного режима
         self.pending_question = None
         self.active_question = None
         self.waiting_for_answer = False
@@ -59,7 +66,6 @@ class BrainAgent:
             if self.enabled:
                 self._cycle()
                 cycle_counter += 1
-                # Автосохранение каждые 10 циклов (для надёжности)
                 if cycle_counter % 10 == 0:
                     self.brain.save()
                     self.brain.save_dialog_history()
@@ -70,45 +76,30 @@ class BrainAgent:
                 time.sleep(1)
 
     def _cycle(self):
-        """Один цикл: либо задаём вопрос пользователю, либо учимся сами."""
+        """Один цикл: интерактивный вопрос или самообучение."""
         if self.interactive_mode:
-            # 1. Проверяем, есть ли активный вопрос (ожидает ответа)
             if self.active_question is not None:
                 print("[Agent] Ожидаем ответ на активный вопрос")
                 return
 
-            # 2. Получаем контекст: темы пользователя и слабые места сети
-            user_topics = self.brain.get_recent_user_topics(limit=3)
-            uncertain = self.brain.get_uncertain_concepts(threshold=0.3, limit=3)
-
-            # 3. Пытаемся сгенерировать контекстный вопрос
-            question = self.brain.generate_contextual_question(user_topics, uncertain)
-
-            # Если не получилось – генерируем случайный вопрос по теме
-            if not question:
-                if user_topics:
-                    topic = random.choice(user_topics)
-                else:
-                    topic = random.choice(self.topics)
-                question = self._generate_question_for_topic(topic)
+            # Генерируем вопрос (упрощённо – случайная тема)
+            topic = random.choice(self.topics)
+            question = self._generate_question_for_topic(topic)
 
             if not question:
                 print("[Agent] Не удалось сгенерировать вопрос")
                 return
 
-            # 4. Отправляем вопрос пользователю
             self.pending_question = question
             self.waiting_for_answer = True
             print(f"[Agent] Вопрос для пользователя: {question}")
 
-            # Ждём, пока фронтенд заберёт вопрос и пользователь ответит
             start = time.time()
             while self.waiting_for_answer and (time.time() - start) < self.user_question_timeout:
                 if self._stop_flag:
                     break
                 time.sleep(1)
 
-            # Если таймаут и вопрос всё ещё ожидает – сбрасываем
             if self.pending_question == question:
                 self.pending_question = None
                 self.waiting_for_answer = False
@@ -120,43 +111,46 @@ class BrainAgent:
 
             return
 
-        # ------------------------------------------------------------
-        # НЕИНТЕРАКТИВНЫЙ РЕЖИМ (самообучение)
-        # ------------------------------------------------------------
+        # ---------- НЕИНТЕРАКТИВНЫЙ РЕЖИМ (самообучение) ----------
         topic = random.choice(self.topics)
         questions = self._generate_questions(topic, self.questions_per_cycle)
         for q in questions:
             if self._stop_flag:
                 break
-            result = self.brain.generate_answer(q, temperature=self.temperature, use_rag=True)
-            answer = result["text"]
-            score, improved, details = self.teacher.evaluate(q, answer)
+            # Используем brain.step() для получения ответа
+            result = self.brain.step(q)
+            answer = result["answer"]
+
+            # Оценка через Teacher (использует LLM)
+            score, improved, _ = self.teacher.evaluate(q, answer)
 
             if score >= 0.7:
                 target = improved if improved != answer else answer
                 if target.lower() != q.lower():
                     self.brain.learn_pair(q, target)
-                    self.brain.save()                     # <-- СОХРАНЕНИЕ
-                    self.brain.save_dialog_history()      # <-- СОХРАНЕНИЕ ИСТОРИИ
+                    self.brain.save()
+                    self.brain.save_dialog_history()
                     print(f"[Agent] Выучено: {q} -> {target}")
             elif score <= 0.3:
                 if improved != answer and improved.lower() != q.lower():
                     self.brain.learn_negative_pair(q, answer)
                     self.brain.learn_pair(q, improved)
-                    self.brain.save()                     # <-- СОХРАНЕНИЕ
+                    self.brain.save()
                     self.brain.save_dialog_history()
                     print(f"[Agent] Отрицание и обучение: {q} -> {improved}")
                 else:
                     self.brain.learn_negative_pair(q, answer)
-                    self.brain.save()                     # <-- СОХРАНЕНИЕ
+                    self.brain.save()
                     self.brain.save_dialog_history()
                     print(f"[Agent] Отрицание: {q} -> {answer}")
             else:
-                self.brain.dialog_memory.add_turn(q, answer, self.brain.text_to_embedding(q))
-                self.brain.save_dialog_history()          # <-- СОХРАНЕНИЕ ТОЛЬКО ИСТОРИИ
+                # Сохраняем диалог в историю
+                self.brain.dialog_memory.append({"user": q, "assistant": answer, "time": time.time()})
+                self.brain.save_dialog_history()
                 print(f"[Agent] Диалог сохранён: {q} -> {answer}")
             time.sleep(1)
 
+    # ---------- Методы для взаимодействия с фронтендом ----------
     def get_next_question(self) -> Optional[str]:
         if self.pending_question is not None:
             q = self.pending_question
@@ -168,17 +162,17 @@ class BrainAgent:
     def submit_answer(self, question: str, answer: str):
         if self.active_question == question:
             self.brain.learn_pair(question, answer)
-            self.brain.save()                             # <-- СОХРАНЕНИЕ
-            self.brain.save_dialog_history()              # <-- СОХРАНЕНИЕ ИСТОРИИ
+            self.brain.save()
+            self.brain.save_dialog_history()
             print(f"[Agent] Пользователь ответил на '{question}' -> '{answer}', выучено.")
             self.active_question = None
             self.waiting_for_answer = False
-            self.brain.dialog_memory.add_turn(question, answer, self.brain.text_to_embedding(question))
+            self.brain.dialog_memory.append({"user": question, "assistant": answer, "time": time.time()})
         else:
             print(f"[Agent] Ответ на неактивный вопрос: {question} (активный: {self.active_question})")
 
+    # ---------- Вспомогательные генераторы вопросов ----------
     def _generate_question_for_topic(self, topic: str) -> Optional[str]:
-        """Генерирует один вопрос по теме (используется как fallback)."""
         try:
             response = self.llm.chat.completions.create(
                 model="local-model",
@@ -198,7 +192,6 @@ class BrainAgent:
             return None
 
     def _generate_questions(self, topic: str, count: int) -> List[str]:
-        """Генерирует несколько вопросов по теме (для самообучения)."""
         system_prompt = (
             "Ты — исследовательский агент. Твоя задача — придумать вопросы, "
             "которые помогут глубже понять тему. Вопросы должны быть разнообразными: "
