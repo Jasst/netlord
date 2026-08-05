@@ -69,10 +69,10 @@ class DifferentiableNeuralGraph(nn.Module):
         return x + delta
 
     def get_node_embeddings(self) -> torch.Tensor:
-        return self.node_emb
+        return self.node_emb.float()
 
     def get_embedding_by_id(self, nid: int) -> torch.Tensor:
-        return self.node_emb[nid-1]
+        return self.node_emb[nid - 1].float()
 
     def find_most_similar(self, query: torch.Tensor, threshold: float = 0.8) -> Optional[int]:
         if self.node_emb.shape[0] == 0:

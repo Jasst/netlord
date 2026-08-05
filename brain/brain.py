@@ -140,11 +140,18 @@ class Brain(nn.Module):
         if q_nid is not None and a_nid is not None:
             emb_q = self.graph.get_embedding_by_id(q_nid)
             emb_a = self.graph.get_embedding_by_id(a_nid)
-            sim = cosine_similarity(emb_q, emb_a)
-            loss = -torch.log(torch.sigmoid(torch.tensor(sim * 10.0)))
+            # Приводим к float32 и нормализуем
+            emb_q = F.normalize(emb_q.float().unsqueeze(0), p=2, dim=1)
+            emb_a = F.normalize(emb_a.float().unsqueeze(0), p=2, dim=1)
+            # Вычисляем косинусное сходство (тензор с градиентами)
+            sim = F.cosine_similarity(emb_q, emb_a, dim=1)
+            loss = -torch.log(torch.sigmoid(sim * 10.0))
+            # Добавляем среднее на случай, если sim – вектор (но это скаляр)
+            loss = loss.mean()
             loss.backward()
             self.optimizer.step()
             self.optimizer.zero_grad()
+            # Добавляем синапс для усиления связи
             self.graph.add_synapse(q_nid, a_nid, weight=0.2)
 
         self.memory.add_episodic(query_vec + answer_vec, {"q": input_text, "a": answer_text, "reward": reward})

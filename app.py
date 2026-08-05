@@ -471,6 +471,8 @@ async def learn(req: LearnRequest):
         await asyncio.to_thread(brain.save)
         return {"status": "learned", "question": req.question, "answer": req.answer}
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/learn_neg")
