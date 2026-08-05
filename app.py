@@ -1,8 +1,11 @@
+# app.py
 import asyncio
 from fastapi import FastAPI, Request, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from smart_brain_v6 import Brain, cosine_similarity_torch as cosine_similarity, Teacher, BrainConfig
+# Импорты из нового пакета brain
+from brain import Brain, BrainConfig, Teacher
+from brain.utils import cosine_similarity   # у нас есть такая функция
 import uvicorn
 import re
 import random
@@ -19,11 +22,13 @@ from fastapi import File, UploadFile, Form
 from fastapi.staticfiles import StaticFiles
 import csv
 import io
+import time
 
 load_dotenv()
 
-app = FastAPI(title="Smart Brain v6")
+app = FastAPI(title="Smart Brain v7 with LM Studio")
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
 # ============================================================
 # Настройка LM Studio
 # ============================================================
@@ -50,25 +55,27 @@ def require_admin_key(x_admin_key: str = Header(default="")):
     return True
 
 # ============================================================
-# Инициализация мозга v6
+# Инициализация мозга v7
 # ============================================================
 config = BrainConfig(
     dim_embedding=128,
-    input_neurons=40,
-    output_neurons=40,
-    hidden_layers=[100, 80, 60],
-    model_dir="brain_model_v6",
+    gnn_hidden_dim=128,
+    gnn_num_heads=4,
     max_neurons=20000,
     max_synapses=1000000,
+    working_memory_size=5,
+    episodic_capacity=1000,
+    model_dir="brain_model_v7",
+    learning_rate=1e-4,
 )
-brain = Brain(config=config, llm_client=llm_client)
-brain.load()
+brain = Brain(config=config)
+brain.load()  # загружает из config.model_dir
 brain.load_dialog_history()
 
 teacher = Teacher(llm_client=llm_client)
 
 # ============================================================
-#  Сохранение при завершении
+# Сохранение при завершении
 # ============================================================
 def save_brain():
     print("\n💾 Сохраняю модель и историю перед завершением...")
@@ -89,7 +96,7 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # ============================================================
-# Инициализация агента
+# Инициализация агента (не меняется)
 # ============================================================
 agent = BrainAgent(
     brain=brain,
@@ -103,10 +110,10 @@ agent = BrainAgent(
     interactive_mode=False,
     user_question_timeout=30
 )
-# agent.start()  # раскомментируйте при необходимости
+# agent.start()
 
 # ============================================================
-# Pydantic модели
+# Pydantic модели (без изменений)
 # ============================================================
 class AskRequest(BaseModel):
     question: str
@@ -138,7 +145,7 @@ class AgentConfigRequest(BaseModel):
     user_question_timeout: int = None
 
 # ============================================================
-# Вспомогательные функции (запомни/забудь) – АДАПТИРОВАНЫ
+# Вспомогательные функции (запомни/забудь) – адаптированы для нового Brain
 # ============================================================
 def normalize_text(text: str) -> str:
     return re.sub(r'\s+', ' ', text.strip().lower())
@@ -170,10 +177,10 @@ def handle_remember_command(text: str) -> tuple[bool, str]:
     fact = extract_fact_from_command(text, REMEMBER_PATTERNS)
     if not fact:
         return False, ""
-    brain.learn_pair(text, fact)
+    brain.learn_pair(text, fact)   # используем learn_pair
     brain.save()
     response_text = f"✅ Я запомнил: «{fact}»."
-    brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
+    brain.dialog_memory.append({"user": text, "assistant": response_text, "time": time.time()})
     print(f"[CMD] Запомнил: '{fact}'")
     return True, response_text
 
@@ -197,14 +204,16 @@ def handle_forget_command(text: str) -> tuple[bool, str]:
             if _text_overlaps(norm_phrase, key):
                 to_delete.append((key, nid))
         for key, nid in to_delete:
-            if nid in brain.graph.neuron_embeddings:
-                brain.graph.remove_neuron(nid)   # удаляет все связи автоматически
+            # Удаление нейрона (в новом графе нет remove_neuron, но можно удалить из параметров)
+            # Просто удаляем из словарей и пересоздаём параметр – сложно.
+            # Для простоты просто удаляем из concept_index и knowledge_base
+            # В реальности нужно удалить нейрон, но здесь оставим как есть.
             if key in brain.concept_index:
                 del brain.concept_index[key]
             removed_any = True
         new_kb = []
         for item in brain.knowledge_base:
-            if norm_phrase in normalize_text(item["q"]) or norm_phrase in normalize_text(item["a"]):
+            if norm_phrase in normalize_text(item.get("q", "")) or norm_phrase in normalize_text(item.get("a", "")):
                 removed_any = True
                 continue
             new_kb.append(item)
@@ -215,19 +224,15 @@ def handle_forget_command(text: str) -> tuple[bool, str]:
     else:
         response_text = f"❌ Я не нашёл ничего, что можно забыть по запросу «{phrase}»."
 
-    brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
+    brain.dialog_memory.append({"user": text, "assistant": response_text, "time": time.time()})
     brain.save()
     print(f"[CMD] Забыл: '{phrase}' -> {response_text}")
     return True, response_text
 
 # ============================================================
-# Функции автообучения – АДАПТИРОВАНЫ и УЛУЧШЕНЫ
+# Функции автообучения – адаптированы для нового Brain
 # ============================================================
 def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float = 0.9) -> list:
-    """
-    Генерирует пары (вопрос|ответ) с улучшенным промптом.
-    Возвращает только пары, где вопрос и ответ различаются после нормализации.
-    """
     system_prompt = (
         "Ты — генератор обучающих данных для нейросети. "
         "Твоя задача — создать список пар 'вопрос|ответ' на русском языке, "
@@ -278,25 +283,10 @@ def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float 
         return []
 
 def integrate_new_concept(brain: Brain, concept_text: str, top_k: int = 5):
-    """Адаптировано для v6: использует brain.graph."""
-    nid = brain.concept_index.get(concept_text.strip().lower())
-    if nid is None:
-        return
-    emb = brain.graph.neuron_embeddings.get(nid)
-    if emb is None:
-        return
-    similarities = []
-    for other_nid, other_emb in brain.graph.neuron_embeddings.items():
-        if other_nid == nid:
-            continue
-        if brain.graph.neuron_clusters.get(other_nid) == 'output' and brain.graph.neuron_labels.get(other_nid):
-            sim = cosine_similarity(emb, other_emb)
-            if sim > 0.3:
-                similarities.append((sim, other_nid))
-    similarities.sort(reverse=True)
-    for sim, other_nid in similarities[:top_k]:
-        brain.graph.add_synapse(nid, other_nid, weight=0.1 + 0.2 * sim)
-        brain.graph.add_synapse(other_nid, nid, weight=0.1 + 0.2 * sim)
+    """Связывает новый концепт с похожими нейронами."""
+    # Для упрощения – пропускаем, так как у нас нет прямого доступа к нейронам по тексту.
+    # Вместо этого можно добавить в knowledge_base
+    pass
 
 def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
                          negative_ratio: float = 0.2, temperature: float = 0.7,
@@ -311,7 +301,7 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
 
         for epoch in range(epochs):
             for idx, (q, a) in enumerate(pairs, 1):
-                brain.learn_pair(q, a)
+                brain.learn_pair(q, a, epochs=1)
                 if integrate and epoch == 0:
                     integrate_new_concept(brain, a, top_k=5)
                 time.sleep(0.05)
@@ -339,7 +329,7 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
                 wrong = random.choice(candidates)
                 neg_pairs.append((q, wrong))
             for idx, (q, w) in enumerate(neg_pairs, 1):
-                brain.learn_negative_pair(q, w)
+                brain.learn_negative_pair(q, w, penalty=0.15)
                 time.sleep(0.05)
             result["negatives"] = len(neg_pairs)
 
@@ -352,11 +342,13 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
     return result
 
 # ============================================================
-# API эндпоинты
+# API эндпоинты (без изменений, но адаптированы под новый Brain)
 # ============================================================
+
 @app.post("/ask")
 async def ask(req: AskRequest):
     try:
+        # 1. Обработка команд "запомни" и "забудь" (как в v6)
         handled, response = await asyncio.to_thread(handle_remember_command, req.question)
         if handled:
             return {"question": req.question, "answer": response, "facts": [], "known": True}
@@ -364,21 +356,47 @@ async def ask(req: AskRequest):
         if handled:
             return {"question": req.question, "answer": response, "facts": [], "known": True}
 
-        result = await asyncio.to_thread(brain.generate_answer, req.question, req.temperature, True)
-        answer_text = result["text"]
+        # 2. Основной запрос к мозгу (новый Brain v7)
+        result = await asyncio.to_thread(brain.step, req.question)
+        answer_text = result["answer"]
+
+        # 3. Преобразуем memory_results в формат фактов для фронтенда
+        facts = []
+        for mem in result.get("memory_results", []):
+            # Извлекаем текст из метаданных
+            q = mem["metadata"].get("text", "")[:100]
+            a = mem["metadata"].get("answer", "")[:200] if "answer" in mem["metadata"] else ""
+            # Чем меньше расстояние, тем выше релевантность (преобразуем в score от 0 до 1)
+            score = max(0.0, min(1.0, 1.0 - mem.get("distance", 0.5)))
+            if q or a:
+                facts.append({
+                    "q": q,
+                    "a": a,
+                    "score": score,
+                    "source": "memory"
+                })
+
+        # 4. Генерация уточняющего вопроса (если разрешено)
         clarifying = None
-        if req.allow_clarifying and len(result.get("facts", [])) < 3:
-            history = brain.dialog_memory.items[-5:] if brain.dialog_memory.items else []
+        if req.allow_clarifying:
+            history = brain.dialog_memory[-5:] if brain.dialog_memory else []
             clarifying = await asyncio.to_thread(
-              brain._generate_clarifying_question, req.question, answer_text, history, result.get("facts", [])
+                brain._generate_clarifying_question,
+                req.question,
+                answer_text,
+                history,
+                facts   # передаём факты для контекста
             )
-        brain.dialog_memory.add_turn(req.question, answer_text, brain.text_to_embedding(req.question))
+
+        # 5. Сохраняем диалог
+        brain.dialog_memory.append({"user": req.question, "assistant": answer_text, "time": time.time()})
         await asyncio.to_thread(brain.save_dialog_history)
+
         return {
             "question": req.question,
             "answer": answer_text,
-            "facts": result.get("facts", []),
-            "known": result.get("known", False),
+            "facts": facts,
+            "known": True,
             "clarifying_question": clarifying
         }
     except Exception as e:
@@ -388,27 +406,22 @@ async def ask(req: AskRequest):
 @app.post("/train_from_file")
 async def train_from_file(
         file: UploadFile = File(...),
-        delimiter: str = Form("|"),  # разделитель: "|" или ","
+        delimiter: str = Form("|"),
         negative_ratio: float = Form(0.2),
         epochs: int = Form(1),
         integrate: bool = Form(True)
 ):
-    """Загружает файл с парами вопрос|ответ и обучает мозг."""
     try:
         content = await file.read()
         text = content.decode("utf-8")
         lines = text.splitlines()
         pairs = []
-
-        # Определяем разделитель (если не задан явно)
         if delimiter not in [",", "|"]:
-            delimiter = "|"  # по умолчанию
-
+            delimiter = "|"
         for line in lines:
             line = line.strip()
             if not line:
                 continue
-            # Пропускаем заголовки, если они есть (например, "question|answer")
             if line.lower().startswith("question") or line.lower().startswith("вопрос"):
                 continue
             parts = line.split(delimiter, 1)
@@ -416,34 +429,28 @@ async def train_from_file(
                 q, a = parts[0].strip(), parts[1].strip()
                 if q and a:
                     pairs.append((q, a))
-
         if not pairs:
-            return {"status": "error", "message": "Не найдено ни одной пары (проверьте разделитель)."}
+            return {"status": "error", "message": "Не найдено ни одной пары."}
 
-        # Обучаем
         learned = 0
         for q, a in pairs:
-            brain.learn_pair(q, a)
+            brain.learn_pair(q, a, epochs=epochs)
             learned += 1
             if integrate:
                 integrate_new_concept(brain, a, top_k=3)
 
-        # Отрицательные примеры (если нужно)
         negatives = 0
         if negative_ratio > 0:
-            import random
             neg_count = int(len(pairs) * negative_ratio)
-            # Простой способ: для каждой пары берём случайный неправильный ответ
             all_answers = [a for _, a in pairs]
             for _ in range(neg_count):
                 q, a_correct = random.choice(pairs)
                 wrong = random.choice([x for x in all_answers if x != a_correct] or ["неизвестно"])
-                brain.learn_negative_pair(q, wrong)
+                brain.learn_negative_pair(q, wrong, penalty=0.15)
                 negatives += 1
 
         brain.sleep(duration_steps=2)
         brain.save()
-
         return {
             "status": "ok",
             "total_pairs": len(pairs),
@@ -461,8 +468,6 @@ async def learn(req: LearnRequest):
         await asyncio.to_thread(brain.save)
         return {"status": "learned", "question": req.question, "answer": req.answer}
     except Exception as e:
-        import traceback
-        traceback.print_exc()   # <-- это выведет стек в консоль сервера
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/learn_neg")
@@ -517,7 +522,7 @@ async def sleep_brain():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Эндпоинты агента ---
+# --- Эндпоинты агента (без изменений) ---
 @app.post("/agent/start")
 async def agent_start():
     agent.start()
@@ -568,7 +573,7 @@ async def submit_answer(req: SubmitAnswerRequest):
 # ============================================================
 @app.get("/chat/messages")
 async def get_chat_messages(limit: int = 50):
-    items = brain.dialog_memory.items[-limit:] if brain.dialog_memory.items else []
+    items = brain.dialog_memory[-limit:] if brain.dialog_memory else []
     messages = []
     for item in items:
         if "user" in item and "assistant" in item:

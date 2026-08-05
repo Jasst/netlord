@@ -1,0 +1,28 @@
+# Core web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.12          # для обработки файлов в FastAPI
+
+# Machine Learning & Deep Learning
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+torch-geometric==2.5.0            # GNN (Graph Neural Networks)
+faiss-cpu==1.8.0                  # или faiss-gpu при наличии CUDA
+
+# Sentence embeddings
+sentence-transformers==2.2.2
+
+# LLM client (OpenAI‑совместимый)
+openai==1.35.0
+
+# Utilities
+python-dotenv==1.0.0
+networkx==3.3
+numpy==1.26.4
+scipy==1.13.1
+
+# (опционально) для дополнительных возможностей
+# tqdm==4.66.4                    # прогресс-бары
+# matplotlib==3.9.0               # для визуализации
+# seaborn==0.13.2
