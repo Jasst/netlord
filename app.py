@@ -61,21 +61,38 @@ def require_admin_key(x_admin_key: str = Header(default="")):
 # Инициализация мозга v7
 # ============================================================
 config = BrainConfig(
-    dim_embedding=128,
-    gnn_hidden_dim=128,
-    gnn_num_heads=4,
-    max_neurons=20000,
-    max_synapses=1000000,
-    working_memory_size=5,
-    episodic_capacity=1000,
+    # Качество эмбеддингов – размерность 512 (в 4 раза выше, чем 128)
+    dim_embedding=512,
+    # Скрытый слой GNN – тоже 512 для максимальной выразительности
+    gnn_hidden_dim=512,
+    # 8 голов внимания – баланс между качеством и скоростью
+    gnn_num_heads=8,
+    # До 200 000 нейронов – это ~200 000 понятий
+    max_neurons=200000,
+    # До 5 000 000 синапсов (рёбер графа)
+    max_synapses=5000000,
+    # Рабочая память – 20 последних запросов
+    working_memory_size=20,
+    # Эпизодическая память – 20 000 записей в FAISS
+    episodic_capacity=20000,
+    # Директория модели
     model_dir="brain_model_v7",
+    # Скорость обучения
     learning_rate=1e-4,
+    # Автосохранение каждые 50 шагов
+    checkpoint_every=50,
 )
 brain = Brain(config=config)
 brain.load()  # загружает из config.model_dir
 brain.load_dialog_history()
 
 teacher = Teacher(llm_client=llm_client)
+brain = Brain(config=config)
+print(f"[GPU] Используется устройство: {brain.device}")
+print(f"[GPU] CUDA доступна: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"[GPU] Модель GPU: {torch.cuda.get_device_name(0)}")
+    print(f"[GPU] Объём VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
 # ============================================================
 # Сохранение при завершении

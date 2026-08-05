@@ -136,28 +136,56 @@ class Brain(nn.Module):
         query_vec = self.text_to_embedding(input_text)
         answer_vec = self.text_to_embedding(answer_text)
 
-        q_nid = self.graph.find_most_similar(query_vec, threshold=0.0)
-        a_nid = self.graph.find_most_similar(answer_vec, threshold=0.0)
+        # Получаем или создаём нейроны для вопроса и ответа
+        q_nid = self.graph.find_most_similar(query_vec, threshold=0.7)
+        a_nid = self.graph.find_most_similar(answer_vec, threshold=0.7)
+        if q_nid is None:
+            q_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="concept", layer=0)
+            norm_q = self.normalize_text(input_text)
+            self.concept_index[norm_q] = q_nid
+        if a_nid is None:
+            a_nid = self.graph.add_node(answer_vec, label=answer_text[:30], cluster="concept", layer=0)
+            norm_a = self.normalize_text(answer_text)
+            self.concept_index[norm_a] = a_nid
+
         if q_nid is not None and a_nid is not None:
+            self.graph.add_synapse(q_nid, a_nid, weight=0.2)
+
+            # Градиентное обновление эмбеддингов (контрастная потеря)
             emb_q = self.graph.get_embedding_by_id(q_nid)
             emb_a = self.graph.get_embedding_by_id(a_nid)
-            # Приводим к float32 и нормализуем
             emb_q = F.normalize(emb_q.float().unsqueeze(0), p=2, dim=1)
             emb_a = F.normalize(emb_a.float().unsqueeze(0), p=2, dim=1)
-            # Вычисляем косинусное сходство (тензор с градиентами)
             sim = F.cosine_similarity(emb_q, emb_a, dim=1)
             loss = -torch.log(torch.sigmoid(sim * 10.0))
-            # Добавляем среднее на случай, если sim – вектор (но это скаляр)
             loss = loss.mean()
             loss.backward()
             self.optimizer.step()
             self.optimizer.zero_grad()
-            # Добавляем синапс для усиления связи
-            self.graph.add_synapse(q_nid, a_nid, weight=0.2)
 
+        # Добавляем в knowledge_base
+        self._add_to_knowledge_base(input_text, answer_text)
+
+        # Запись в эпизодическую память
         self.memory.add_episodic(query_vec + answer_vec, {"q": input_text, "a": answer_text, "reward": reward})
         if self.step_counter % 50 == 0:
             self.memory.consolidate()
+
+    def _add_to_knowledge_base(self, q: str, a: str):
+        for item in self.knowledge_base:
+            if item["q"] == q and item["a"] == a:
+                return
+        emb = self.text_to_embedding(q + " " + a)
+        self.knowledge_base.append({
+            "q": q,
+            "a": a,
+            "emb": emb,
+            "time": time.time(),
+            "confidence": 0.5,
+            "access_count": 0
+        })
+        if len(self.knowledge_base) > self.config.max_kb_size:
+            self.knowledge_base.pop(0)
 
     # ---------- Совместимые методы для app.py ----------
     def learn_pair(self, input_text: str, output_text: str, reinforce_boost: float = 0.15, epochs: int = 1):

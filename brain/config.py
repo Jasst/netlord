@@ -6,7 +6,7 @@ from typing import List, Optional
 class BrainConfig:
     # Размерность эмбеддингов
     dim_embedding: int = 128
-
+    max_kb_size: int = 5000
     # Архитектура графа (GNN)
     gnn_hidden_dim: int = 128
     gnn_num_layers: int = 2
