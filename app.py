@@ -23,6 +23,9 @@ from fastapi.staticfiles import StaticFiles
 import csv
 import io
 import time
+import torch
+
+torch.set_default_dtype(torch.float32)
 
 load_dotenv()
 

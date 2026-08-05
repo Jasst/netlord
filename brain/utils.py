@@ -16,17 +16,17 @@ class EmbeddingProvider:
     def _project(self, vec: torch.Tensor) -> torch.Tensor:
         src_dim = vec.shape[-1]
         if src_dim == self.dim:
-            return vec
+            return vec.float()  # <-- добавлено .float()
         if self._projection is None or self._projection.shape[0] != src_dim:
             rng = np.random.RandomState(42)
-            proj = rng.randn(src_dim, self.dim).astype(np.float32) / np.sqrt(self.dim)
+            proj = rng.randn(src_dim, self.dim).astype(np.float32)
             self._projection = torch.from_numpy(proj)
-        return F.normalize(vec @ self._projection, p=2, dim=-1)
+        return F.normalize(vec.float() @ self._projection, p=2, dim=-1)  # <-- .float()
 
     def get_embedding(self, text: str) -> torch.Tensor:
         if text in self._cache:
             return self._cache[text].clone()
-        emb = torch.from_numpy(self.model.encode(text, normalize_embeddings=True))
+        emb = torch.from_numpy(self.model.encode(text, normalize_embeddings=True)).float()  # <-- добавлено .float()
         emb = self._project(emb)
         self._cache[text] = emb.clone()
         return emb

@@ -65,7 +65,7 @@ class Brain(nn.Module):
         return x
 
     def text_to_embedding(self, text: str) -> torch.Tensor:
-        return self.embedder.get_embedding(text).to(self.device)
+        return self.embedder.get_embedding(text).float().to(self.device)  # <-- добавлено .float()
 
     # ---------- Основной шаг (step) ----------
     def step(self, input_text: str) -> Dict[str, Any]:

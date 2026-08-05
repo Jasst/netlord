@@ -26,17 +26,23 @@ class DifferentiableNeuralGraph(nn.Module):
         self._edges = []  # list of (from_id, to_id, weight)
 
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden", layer: int = 0) -> int:
+        # Приводим к float32, чтобы избежать ошибок несовместимости типов
+        embedding = embedding.float()
+
         if self.node_emb.shape[0] >= self.max_nodes:
             raise RuntimeError("Max neurons reached")
         nid = self._next_nid
         self._next_nid += 1
+
         new_emb = F.normalize(embedding.unsqueeze(0), p=2, dim=1)
         old_emb = self.node_emb.data
         new_emb_all = torch.cat([old_emb, new_emb], dim=0)
         self.node_emb = nn.Parameter(new_emb_all)
+
         old_mask = self.node_mask
         new_mask = torch.cat([old_mask, torch.tensor([True])], dim=0)
         self.register_buffer("node_mask", new_mask)
+
         self.neuron_labels[nid] = label
         self.neuron_clusters[nid] = cluster
         self.neuron_layers[nid] = layer
