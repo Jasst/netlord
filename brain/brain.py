@@ -10,7 +10,7 @@ import re
 import threading
 from collections import deque
 from typing import List, Dict, Optional, Any
-
+import pickle
 from brain.config import BrainConfig
 from brain.graph import DifferentiableNeuralGraph
 from brain.memory import HierarchicalMemory
@@ -230,13 +230,28 @@ class Brain(nn.Module):
         path = model_dir or self.config.model_dir
         os.makedirs(path, exist_ok=True)
         torch.save(self.graph.state_dict(), f"{path}/graph.pth")
+
+        # Сохраняем рёбра (синапсы)
+        with open(f"{path}/edges.pkl", "wb") as f:
+            pickle.dump(self.graph._edges, f)
+
+        # Подготавливаем knowledge_base для JSON (убираем тензоры)
+        kb_serializable = []
+        for item in self.knowledge_base:
+            kb_serializable.append({
+                "q": item["q"],
+                "a": item["a"],
+                "time": item.get("time", 0),
+                "confidence": item.get("confidence", 0.5),
+                "access_count": item.get("access_count", 0)
+            })
         meta = {
             "step_counter": self.step_counter,
             "learn_counter": self._learn_counter,
             "concept_index": self.concept_index,
-            "knowledge_base": self.knowledge_base,
-            "num_neurons": self.graph.node_emb.shape[0],  # <-- добавляем
-            "num_edges": len(self.graph._edges),  # <-- добавляем
+            "knowledge_base": kb_serializable,
+            "num_neurons": self.graph.node_emb.shape[0],
+            "num_edges": len(self.graph._edges),
         }
         with open(f"{path}/meta.json", "w") as f:
             json.dump(meta, f)
@@ -257,16 +272,14 @@ class Brain(nn.Module):
             # Добавляем недостающие нейроны, если их меньше, чем в сохранённой модели
             current_num = self.graph.node_emb.shape[0]
             if current_num < num_neurons:
-                # Добавляем случайные нейроны до нужного количества
                 for _ in range(num_neurons - current_num):
                     emb = random_vector(self.dim)
                     self.graph.add_node(emb, label="loaded", cluster="hidden", layer=0)
                 print(f"[Brain] Добавлено {num_neurons - current_num} нейронов для загрузки.")
-            # Загружаем state_dict
+            # Загружаем state_dict графа
             graph_path = f"{path}/graph.pth"
             if os.path.exists(graph_path):
                 state_dict = torch.load(graph_path, map_location=self.device)
-                # Фильтруем по размеру
                 model_state = self.graph.state_dict()
                 filtered_state = {}
                 for key, value in state_dict.items():
@@ -276,6 +289,14 @@ class Brain(nn.Module):
                         print(
                             f"[Brain] Пропуск загрузки {key}: размер {value.shape} -> {model_state[key].shape if key in model_state else 'not found'}")
                 self.graph.load_state_dict(filtered_state, strict=False)
+            # Загружаем рёбра (синапсы)
+            edges_path = f"{path}/edges.pkl"
+            if os.path.exists(edges_path):
+                with open(edges_path, "rb") as f:
+                    self.graph._edges = pickle.load(f)
+                print(f"[Brain] Загружено {len(self.graph._edges)} синапсов.")
+            else:
+                self.graph._edges = []
             # Загружаем остальные метаданные
             self.step_counter = meta.get("step_counter", 0)
             self._learn_counter = meta.get("learn_counter", 0)
