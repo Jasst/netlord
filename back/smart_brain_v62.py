@@ -60,7 +60,6 @@ LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234
 LM_STUDIO_API_KEY = os.environ.get("LM_STUDIO_API_KEY", "not-needed")
 
 
-
 @dataclass
 class BrainConfig:
     """Конфигурация мозга v6."""
@@ -70,9 +69,9 @@ class BrainConfig:
     hidden_layers: List[int] = field(default_factory=lambda: [100, 80, 60])
     max_neurons: int = 2000
     max_synapses: int = 20000
-    model_dir: str = "brain_model_v6"
+    model_dir: str = "brain_model_v6"          # <-- директория вместо файла
 
-    # STDP (оставлено для совместимости, но фактически не используется)
+    # STDP
     stdp_tau: float = 2.0
     stdp_a_plus: float = 0.03
     stdp_a_minus: float = 0.032
@@ -105,12 +104,6 @@ class BrainConfig:
 
     # Сохранение
     auto_save_every: int = 3
-
-    # ===== НОВЫЕ ПОЛЯ ДЛЯ УЛУЧШЕНИЙ =====
-    use_global_context: bool = True          # Глобальный GRU-контекст для длинных зависимостей
-    use_creative_merging: bool = True        # Гибридные нейроны при learn
-    use_sleep_associations: bool = True      # Ассоциативные мостики во сне
-    context_gru_lr: float = 0.01             # (резерв) скорость обучения GRU
 
 
 # ============================
@@ -523,7 +516,10 @@ class NeuralGraph:
             self.synapse_frequency[sid] = 0.0
             self.synapse_energy[sid] = 1.0
             self.synapse_learning_rate[sid] = 0.01
-            self.synapse_lr_momentum[sid] = 0.0  # ← ВОССТАНОВЛЕНО
+            self.synapse_lr_momentum[sid] = 0.0
+            self.synapse_eligibility[sid] = 0.0
+            self.synapse_tag_strength[sid] = 0.0
+            self.synapse_structural_stability[sid] = 1.0
             self.synapse_is_inhibitory[sid] = is_inhibitory
             self.synapse_reward[sid] = 0.0
             self.synapse_pred_error[sid] = 0.0
@@ -601,13 +597,21 @@ class NeuralGraph:
                     self.synapse_confidence[sid] = max(0.0, self.synapse_confidence[sid] - 0.00025)
                     self.synapse_energy[sid] = max(0.0, self.synapse_energy[sid] - 0.0001)
                     self.synapse_frequency[sid] *= 0.999
-                    # УДАЛЕНЫ: eligibility, tag_strength, structural_stability
+                    self.synapse_eligibility[sid] *= 0.9
+                    self.synapse_tag_strength[sid] *= 0.95
+                    self.synapse_structural_stability[sid] *= 0.9999
 
-                    # Проверка на удаление
+                    # find source neuron for age check
+                    src = None
+                    for u, v, d in self.graph.edges(data=True):
+                        if d.get("sid") == sid:
+                            src = u
+                            break
                     age = now - self.synapse_last_used.get(sid, now)
-                    if (abs(self.synapse_weights[sid]) < 0.01 and age > 3600 * 24 * 30) or \
-                            (self.synapse_usage_count.get(sid, 0) == 0 and
-                             now - self.synapse_creation_time.get(sid, now) > 3600 * 24 * 30):
+                    if (self.synapse_structural_stability[sid] < 0.1 or
+                        (abs(self.synapse_weights[sid]) < 0.01 and age > 3600 * 24 * 30) or
+                        (self.synapse_usage_count[sid] == 0 and
+                         now - self.synapse_creation_time.get(sid, now) > 3600 * 24 * 30)):
                         to_remove.append(sid)
                 for sid in to_remove:
                     self._remove_synapse_by_sid(sid)
@@ -621,10 +625,10 @@ class NeuralGraph:
                 sc = (abs(self.synapse_weights[sid]) * 0.3 +
                       self.synapse_frequency[sid] * 0.2 +
                       self.synapse_confidence[sid] * 0.15 +
-                      # УДАЛЕНЫ: tag_strength, structural_stability
+                      self.synapse_tag_strength[sid] * 0.15 +
                       (self.synapse_usage_count[sid] /
                        (time.time() - self.synapse_creation_time.get(sid, time.time()) + 1)) * 0.1 +
-                      self.synapse_energy[sid] * 0.1)  # добавляем энергию как показатель стабильности
+                      self.synapse_structural_stability[sid] * 0.1)
                 scored.append((sc, sid))
             scored.sort(key=lambda x: x[0])
             to_remove = []
@@ -832,57 +836,7 @@ class NeuralGraph:
         logger.info(f"NeuralGraph loaded: {len(self.neuron_embeddings)} neurons, "
                     f"{len(self.synapse_weights)} synapses")
 
-class ShortMemoryWrapper:
-    """Обёртка для совместимости со старым кодом, перенаправляет в HierarchicalMemory."""
-    def __init__(self, brain):
-        self.brain = brain
 
-    def add(self, item):
-        # item ожидается как (signal, activated)
-        if isinstance(item, tuple) and len(item) > 0:
-            signal = item[0]
-            emb = signal.embedding if hasattr(signal, 'embedding') else torch.zeros(self.brain.dim)
-        else:
-            emb = torch.zeros(self.brain.dim)
-        self.brain.memory.add(
-            content=item,
-            embedding=emb,
-            memory_level=MemoryLevel.WORKING,
-            importance=0.3
-        )
-
-    def get_recent(self, n=10):
-        # Возвращаем пустой список, т.к. данные теперь в SQLite
-        return []
-
-    def clear(self):
-        # Не удаляем из памяти, только сбрасываем локальный кэш (его нет)
-        pass
-
-class LongMemoryWrapper:
-    """Обёртка для долговременной памяти, перенаправляет в SEMANTIC."""
-    def __init__(self, brain):
-        self.brain = brain
-
-    def add(self, item):
-        # Перенаправляем в семантическую память с высоким приоритетом
-        if isinstance(item, tuple) and len(item) > 0:
-            signal = item[0]
-            emb = signal.embedding if hasattr(signal, 'embedding') else torch.zeros(self.brain.dim)
-        else:
-            emb = torch.zeros(self.brain.dim)
-        self.brain.memory.add(
-            content=item,
-            embedding=emb,
-            memory_level=MemoryLevel.SEMANTIC,
-            importance=0.8
-        )
-
-    def get_recent(self, n=10):
-        return []
-
-    def clear(self):
-        pass
 
 # ============================
 # Hierarchical Memory (SQLite)
@@ -1350,11 +1304,10 @@ class Brain:
         # Self-reflection
         self.reflection = SelfReflection(self.llm_client)
 
-        # Legacy memory (перенаправляем в HierarchicalMemory через обёртки)
-        # Оставляем для обратной совместимости, но фактически не используем
+        # Legacy memory
         self.dialog_memory = DialogMemory(max_turns=self.config.dialog_memory_turns)
-        self.short_memory = ShortMemory(max_size=self.config.short_memory_size)
-        self.long_memory = LongMemory(max_size=self.config.long_memory_size)
+        self.short_memory = ShortMemory()
+        self.long_memory = LongMemory()
 
         # Knowledge base (in-memory list for fast retrieval)
         self.knowledge_base: List[Dict[str, Any]] = []
@@ -1373,18 +1326,6 @@ class Brain:
 
         # Lock
         self.lock = self.graph._lock  # reuse graph lock
-
-        # ===== НОВОЕ: глобальный контекст =====
-        self.use_global_context = getattr(self.config, 'use_global_context', True)
-        if self.use_global_context:
-            self.context_gru = nn.GRUCell(self.dim, self.dim).to(self.device)
-            self.context_state = torch.zeros(self.dim, device=self.device)
-        else:
-            self.context_gru = None
-            self.context_state = None
-
-        self.use_creative_merging = getattr(self.config, 'use_creative_merging', True)
-        self.use_sleep_associations = getattr(self.config, 'use_sleep_associations', True)
 
         # Init architecture
         self._init_architecture(
@@ -1460,7 +1401,7 @@ class Brain:
         for i in range(len(activated_ids)):
             for j in range(i + 1, len(activated_ids)):
                 a, b = activated_ids[i], activated_ids[j]
-                # Проверяем обе стороны
+                # Check both directions
                 for u, v in [(a, b), (b, a)]:
                     sid = self.graph.edge_to_sid.get((u, v))
                     if sid is None or sid not in self.graph.synapse_weights:
@@ -1471,21 +1412,16 @@ class Brain:
                     if syn_sem is None:
                         continue
                     att = self.graph.attention_score(query_vec, syn_sem)
-
-                    # Hebbian-обновление
-                    pre_act = self.graph.neuron_activations.get(u, 0.0)
-                    post_act = self.graph.neuron_activations.get(v, 0.0)
-                    hebbian_delta = pre_act * post_act * 0.1
-
+                    pre_t = self.graph.neuron_last_activation.get(u, 0)
+                    post_t = self.graph.neuron_last_activation.get(v, 0)
+                    stdp = self._stdp_delta(pre_t, post_t)
                     w = self.graph.synapse_weights[sid]
-                    delta = hebbian_delta * (1.0 - min(1.0, abs(w))) * (1.0 + att)
-
+                    delta = stdp * (1.0 - min(1.0, abs(w))) * (1.0 + att)
                     meta_factor = 1.0 + self.meta_lr * np.log(1 + self.graph.synapse_usage_count.get(sid, 0))
                     delta *= meta_factor
                     lr = self.graph.synapse_learning_rate.get(sid, 0.01)
                     pl = self.graph.synapse_plasticity.get(sid, 0.5)
                     effective = delta * lr * pl
-
                     self.graph.synapse_weights[sid] = float(np.clip(w + effective, -2.0, 2.0))
                     self.graph.synapse_plasticity[sid] = float(np.clip(
                         self.graph.synapse_plasticity.get(sid, 0.5) + 0.001, 0.0, 1.0))
@@ -1532,22 +1468,19 @@ class Brain:
                         self.coactivation_counter[pair] = 0
 
     # ---------- Propagation ----------
-    def propagate_signal(self, input_signal: Signal, max_steps: int = None, context_emb: Optional[torch.Tensor] = None) -> Tuple[List[int], Dict[int, float]]:
+    def propagate_signal(self, input_signal: Signal, max_steps: int = None) -> Tuple[List[int], Dict[int, float]]:
         max_steps = max_steps or self.config.max_propagation_steps
         with self.lock:
-            return self._propagate_signal_impl(input_signal, max_steps, context_emb)
+            return self._propagate_signal_impl(input_signal, max_steps)
 
-    def _propagate_signal_impl(self, input_signal: Signal, max_steps: int, context_emb: Optional[torch.Tensor] = None) -> Tuple[List[int], Dict[int, float]]:
-        # Определяем контекст
-        if context_emb is not None:
-            ctx = context_emb
+    def _propagate_signal_impl(self, input_signal: Signal, max_steps: int) -> Tuple[List[int], Dict[int, float]]:
+        # Context
+        dialog_ctx = self.dialog_memory.get_context_embedding()
+        if dialog_ctx is not None:
+            ctx = 0.7 * input_signal.embedding + 0.3 * dialog_ctx
+            ctx = F.normalize(ctx.unsqueeze(0), p=2, dim=1).squeeze(0)
         else:
-            dialog_ctx = self.dialog_memory.get_context_embedding()
-            if dialog_ctx is not None:
-                ctx = 0.7 * input_signal.embedding + 0.3 * dialog_ctx
-                ctx = F.normalize(ctx.unsqueeze(0), p=2, dim=1).squeeze(0)
-            else:
-                ctx = input_signal.embedding
+            ctx = input_signal.embedding
 
         # Start neurons (input layer)
         similarities = []
@@ -1614,20 +1547,24 @@ class Brain:
                     continue
                 energy_budget -= energy_cost
 
+                # Update target neuron potential
                 tgt_pot = self.graph.neuron_potentials.get(target, 0.0)
                 sim = cosine_similarity_torch(self.graph.neuron_embeddings.get(target, torch.zeros(self.dim)),
                                                input_signal.embedding)
                 combined = input_signal.energy * weight * input_signal.importance * (1.0 + sim * 0.3)
                 self.graph.neuron_potentials[target] = tgt_pot + combined
 
+                # Update LSTM
                 self.graph.update_lstm(target, input_signal.embedding)
 
+                # Surprise detection
                 pred_err = self.graph.neuron_pred_error.get(target, 0.0)
                 error = abs(combined - pred_err)
                 self.graph.neuron_pred_error[target] = 0.9 * pred_err + 0.1 * error
                 if error > 0.5:
                     self.graph.neuron_importance[target] = min(1.0, self.graph.neuron_importance.get(target, 0.5) + 0.05)
 
+                # Create new signal
                 new_sig = copy.deepcopy(input_signal)
                 new_sig.energy *= energy_cost
                 new_sig.source = nid
@@ -1640,12 +1577,15 @@ class Brain:
                     visited.add(target)
                     queue.append((target, steps + 1, new_sig.energy))
 
+                # Update synapse frequency
                 self.graph.synapse_frequency[sid] = self.graph.synapse_frequency.get(sid, 0) + 0.001
                 self.graph.synapse_last_used[sid] = time.time()
 
+            # Residual
             if nid in residual:
                 self.graph.neuron_potentials[nid] = self.graph.neuron_potentials.get(nid, 0.0) + residual[nid] * 0.1
 
+            # Activate
             pot = self.graph.neuron_potentials.get(nid, 0.0)
             refr = self.graph.neuron_refractory.get(nid, 0)
             if refr > 0:
@@ -1717,15 +1657,14 @@ class Brain:
 
             if reward > 0:
                 for nid in activated:
-                    self.graph.neuron_importance[nid] = min(1.0,
-                                                            self.graph.neuron_importance.get(nid, 0.5) + reward * 0.02)
+                    self.graph.neuron_importance[nid] = min(1.0, self.graph.neuron_importance.get(nid, 0.5) + reward * 0.02)
                     for _, sid, _ in self.graph.get_incoming(nid):
                         if not self.graph.synapse_is_inhibitory.get(sid, False):
                             self.graph.synapse_reward[sid] = self.graph.synapse_reward.get(sid, 0.0) + reward
                             w = self.graph.synapse_weights.get(sid, 0)
                             self.graph.synapse_weights[sid] = float(np.clip(w + reward * 0.005, -2.0, 2.0))
-                            self.graph.synapse_confidence[sid] = min(1.0, self.graph.synapse_confidence.get(sid,
-                                                                                                            0.1) + reward * 0.005)
+                            self.graph.synapse_confidence[sid] = min(1.0, self.graph.synapse_confidence.get(sid, 0.1) + reward * 0.005)
+                            # meta-learning on synapse LR
                             lr = self.graph.synapse_learning_rate.get(sid, 0.01)
                             mom = self.graph.synapse_lr_momentum.get(sid, 0.0)
                             mom = 0.9 * mom + 0.1 * reward
@@ -1746,27 +1685,14 @@ class Brain:
                 self._experience_replay()
             if reward != 0:
                 self._meta_learn(reward)
-
-            # ===== УБИРАЕМ вызов _create_new_synapses_from_coactivation =====
-            # if self.step_counter % 10 == 0:
-            #     self._create_new_synapses_from_coactivation()
-
+            if self.step_counter % 10 == 0:
+                self._create_new_synapses_from_coactivation()
             if self.step_counter % self.config.homeostasis_every == 0:
                 self._homeostatic_scaling()
             if self.step_counter % self.config.prune_every == 0:
                 self.graph._prune_synapses()
                 self.graph._prune_neurons()
 
-            # ===== ПЕРЕНАПРАВЛЯЕМ short_memory в HierarchicalMemory =====
-            # self.short_memory.add((input_signal, activated))   # заменяем:
-            # Добавляем:
-            self.memory.add(
-                content={"signal": input_signal, "activated": activated},
-                embedding=input_signal.embedding,
-                memory_level=MemoryLevel.WORKING,
-                importance=0.3
-            )
-            # И добавляем в short_memory для replay:
             self.short_memory.add((input_signal, activated))
             self.global_time = time.time()
             return activated
@@ -1792,33 +1718,25 @@ class Brain:
         self.experience_buffer.update_priorities(indices, np.array(new_priorities))
 
     # ---------- RAG Retrieval ----------
-    def retrieve_facts(self, query_text: str, top_k: int = 5, context_emb: Optional[torch.Tensor] = None) -> List[
-        Dict[str, Any]]:
+    def retrieve_facts(self, query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
         query_emb = self.text_to_embedding(query_text)
-
-        # Если передан контекст, комбинируем с запросом
-        if context_emb is not None:
-            combined_emb = 0.7 * query_emb + 0.3 * context_emb
-            combined_emb = F.normalize(combined_emb.unsqueeze(0), p=2, dim=1).squeeze(0)
-        else:
-            combined_emb = query_emb
 
         # 1. Knowledge base
         scored_kb = []
         for fact in self.knowledge_base:
-            sim = cosine_similarity_torch(combined_emb, fact["emb"])
+            sim = cosine_similarity_torch(query_emb, fact["emb"])
             scored_kb.append((sim, fact))
         scored_kb.sort(key=lambda x: x[0], reverse=True)
 
         # 2. Hierarchical memory
         mem_results = self.memory.retrieve(
-            combined_emb, top_k=top_k * 2,
+            query_emb, top_k=top_k * 2,
             memory_levels=[MemoryLevel.SEMANTIC, MemoryLevel.EPISODIC]
         )
 
-        # 3. Network propagation (используем combined_emb для контекста)
+        # 3. Network propagation
         sig = self.text_to_signal(query_text)
-        activated, act_map = self.propagate_signal(sig, max_steps=12, context_emb=combined_emb)
+        activated, act_map = self.propagate_signal(sig, max_steps=12)
 
         network_facts = []
         for nid in activated:
@@ -1837,7 +1755,7 @@ class Brain:
                         "source": "network"
                     })
 
-        # 4. Aggregate & re-rank (без изменений)
+        # 4. Aggregate & re-rank
         results = []
         for sim, fact in scored_kb[:top_k]:
             if sim > 0.25:
@@ -1879,19 +1797,8 @@ class Brain:
     # ---------- Answer Generation ----------
     def generate_answer(self, input_text: str, temperature: float = 0.7,
                         use_rag: bool = True, use_reflection: bool = True) -> Dict[str, Any]:
-        # ===== НОВОЕ: обновление глобального контекста =====
-        emb_question = self.text_to_embedding(input_text)
-        if self.use_global_context and self.context_gru is not None:
-            self.context_state = self.context_gru(
-                emb_question.unsqueeze(0),
-                self.context_state.unsqueeze(0)
-            ).squeeze(0)
-
-        # Получаем факты с учётом контекста
-        facts = self.retrieve_facts(input_text, top_k=5,
-                                    context_emb=self.context_state if self.use_global_context else None) if use_rag else []
-
         dialog_ctx = self.dialog_memory.get_context_string(n=3)
+        facts = self.retrieve_facts(input_text, top_k=5) if use_rag else []
 
         system_msg = (
             "Ты - интеллектуальный ассистент с ассоциативной памятью и способностью к саморефлексии. "
@@ -1913,10 +1820,10 @@ class Brain:
                     f"{i}. Вопрос: {f['q']} -> Ответ: {f['a']} "
                     f"(источник: {f['source']}, релевантность: {f['score']:.2f})"
                 )
-        context_str = "\n".join(context_parts)
+        context_str = "\\n".join(context_parts)
         user_prompt = input_text
         if context_str:
-            user_prompt = f"{context_str}\n\nТекущий вопрос: {input_text}"
+            user_prompt = f"{context_str}\\n\\nТекущий вопрос: {input_text}"
 
         try:
             response = self.llm_client.chat.completions.create(
@@ -2100,7 +2007,7 @@ class Brain:
                 if syn_id is None:
                     logger.error("Failed to create synapse (limit reached)")
                     return
-                syn = syn_id
+                syn = syn_id  # just ID
                 usage = self.graph.synapse_usage_count.get(syn, 0)
                 if usage > 0:
                     w = self.graph.synapse_weights[syn]
@@ -2129,24 +2036,6 @@ class Brain:
                                     self.graph.synapse_weights.get(hsyn_id, 0) + 0.03, -2.0, 2.0))
                     self.step(sig, target_neuron_id=output_id)
 
-                # ===== НОВОЕ: создание гибридного нейрона =====
-                if self.use_creative_merging:
-                    emb_input = self.graph.neuron_embeddings[input_id]
-                    emb_output = self.graph.neuron_embeddings[output_id]
-                    emb_mid = 0.5 * (emb_input + emb_output)
-                    emb_mid = F.normalize(emb_mid.unsqueeze(0), p=2, dim=1).squeeze(0)
-                    similar = self.graph.find_most_similar(emb_mid, threshold=0.7)
-                    if similar is None:
-                        new_nid = self.graph.add_neuron(
-                            emb_mid,
-                            cluster="abstract",
-                            layer=len(self.config.hidden_layers) + 2,
-                            label=f"hybrid_{input_text}_{output_text}"
-                        )
-                        self.graph.add_synapse(input_id, new_nid, weight=0.1)
-                        self.graph.add_synapse(new_nid, output_id, weight=0.1)
-                        logger.info(f"Created hybrid neuron {new_nid}")
-
                 if epoch == 0:
                     self._add_to_knowledge_base(input_text, output_text)
                     combined_emb = self.text_to_embedding(input_text + " " + output_text)
@@ -2157,7 +2046,7 @@ class Brain:
                         importance=0.7,
                         tags=["learned", "fact"]
                     )
-                logger.info(f"Learn epoch {epoch + 1}/{epochs}: '{input_text}' -> '{output_text}' "
+                logger.info(f"Learn epoch {epoch+1}/{epochs}: '{input_text}' -> '{output_text}' "
                             f"(weight: {self.graph.synapse_weights.get(syn_id, 0):.3f})")
             self._learn_counter += epochs
             if self._learn_counter % self.config.auto_save_every == 0:
@@ -2277,8 +2166,8 @@ class Brain:
                 to_remove = []
                 for nid in self.graph.neuron_embeddings:
                     if (self.graph.neuron_energy.get(nid, 1.0) < 0.05 and
-                            self.graph.neuron_importance.get(nid, 0.5) < 0.1 and
-                            self.graph.neuron_clusters.get(nid) not in ("output", "input")):
+                        self.graph.neuron_importance.get(nid, 0.5) < 0.1 and
+                        self.graph.neuron_clusters.get(nid) not in ("output", "input")):
                         to_remove.append(nid)
                 for nid in to_remove:
                     self.graph.remove_neuron(nid)
@@ -2287,38 +2176,13 @@ class Brain:
                     if self.graph.synapse_frequency.get(sid, 0) > 0.5:
                         w = self.graph.synapse_weights.get(sid, 0)
                         self.graph.synapse_weights[sid] = float(np.clip(w + 0.01, -2.0, 2.0))
-                        self.graph.synapse_confidence[sid] = min(1.0,
-                                                                 self.graph.synapse_confidence.get(sid, 0.1) + 0.01)
+                        self.graph.synapse_confidence[sid] = min(1.0, self.graph.synapse_confidence.get(sid, 0.1) + 0.01)
                     if self.graph.synapse_reward.get(sid, 0) > 0.5:
                         w = self.graph.synapse_weights.get(sid, 0)
                         self.graph.synapse_weights[sid] = float(np.clip(w + 0.02, -2.0, 2.0))
-                        self.graph.synapse_confidence[sid] = min(1.0,
-                                                                 self.graph.synapse_confidence.get(sid, 0.1) + 0.02)
+                        self.graph.synapse_confidence[sid] = min(1.0, self.graph.synapse_confidence.get(sid, 0.1) + 0.02)
                     self.graph.synapse_reward[sid] = self.graph.synapse_reward.get(sid, 0) * 0.9
-
-            # ===== НОВОЕ: ассоциативные мостики =====
-            if self.use_sleep_associations:
-                all_nids = list(self.graph.neuron_embeddings.keys())
-                sample_nids = random.sample(all_nids, min(200, len(all_nids)))
-                added = 0
-                for i, nid1 in enumerate(sample_nids):
-                    for nid2 in sample_nids[i + 1:]:
-                        if nid1 == nid2:
-                            continue
-                        if self.graph.graph.has_edge(nid1, nid2):
-                            continue
-                        emb1 = self.graph.neuron_embeddings[nid1]
-                        emb2 = self.graph.neuron_embeddings[nid2]
-                        sim = cosine_similarity_torch(emb1, emb2)
-                        if sim > 0.6:
-                            sid = self.graph.add_synapse(nid1, nid2, weight=0.01, plasticity=0.9)
-                            if sid is not None:
-                                added += 1
-                logger.info(f"Added {added} associative bridge synapses")
-
             self._homeostatic_scaling()
-            # Заменяем сохранение в short/long memory на использование HierarchicalMemory
-            # (теперь short_memory и long_memory — обёртки, но для совместимости оставляем)
             for item in self.short_memory.get_recent(50):
                 self.long_memory.add(item)
             self.short_memory.clear()
