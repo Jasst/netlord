@@ -87,7 +87,7 @@ brain.load()  # загружает из config.model_dir
 brain.load_dialog_history()
 
 teacher = Teacher(llm_client=llm_client)
-brain = Brain(config=config)
+
 print(f"[GPU] Используется устройство: {brain.device}")
 print(f"[GPU] CUDA доступна: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
