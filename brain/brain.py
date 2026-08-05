@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F   # <-- обязательно
 import json
 import os
 import time
@@ -206,6 +207,8 @@ class Brain(nn.Module):
             "learn_counter": self._learn_counter,
             "concept_index": self.concept_index,
             "knowledge_base": self.knowledge_base,
+            "num_neurons": self.graph.node_emb.shape[0],  # <-- добавляем
+            "num_edges": len(self.graph._edges),  # <-- добавляем
         }
         with open(f"{path}/meta.json", "w") as f:
             json.dump(meta, f)
@@ -217,13 +220,35 @@ class Brain(nn.Module):
         if not os.path.exists(path):
             print(f"[Brain] Директория {path} не найдена, запуск с нуля.")
             return
-        graph_path = f"{path}/graph.pth"
-        if os.path.exists(graph_path):
-            self.graph.load_state_dict(torch.load(graph_path, map_location=self.device))
+        # Загружаем метаданные
         meta_path = f"{path}/meta.json"
         if os.path.exists(meta_path):
             with open(meta_path, "r") as f:
                 meta = json.load(f)
+            num_neurons = meta.get("num_neurons", 10)
+            # Добавляем недостающие нейроны, если их меньше, чем в сохранённой модели
+            current_num = self.graph.node_emb.shape[0]
+            if current_num < num_neurons:
+                # Добавляем случайные нейроны до нужного количества
+                for _ in range(num_neurons - current_num):
+                    emb = random_vector(self.dim)
+                    self.graph.add_node(emb, label="loaded", cluster="hidden", layer=0)
+                print(f"[Brain] Добавлено {num_neurons - current_num} нейронов для загрузки.")
+            # Загружаем state_dict
+            graph_path = f"{path}/graph.pth"
+            if os.path.exists(graph_path):
+                state_dict = torch.load(graph_path, map_location=self.device)
+                # Фильтруем по размеру
+                model_state = self.graph.state_dict()
+                filtered_state = {}
+                for key, value in state_dict.items():
+                    if key in model_state and model_state[key].shape == value.shape:
+                        filtered_state[key] = value
+                    else:
+                        print(
+                            f"[Brain] Пропуск загрузки {key}: размер {value.shape} -> {model_state[key].shape if key in model_state else 'not found'}")
+                self.graph.load_state_dict(filtered_state, strict=False)
+            # Загружаем остальные метаданные
             self.step_counter = meta.get("step_counter", 0)
             self._learn_counter = meta.get("learn_counter", 0)
             self.concept_index = meta.get("concept_index", {})
