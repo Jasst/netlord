@@ -2,7 +2,7 @@ import asyncio
 from fastapi import FastAPI, Request, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from smart_brain_v5 import Brain, cosine_similarity, Teacher, BrainConfig
+from smart_brain_v6 import Brain, cosine_similarity_torch as cosine_similarity, Teacher, BrainConfig
 import uvicorn
 import re
 import random
@@ -58,7 +58,7 @@ config = BrainConfig(
     input_neurons=40,
     output_neurons=40,
     hidden_layers=[100, 80, 60],
-    model_path="brain_model_trained.json",
+    model_dir="brain_model_v6",
     max_neurons=2000,
     max_synapses=20000,
 )
@@ -428,12 +428,14 @@ async def train_pair(req: TrainPairRequest):
 
 @app.get("/stats")
 async def stats():
+    # Используем метод get_stats() или напрямую обращаемся к graph
+    stats_data = brain.get_stats()  # возвращает словарь со всеми метриками
     return {
-        "neurons": len(brain.neurons),
-        "synapses": len(brain.synapses),
-        "concepts": len(brain.concept_index),
-        "knowledge_base": len(brain.knowledge_base),
-        "memory_entries": len(brain.long_memory.items) + len(brain.short_memory.items)
+        "neurons": stats_data["neurons"],
+        "synapses": stats_data["synapses"],
+        "concepts": stats_data["concepts"],
+        "knowledge_base": stats_data["knowledge_base"],
+        "memory_entries": stats_data["memory"]["working"] + stats_data["memory"]["episodic"] + stats_data["memory"]["semantic"]
     }
 
 @app.post("/sleep")

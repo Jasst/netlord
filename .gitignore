@@ -1,3 +1,4 @@
 *.json
 *.tmp
 .env
+/brain_model_v6
