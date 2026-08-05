@@ -16,13 +16,14 @@ import secrets
 from agent import BrainAgent
 from dotenv import load_dotenv
 from fastapi import File, UploadFile, Form
+from fastapi.staticfiles import StaticFiles
 import csv
 import io
 
 load_dotenv()
 
 app = FastAPI(title="Smart Brain v6")
-
+app.mount("/static", StaticFiles(directory="static"), name="static")
 # ============================================================
 # Настройка LM Studio
 # ============================================================
