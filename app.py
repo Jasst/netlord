@@ -355,6 +355,16 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
 
         brain.sleep(duration_steps=5)
         brain.save()
+
+        # ========== ДОБАВЛЕННАЯ ЧАСТЬ ==========
+        # Добавляем мета-факт об обучении, чтобы модель "знала" о своём обучении
+        brain.learn_pair(
+            f"я обучился теме {topic}",
+            f"да, я выучил новые факты по теме {topic}"
+        )
+        brain.save()  # сохраняем ещё раз, чтобы факт попал в память
+        # ======================================
+
         result["message"] = f"Обучение на тему '{topic}' завершено за {epochs} эпох(и)."
     except Exception as e:
         result["status"] = "error"
