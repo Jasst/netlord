@@ -54,8 +54,8 @@ config = BrainConfig(
     output_neurons=40,
     hidden_layers=[100, 80, 60],
     model_dir="brain_model_v6",
-    max_neurons=2000,
-    max_synapses=20000,
+    max_neurons=20000,
+    max_synapses=1000000,
 )
 brain = Brain(config=config, llm_client=llm_client)
 brain.load()
