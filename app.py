@@ -16,14 +16,12 @@ import secrets
 from agent import BrainAgent
 from dotenv import load_dotenv
 
-load_dotenv()  # загружает переменные из .env в os.environ
+load_dotenv()
 
-app = FastAPI(title="Smart Brain v4")
+app = FastAPI(title="Smart Brain v6")
 
 # ============================================================
-# ФИКС: адрес LM Studio теперь берём из окружения, а не хардкодим
-# IP разработчика. См. также smart_brain_v4.LM_STUDIO_BASE_URL --
-# оба места должны указывать на один и тот же инстанс.
+# Настройка LM Studio
 # ============================================================
 LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
 LM_STUDIO_API_KEY = os.environ.get("LM_STUDIO_API_KEY", "not-needed")
@@ -34,10 +32,7 @@ llm_client = OpenAI(
 )
 
 # ============================================================
-# ФИКС: авторизация на деструктивных эндпоинтах (/learn*, /train*,
-# /sleep, /chat/clear, /agent/*). Если ADMIN_API_KEY не задан в
-# окружении -- генерируем случайный на старте и печатаем его в лог,
-# чтобы сервис нельзя было по недосмотру оставить полностью открытым.
+# Админ‑ключ
 # ============================================================
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY") or secrets.token_urlsafe(24)
 if not os.environ.get("ADMIN_API_KEY"):
@@ -50,9 +45,9 @@ def require_admin_key(x_admin_key: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Неверный или отсутствующий X-Admin-Key")
     return True
 
-# Инициализация мозга -- ФИКС: передаём единый llm_client явно,
-# чтобы Brain/Teacher/EmbeddingProvider не полагались на глобальный
-# клиент из smart_brain_v4.py с другим (потенциально) хостом.
+# ============================================================
+# Инициализация мозга v6
+# ============================================================
 config = BrainConfig(
     dim_embedding=128,
     input_neurons=40,
@@ -64,13 +59,12 @@ config = BrainConfig(
 )
 brain = Brain(config=config, llm_client=llm_client)
 brain.load()
-# Загружаем историю диалога (если есть)
 brain.load_dialog_history()
 
 teacher = Teacher(llm_client=llm_client)
 
 # ============================================================
-#  Сохранение при завершении (включая историю)
+#  Сохранение при завершении
 # ============================================================
 def save_brain():
     print("\n💾 Сохраняю модель и историю перед завершением...")
@@ -90,7 +84,9 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# --- Инициализация агента ---
+# ============================================================
+# Инициализация агента
+# ============================================================
 agent = BrainAgent(
     brain=brain,
     teacher=teacher,
@@ -103,7 +99,7 @@ agent = BrainAgent(
     interactive_mode=False,
     user_question_timeout=30
 )
-#agent.start()
+# agent.start()  # раскомментируйте при необходимости
 
 # ============================================================
 # Pydantic модели
@@ -138,7 +134,7 @@ class AgentConfigRequest(BaseModel):
     user_question_timeout: int = None
 
 # ============================================================
-# Вспомогательные функции (запомни/забудь)
+# Вспомогательные функции (запомни/забудь) – АДАПТИРОВАНЫ
 # ============================================================
 def normalize_text(text: str) -> str:
     return re.sub(r'\s+', ' ', text.strip().lower())
@@ -170,7 +166,7 @@ def handle_remember_command(text: str) -> tuple[bool, str]:
     fact = extract_fact_from_command(text, REMEMBER_PATTERNS)
     if not fact:
         return False, ""
-    brain.learn_pair(text, fact)  # уже под своим локом внутри
+    brain.learn_pair(text, fact)
     brain.save()
     response_text = f"✅ Я запомнил: «{fact}»."
     brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
@@ -178,10 +174,6 @@ def handle_remember_command(text: str) -> tuple[bool, str]:
     return True, response_text
 
 def _text_overlaps(norm_phrase: str, key: str) -> bool:
-    """ФИКС: раньше матчилось произвольной подстрокой
-    (`norm_phrase in key or key in norm_phrase`) -- короткая фраза вроде
-    "мир" случайно сносила бы "мировая война", "мирный житель" и т.п.
-    Теперь сравниваем целыми словами."""
     phrase_words = set(norm_phrase.split())
     key_words = set(key.split())
     if not phrase_words or not key_words:
@@ -194,22 +186,17 @@ def handle_forget_command(text: str) -> tuple[bool, str]:
         return False, ""
     norm_phrase = normalize_text(phrase)
     removed_any = False
-    # ФИКС: эта функция мутирует внутренности brain напрямую (concept_index,
-    # neurons, knowledge_base), в обход всех методов Brain с их собственным
-    # локом -- поэтому берём brain.lock явно, иначе гонка с BrainAgent/другими
-    # запросами всё ещё возможна именно здесь.
+
     with brain.lock:
         to_delete = []
         for key, nid in brain.concept_index.items():
             if _text_overlaps(norm_phrase, key):
                 to_delete.append((key, nid))
         for key, nid in to_delete:
-            if nid in brain.neurons:
-                neuron = brain.neurons[nid]
-                for syn_id in list(neuron.incoming_synapses) + list(neuron.outgoing_synapses):
-                    brain._remove_synapse(syn_id)
-                del brain.neurons[nid]
-            del brain.concept_index[key]
+            if nid in brain.graph.neuron_embeddings:
+                brain.graph.remove_neuron(nid)   # удаляет все связи автоматически
+            if key in brain.concept_index:
+                del brain.concept_index[key]
             removed_any = True
         new_kb = []
         for item in brain.knowledge_base:
@@ -218,32 +205,45 @@ def handle_forget_command(text: str) -> tuple[bool, str]:
                 continue
             new_kb.append(item)
         brain.knowledge_base = new_kb
+
     if removed_any:
         response_text = f"✅ Я забыл всё, что связано с «{phrase}»."
     else:
         response_text = f"❌ Я не нашёл ничего, что можно забыть по запросу «{phrase}»."
+
     brain.dialog_memory.add_turn(text, response_text, brain.text_to_embedding(text))
     brain.save()
     print(f"[CMD] Забыл: '{phrase}' -> {response_text}")
     return True, response_text
 
 # ============================================================
-# Функции автообучения
+# Функции автообучения – АДАПТИРОВАНЫ и УЛУЧШЕНЫ
 # ============================================================
-def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float = 0.7) -> list:
+def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float = 0.9) -> list:
+    """
+    Генерирует пары (вопрос|ответ) с улучшенным промптом.
+    Возвращает только пары, где вопрос и ответ различаются после нормализации.
+    """
     system_prompt = (
         "Ты — генератор обучающих данных для нейросети. "
         "Твоя задача — создать список пар 'вопрос|ответ' на русском языке, "
         "которые помогут нейросети понять тему и её атрибуты, контекстные связи и ассоциации. "
         "Формат вывода: каждая пара на новой строке, разделена символом '|'. "
-        "Не добавляй никаких пояснений, только список пар."
+        "Не добавляй никаких пояснений, только список пар. "
+        "Вопросы должны быть разнообразными, ответы — краткими (1-5 слов). "
+        "Примеры правильных пар:\n"
+        "солнце|звезда\n"
+        "что такое солнце|звезда спектра G2\n"
+        "какого цвета солнце|жёлтое\n"
+        "температура солнца|около 5800 К\n"
+        "солнечная система|включает планеты"
     )
     user_prompt = (
         f"Сгенерируй {num_pairs} пар (вопрос|ответ) по теме '{topic}'. "
         "Вопросы должны быть разнообразными: от прямых ('что такое ...') до контекстных ('как ...', 'почему ...', 'в каком случае ...'). "
         "Ответы должны быть краткими, но информативными (1-5 слов). "
         "Включай синонимы и связанные понятия, чтобы модель научилась ассоциировать разные формулировки с одним понятием. "
-        "Примеры: 'солнце|звезда', 'солнечный день|ясно и жарко', 'что дает солнце|свет и тепло'."
+        "Избегай одинаковых вопросов и ответов."
     )
     messages = [
         {"role": "system", "content": system_prompt},
@@ -253,7 +253,7 @@ def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float 
         response = llm_client.chat.completions.create(
             model="local-model",
             messages=messages,
-            max_tokens=num_pairs * 20 + 100,
+            max_tokens=num_pairs * 25 + 150,
             temperature=temperature,
         )
         raw_text = response.choices[0].message.content.strip()
@@ -265,30 +265,34 @@ def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float 
                 if len(parts) == 2:
                     q = parts[0].strip()
                     a = parts[1].strip()
-                    if q and a:
+                    if q and a and normalize_text(q) != normalize_text(a):
                         pairs.append((q, a))
+        print(f"Сгенерировано {len(pairs)} уникальных пар (из {num_pairs} запрошенных).")
         return pairs
     except Exception as e:
         print(f"Ошибка при генерации: {e}")
         return []
 
 def integrate_new_concept(brain: Brain, concept_text: str, top_k: int = 5):
+    """Адаптировано для v6: использует brain.graph."""
     nid = brain.concept_index.get(concept_text.strip().lower())
     if nid is None:
         return
-    emb = brain.neurons[nid].embedding
+    emb = brain.graph.neuron_embeddings.get(nid)
+    if emb is None:
+        return
     similarities = []
-    for other_nid, neuron in brain.neurons.items():
+    for other_nid, other_emb in brain.graph.neuron_embeddings.items():
         if other_nid == nid:
             continue
-        if neuron.cluster == 'output' and neuron.label:
-            sim = cosine_similarity(emb, neuron.embedding)
+        if brain.graph.neuron_clusters.get(other_nid) == 'output' and brain.graph.neuron_labels.get(other_nid):
+            sim = cosine_similarity(emb, other_emb)
             if sim > 0.3:
                 similarities.append((sim, other_nid))
     similarities.sort(reverse=True)
     for sim, other_nid in similarities[:top_k]:
-        brain._create_synapse(nid, other_nid, weight=0.1 + 0.2 * sim)
-        brain._create_synapse(other_nid, nid, weight=0.1 + 0.2 * sim)
+        brain.graph.add_synapse(nid, other_nid, weight=0.1 + 0.2 * sim)
+        brain.graph.add_synapse(other_nid, nid, weight=0.1 + 0.2 * sim)
 
 def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
                          negative_ratio: float = 0.2, temperature: float = 0.7,
@@ -298,8 +302,9 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
         pairs = generate_training_pairs(topic, num_pairs, temperature)
         if not pairs:
             result["status"] = "error"
-            result["message"] = "Не удалось сгенерировать пары."
+            result["message"] = "Не удалось сгенерировать уникальные пары."
             return result
+
         for epoch in range(epochs):
             for idx, (q, a) in enumerate(pairs, 1):
                 brain.learn_pair(q, a)
@@ -344,14 +349,6 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
 
 # ============================================================
 # API эндпоинты
-#
-# ФИКС: все обращения к brain.*, которые под капотом синхронно бьют в
-# LM Studio (generate_answer, learn_pair, sleep, ...), теперь идут через
-# asyncio.to_thread(...). Раньше блокирующий вызов внутри `async def`
-# замораживал весь event loop uvicorn на время генерации ответа локальной
-# моделью -- ни один другой запрос (даже /stats) не обрабатывался, пока
-# LM Studio не ответит. to_thread уводит блокирующий вызов в отдельный
-# поток, event loop остаётся отзывчивым.
 # ============================================================
 @app.post("/ask")
 async def ask(req: AskRequest):
@@ -372,7 +369,6 @@ async def ask(req: AskRequest):
               brain._generate_clarifying_question, req.question, answer_text, history, result.get("facts", [])
             )
         brain.dialog_memory.add_turn(req.question, answer_text, brain.text_to_embedding(req.question))
-        # Сохраняем историю после каждого сообщения (для надёжности)
         await asyncio.to_thread(brain.save_dialog_history)
         return {
             "question": req.question,
@@ -428,8 +424,7 @@ async def train_pair(req: TrainPairRequest):
 
 @app.get("/stats")
 async def stats():
-    # Используем метод get_stats() или напрямую обращаемся к graph
-    stats_data = brain.get_stats()  # возвращает словарь со всеми метриками
+    stats_data = brain.get_stats()
     return {
         "neurons": stats_data["neurons"],
         "synapses": stats_data["synapses"],
@@ -446,7 +441,7 @@ async def sleep_brain():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Эндпоинты управления агентом ---
+# --- Эндпоинты агента ---
 @app.post("/agent/start")
 async def agent_start():
     agent.start()
@@ -489,11 +484,10 @@ async def submit_answer(question: str, answer: str):
     return {"status": "ok"}
 
 # ============================================================
-# ЭНДПОИНТЫ ДЛЯ ИСТОРИИ ЧАТА
+# Эндпоинты истории чата
 # ============================================================
 @app.get("/chat/messages")
 async def get_chat_messages(limit: int = 50):
-    """Возвращает последние сообщения из истории диалога."""
     items = brain.dialog_memory.items[-limit:] if brain.dialog_memory.items else []
     messages = []
     for item in items:
@@ -508,7 +502,6 @@ async def get_chat_messages(limit: int = 50):
 
 @app.post("/chat/clear")
 async def clear_chat():
-    """Очищает историю диалога."""
     brain.dialog_memory.clear()
     await asyncio.to_thread(brain.save_dialog_history)
     return {"status": "cleared"}

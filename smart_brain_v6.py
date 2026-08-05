@@ -1870,9 +1870,7 @@ class Brain:
 
     # ---------- Text utilities ----------
     def normalize_text(self, text: str) -> str:
-        text = text.lower().strip()
-        text = re.sub(r"[^\\w\\s]", " ", text)
-        return " ".join(text.split())
+        return re.sub(r'\s+', ' ', text.strip().lower())
 
     def text_to_embedding(self, text: str) -> torch.Tensor:
         return self.embedder.get_embedding(text)
