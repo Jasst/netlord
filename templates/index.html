@@ -1,1314 +1,147 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Smart Brain v4</title>
-    <!-- Подключаем highlight.js для подсветки кода -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-    <style>
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #eef2f7;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .header {
-            background: #2c3e50;
-            color: white;
-            padding: 10px 20px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            flex-shrink: 0;
-            z-index: 10;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .header .left {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-        .header h1 {
-            font-size: 20px;
-            font-weight: 400;
-            letter-spacing: 1px;
-        }
-        .header .controls {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        .header .controls label {
-            font-size: 13px;
-            display: flex;
-            align-items: center;
-            gap: 5px;
-        }
-        .header .controls input[type="range"] {
-            width: 80px;
-            cursor: pointer;
-        }
-        .header .controls span {
-            font-weight: bold;
-            min-width: 30px;
-            text-align: center;
-        }
-        .toggle-chat-btn {
-            background: none;
-            border: none;
-            color: white;
-            font-size: 24px;
-            cursor: pointer;
-            padding: 0 4px;
-            transition: 0.2s;
-        }
-        .toggle-chat-btn:hover {
-            opacity: 0.7;
-        }
-        .settings-btn {
-            background: none;
-            border: none;
-            color: white;
-            font-size: 22px;
-            cursor: pointer;
-            padding: 0 8px;
-            transition: 0.2s;
-        }
-        .settings-btn:hover {
-            opacity: 0.7;
-        }
-
-        .app-container {
-            display: flex;
-            flex: 1;
-            overflow: hidden;
-        }
-
-        /* Левая панель – список чатов */
-        .chat-list {
-            width: 260px;
-            background: #f0f2f5;
-            border-right: 1px solid #d0d7de;
-            display: flex;
-            flex-direction: column;
-            flex-shrink: 0;
-            overflow: hidden;
-            transition: width 0.3s ease, margin 0.3s ease;
-        }
-        .chat-list.collapsed {
-            width: 0;
-            margin: 0;
-            border: none;
-            overflow: hidden;
-            padding: 0;
-        }
-        .chat-list .list-header {
-            padding: 12px 16px;
-            border-bottom: 1px solid #d0d7de;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background: #e8eaed;
-        }
-        .chat-list .list-header span {
-            font-weight: 600;
-        }
-        .chat-list .list-header button {
-            background: #27ae60;
-            border: none;
-            color: white;
-            padding: 4px 12px;
-            border-radius: 16px;
-            cursor: pointer;
-            font-size: 13px;
-            transition: 0.2s;
-        }
-        .chat-list .list-header button:hover {
-            background: #1e8449;
-        }
-        .chat-list .chat-items {
-            flex: 1;
-            overflow-y: auto;
-            padding: 8px 0;
-        }
-        .chat-item {
-            padding: 10px 16px;
-            cursor: pointer;
-            border-bottom: 1px solid #e4e7ea;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            transition: 0.2s;
-            font-size: 14px;
-        }
-        .chat-item:hover {
-            background: #e4e7ea;
-        }
-        .chat-item.active {
-            background: #d0d7de;
-            font-weight: 600;
-        }
-        .chat-item .chat-name {
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            max-width: 160px;
-            cursor: pointer;
-        }
-        .chat-item .chat-name:hover {
-            text-decoration: underline;
-        }
-        .chat-item .delete-btn {
-            background: none;
-            border: none;
-            color: #e74c3c;
-            font-size: 16px;
-            cursor: pointer;
-            opacity: 0.5;
-            transition: 0.2s;
-            padding: 0 4px;
-        }
-        .chat-item .delete-btn:hover {
-            opacity: 1;
-        }
-
-        /* Центральная область – чат */
-        .chat-area {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            background: #f8fafc;
-            padding: 15px 25px;
-            overflow: hidden;
-        }
-        .messages {
-            flex: 1;
-            overflow-y: auto;
-            padding-right: 10px;
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-            margin-bottom: 15px;
-        }
-        .message {
-            max-width: 85%;
-            padding: 10px 16px;
-            border-radius: 18px;
-            line-height: 1.6;
-            word-wrap: break-word;
-            animation: fadeIn 0.3s ease;
-        }
-        .message.user {
-            align-self: flex-end;
-            background: #3498db;
-            color: white;
-            border-bottom-right-radius: 6px;
-        }
-        .message.bot {
-            align-self: flex-start;
-            background: #ffffff;
-            border: 1px solid #d0d7de;
-            border-bottom-left-radius: 6px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-        }
-        .message.bot.agent-question {
-            border-left: 4px solid #f39c12;
-            background: #fef9e7;
-        }
-        .message .time {
-            font-size: 11px;
-            opacity: 0.7;
-            margin-top: 4px;
-            text-align: right;
-        }
-        .message .facts-indicator {
-            font-size: 12px;
-            background: #ecf0f1;
-            padding: 2px 8px;
-            border-radius: 12px;
-            display: inline-block;
-            margin-top: 6px;
-            color: #2c3e50;
-        }
-        .message pre {
-            background: #282c34;
-            color: #abb2bf;
-            padding: 12px 16px;
-            border-radius: 8px;
-            overflow-x: auto;
-            margin: 8px 0;
-            position: relative;
-        }
-        .message pre code {
-            font-family: 'Consolas', 'Courier New', monospace;
-            font-size: 13px;
-            line-height: 1.5;
-            white-space: pre-wrap;
-        }
-        .message .copy-btn {
-            position: absolute;
-            top: 6px;
-            right: 10px;
-            background: rgba(255,255,255,0.1);
-            border: none;
-            color: #ccc;
-            font-size: 12px;
-            padding: 2px 8px;
-            border-radius: 4px;
-            cursor: pointer;
-            transition: 0.2s;
-        }
-        .message .copy-btn:hover {
-            background: rgba(255,255,255,0.2);
-            color: #fff;
-        }
-        .message.typing {
-            background: #e8eaed;
-            color: #555;
-            font-style: italic;
-            border: 1px solid #d0d7de;
-            border-bottom-left-radius: 6px;
-            min-width: 60px;
-            text-align: center;
-        }
-        .message.typing .dots::after {
-            content: '';
-            animation: dots 1.2s steps(3, end) infinite;
-        }
-        @keyframes dots {
-            0% { content: ''; }
-            33% { content: '.'; }
-            66% { content: '..'; }
-            100% { content: '...'; }
-        }
-
-        .input-area {
-            display: flex;
-            gap: 10px;
-            background: white;
-            padding: 10px 16px;
-            border-radius: 30px;
-            box-shadow: 0 1px 6px rgba(0,0,0,0.08);
-            border: 1px solid #d0d7de;
-        }
-        .input-area input {
-            flex: 1;
-            border: none;
-            padding: 8px 0;
-            font-size: 15px;
-            outline: none;
-            background: transparent;
-        }
-        .input-area button {
-            background: #3498db;
-            color: white;
-            border: none;
-            border-radius: 30px;
-            padding: 8px 20px;
-            font-size: 15px;
-            cursor: pointer;
-            transition: 0.2s;
-            white-space: nowrap;
-        }
-        .input-area button:hover {
-            background: #2980b9;
-        }
-        .input-area button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .learn-btn-container {
-            display: flex;
-            justify-content: flex-end;
-            margin-top: 6px;
-            gap: 8px;
-        }
-        .learn-btn-container button {
-            background: #27ae60;
-            color: white;
-            border: none;
-            border-radius: 20px;
-            padding: 4px 14px;
-            font-size: 12px;
-            cursor: pointer;
-            transition: 0.2s;
-        }
-        .learn-btn-container button:hover {
-            background: #1e8449;
-        }
-        .learn-btn-container button.neg {
-            background: #e74c3c;
-        }
-        .learn-btn-container button.neg:hover {
-            background: #c0392b;
-        }
-
-        /* Правая панель – настройки (изначально скрыта) */
-        .settings-panel {
-            width: 0;
-            background: #ffffff;
-            border-left: 1px solid #d0d7de;
-            overflow-y: auto;
-            transition: width 0.3s ease, padding 0.3s ease;
-            padding: 0;
-            flex-shrink: 0;
-        }
-        .settings-panel.open {
-            width: 340px;
-            padding: 20px;
-        }
-        .settings-panel h3 {
-            font-size: 16px;
-            color: #2c3e50;
-            margin-bottom: 12px;
-            border-bottom: 2px solid #3498db;
-            padding-bottom: 8px;
-        }
-        .settings-panel .stat-item {
-            display: flex;
-            justify-content: space-between;
-            padding: 6px 0;
-            border-bottom: 1px solid #f0f0f0;
-            font-size: 14px;
-        }
-        .settings-panel .stat-item .label {
-            color: #555;
-        }
-        .settings-panel .stat-item .value {
-            font-weight: 600;
-            color: #2c3e50;
-        }
-
-        .settings-panel .train-section {
-            margin-top: 20px;
-            border-top: 2px solid #ecf0f1;
-            padding-top: 15px;
-        }
-        .settings-panel .train-section label {
-            font-size: 13px;
-            display: block;
-            margin: 8px 0 4px;
-            color: #2c3e50;
-        }
-        .settings-panel .train-section input,
-        .settings-panel .train-section select {
-            width: 100%;
-            padding: 6px 10px;
-            border: 1px solid #d0d7de;
-            border-radius: 4px;
-            font-size: 13px;
-            margin-bottom: 6px;
-        }
-        .settings-panel .train-section button {
-            background: #27ae60;
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 13px;
-            margin-top: 6px;
-            width: 100%;
-        }
-        .settings-panel .train-section button:hover {
-            background: #1e8449;
-        }
-        .settings-panel .train-section .log {
-            background: #f8f9fa;
-            border: 1px solid #e0e0e0;
-            border-radius: 4px;
-            padding: 8px;
-            margin-top: 10px;
-            font-size: 12px;
-            max-height: 120px;
-            overflow-y: auto;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-            color: #2c3e50;
-        }
-
-        .settings-panel .facts-section {
-            margin-top: 20px;
-        }
-        .settings-panel .fact-item {
-            background: #f8f9fa;
-            border-left: 3px solid #3498db;
-            padding: 8px 12px;
-            margin-bottom: 8px;
-            border-radius: 4px;
-            font-size: 13px;
-            line-height: 1.4;
-        }
-        .settings-panel .fact-item .q {
-            font-weight: 600;
-            color: #2c3e50;
-        }
-        .settings-panel .fact-item .a {
-            color: #555;
-        }
-        .settings-panel .fact-item .score {
-            font-size: 12px;
-            color: #888;
-            float: right;
-        }
-
-        @keyframes fadeIn {
-            from {
-                opacity: 0;
-                transform: translateY(8px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        @media (max-width: 768px) {
-            .chat-list {
-                width: 200px;
-            }
-            .settings-panel.open {
-                width: 280px;
-            }
-            .chat-area {
-                padding: 10px;
-            }
-            .message {
-                max-width: 90%;
-            }
-            .header h1 {
-                font-size: 18px;
-            }
-            .header .controls label {
-                font-size: 12px;
-            }
-        }
-    </style>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0d0d0d" />
+    <title>Smart Brain v6</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css" />
+    <link rel="stylesheet" href="/static/css/style.css" />
 </head>
 <body>
+    <div id="app">
+        <header class="header">
+            <div class="header-left">
+                <button class="icon-btn" id="toggleChatList" title="Свернуть/развернуть чаты" aria-label="Чаты">☰</button>
+                <h1>🧠 Smart Brain <span>v6</span></h1>
+            </div>
+            <div class="header-right">
+                <div class="control-group">
+                    <label for="tempSlider" title="Температура">🌡️</label>
+                    <input type="range" id="tempSlider" min="0.1" max="1.5" step="0.1" value="0.7" aria-label="Температура" />
+                    <span id="tempDisplay">0.7</span>
+                </div>
+                <button class="icon-btn" id="toggleSettings" title="Настройки" aria-label="Настройки">⚙️</button>
+            </div>
+        </header>
 
-<div class="header">
-    <div class="left">
-        <button class="toggle-chat-btn" onclick="toggleChatList()">☰</button>
-        <h1>🧠 Smart Brain v4</h1>
+        <div class="app-container">
+            <aside class="chat-list" id="chatList" aria-label="Список чатов">
+                <div class="list-header">
+                    <span>Чаты</span>
+                    <button id="newChatBtn">+ Новый</button>
+                </div>
+                <div class="chat-items" id="chatItems"></div>
+            </aside>
+
+            <main class="chat-area">
+                <div class="messages" id="messages"></div>
+
+                <div class="input-wrapper">
+                    <div class="input-area">
+                        <textarea id="questionInput" placeholder="Введите вопрос…" rows="1" autocomplete="off" aria-label="Вопрос"></textarea>
+                        <button id="sendBtn" aria-label="Отправить" disabled></button>
+                    </div>
+                    <div class="learn-buttons" id="learnButtons">
+                        <button id="learnPosBtn" title="Положительное обучение" aria-label="Положительное" style="display:none;">✅</button>
+                        <button id="learnNegBtn" class="neg" title="Отрицательное обучение" aria-label="Отрицательное" style="display:none;">❌</button>
+                    </div>
+                </div>
+            </main>
+
+            <aside class="settings-panel" id="settingsPanel" aria-label="Настройки">
+                <div class="settings-section">
+                    <h3>📊 Статистика</h3>
+                    <div id="statsContainer">
+                        <div class="stat-item"><span class="label">Нейроны</span><span class="value" id="statNeurons">-</span></div>
+                        <div class="stat-item"><span class="label">Синапсы</span><span class="value" id="statSynapses">-</span></div>
+                        <div class="stat-item"><span class="label">Понятия</span><span class="value" id="statConcepts">-</span></div>
+                        <div class="stat-item"><span class="label">Факты KB</span><span class="value" id="statKB">-</span></div>
+                        <div class="stat-item"><span class="label">Память</span><span class="value" id="statMemory">-</span></div>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>📚 Факты</h3>
+                    <div id="factsList"><p class="empty-hint">Факты появятся после ответа.</p></div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>💬 Диалог</h3>
+                    <label class="checkbox-label"><input type="checkbox" id="allowClarifying" checked /> <span>Уточняющие вопросы</span></label>
+                    <div class="range-group">
+                        <label>Задержка</label>
+                        <input type="range" id="clarifyingDelay" min="0.5" max="5" step="0.1" value="1.5" />
+                        <span id="delayDisplay">1.5</span>с
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>🤖 Агент (интерактив)</h3>
+                    <label class="checkbox-label"><input type="checkbox" id="interactiveMode" /> <span>Вопросы агента</span></label>
+                    <div class="input-group">
+                        <label>Таймаут (сек)</label>
+                        <input type="number" id="userTimeout" value="30" min="5" max="120" />
+                    </div>
+                    <button id="applyAgentConfig">Применить</button>
+                    <div class="log" id="interactiveLog">Выключен.</div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>🚀 Автообучение</h3>
+                    <div class="input-group"><label>Тема</label><input type="text" id="trainTopic" value="солнце" /></div>
+                    <div class="input-group"><label>Пар</label><input type="number" id="trainNumPairs" value="30" min="10" max="200" /></div>
+                    <div class="input-group"><label>Темп.</label><input type="number" id="trainTemp" value="0.7" step="0.1" min="0.1" max="1.0" /></div>
+                    <div class="input-group"><label>Neg. ratio</label><input type="number" id="trainNegRatio" value="0.2" step="0.05" min="0" max="1" /></div>
+                    <div class="input-group"><label>Эпохи</label><input type="number" id="trainEpochs" value="1" min="1" max="10" /></div>
+                    <label class="checkbox-label"><input type="checkbox" id="trainIntegrate" checked /> <span>Интеграция</span></label>
+                    <button id="trainTopicBtn">🚀 Обучить</button>
+                    <div class="log" id="trainLog">Готов.</div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>📝 Обучить пару</h3>
+                    <div class="input-group"><label>Вопрос</label><input type="text" id="pairQuestion" placeholder="Вопрос" /></div>
+                    <div class="input-group"><label>Ответ</label><input type="text" id="pairAnswer" placeholder="Ответ" /></div>
+                    <div class="input-group"><label>Эпохи</label><input type="number" id="pairEpochs" value="3" min="1" max="20" /></div>
+                    <button id="trainPairBtn">🧠 Обучить</button>
+                    <div class="log" id="pairLog">Готов.</div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>💤 Сон</h3>
+                    <button id="sleepBtn">💤 Запустить сон</button>
+                    <div class="log" id="sleepLog">Готов.</div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>🤖 Агент-исследователь</h3>
+                    <button id="agentToggleBtn">⏸ Остановить</button>
+                    <div class="input-group"><label>Темы (через ,)</label><input type="text" id="agentTopics" value="наука, природа, технологии, история, искусство, философия" /></div>
+                    <div class="input-group"><label>Интервал (сек)</label><input type="number" id="agentInterval" value="120" min="10" /></div>
+                    <div class="input-group"><label>Вопросов/цикл</label><input type="number" id="agentQCount" value="2" min="1" max="10" /></div>
+                    <button id="updateAgentConfig">⚙️ Обновить</button>
+                    <div class="log" id="agentLog">Агент активен.</div>
+                </div>
+            </aside>
+        </div>
+
+        <div class="overlay" id="overlay" aria-hidden="true"></div>
     </div>
-    <div class="controls">
-        <label>Температура <input type="range" id="tempSlider" min="0.1" max="1.5" step="0.1" value="0.7"> <span id="tempDisplay">0.7</span></label>
-        <button class="settings-btn" onclick="toggleSettings()">⚙️</button>
+    <!-- Модальное окно для подтверждения -->
+    <div id="confirmModal" style="display:none; position:fixed; inset:0; z-index:1000; background:rgba(0,0,0,0.7); align-items:center; justify-content:center;">
+    <div style="background:#1a1a1a; padding:24px; border-radius:16px; max-width:400px; border:1px solid #333; box-shadow:0 8px 30px rgba(0,0,0,0.8);">
+        <p id="confirmMessage" style="margin-bottom:20px; font-size:16px; color:#e0e0e0;">Удалить чат?</p>
+        <div style="display:flex; gap:12px; justify-content:flex-end;">
+            <button id="confirmCancelBtn" style="padding:8px 20px; background:#2a2a2a; border:1px solid #444; border-radius:8px; color:#aaa; cursor:pointer;">Отмена</button>
+            <button id="confirmOkBtn" style="padding:8px 20px; background:#9a4a4a; border:1px solid #7a3a3a; border-radius:8px; color:#fff; cursor:pointer;">Удалить</button>
+        </div>
     </div>
 </div>
+    <!-- ===== Кастомный тост для уведомлений ===== -->
+    <div id="toast"></div>
 
-<div class="app-container">
-    <!-- Левая панель: список чатов -->
-    <div class="chat-list" id="chatList">
-        <div class="list-header">
-            <span>Чаты</span>
-            <button onclick="createNewChat()">+ Новый</button>
-        </div>
-        <div class="chat-items" id="chatItems"></div>
-    </div>
-
-    <!-- Центральная область чата -->
-    <div class="chat-area">
-        <div class="messages" id="messages"></div>
-        <div class="input-area">
-            <input type="text" id="questionInput" placeholder="Введите вопрос..." onkeydown="if(event.key==='Enter') sendMessage()">
-            <button id="sendBtn" onclick="sendMessage()">Отправить</button>
-        </div>
-        <div class="learn-btn-container">
-            <button onclick="learnLastPair()" id="learnPosBtn" style="display:none;">✅ Обучить ответу</button>
-            <button onclick="learnLastPairNeg()" id="learnNegBtn" style="display:none;">❌ Обучить отрицанию</button>
-        </div>
-    </div>
-
-    <!-- Правая панель: настройки -->
-    <div class="settings-panel" id="settingsPanel">
-        <h3>📊 Статистика</h3>
-        <div id="statsContainer">
-            <div class="stat-item"><span class="label">Нейроны</span><span class="value" id="statNeurons">-</span></div>
-            <div class="stat-item"><span class="label">Синапсы</span><span class="value" id="statSynapses">-</span></div>
-            <div class="stat-item"><span class="label">Понятия</span><span class="value" id="statConcepts">-</span></div>
-            <div class="stat-item"><span class="label">Факты в KB</span><span class="value" id="statKB">-</span></div>
-            <div class="stat-item"><span class="label">Записей памяти</span><span class="value" id="statMemory">-</span></div>
-        </div>
-
-        <div class="facts-section" id="factsSection">
-            <h3>📚 Факты из памяти</h3>
-            <div id="factsList"><p style="color:#999; font-size:14px;">Факты появятся здесь после ответа.</p></div>
-        </div>
-
-        <div class="train-section">
-            <h3>💬 Режим диалога</h3>
-            <label><input type="checkbox" id="allowClarifying" checked> Задавать уточняющие вопросы</label>
-            <label>Задержка перед вопросом (сек)</label>
-            <input type="range" id="clarifyingDelay" min="0.5" max="5" step="0.1" value="1.5">
-            <span id="delayDisplay">1.5</span> сек
-            <p style="font-size:12px; color:#666; margin-top:4px;">Если начнёте печатать, вопрос не появится.</p>
-        </div>
-
-        <div class="train-section">
-            <h3>🤖 Интерактивный агент</h3>
-            <label><input type="checkbox" id="interactiveMode"> Агент задаёт вопросы</label>
-            <label>Таймаут ответа (сек)</label>
-            <input type="number" id="userTimeout" value="30" min="5" max="120">
-            <button onclick="updateAgentInteractiveConfig()">Применить настройки</button>
-            <div class="log" id="interactiveLog">Интерактивный режим выключен.</div>
-        </div>
-
-        <div class="train-section">
-            <h3>🤖 Автообучение на тему</h3>
-            <label>Тема</label>
-            <input type="text" id="trainTopic" placeholder="например, солнце" value="солнце">
-            <label>Количество пар (10-200)</label>
-            <input type="number" id="trainNumPairs" min="10" max="200" value="30">
-            <label>Температура (0.1-1.0)</label>
-            <input type="number" id="trainTemp" min="0.1" max="1.0" step="0.1" value="0.7">
-            <label>Отрицательные примеры (0.0-1.0)</label>
-            <input type="number" id="trainNegRatio" min="0.0" max="1.0" step="0.05" value="0.2">
-            <label>Эпохи (повторы для закрепления)</label>
-            <input type="number" id="trainEpochs" min="1" max="10" value="1">
-            <label><input type="checkbox" id="trainIntegrate" checked> Интеграция с существующими понятиями</label>
-            <button onclick="trainTopic()">🚀 Обучить на тему</button>
-            <div class="log" id="trainLog">Готов к обучению.</div>
-        </div>
-
-        <div class="train-section">
-            <h3>📝 Обучение конкретной пары</h3>
-            <label>Вопрос</label>
-            <input type="text" id="pairQuestion" placeholder="Вопрос">
-            <label>Ответ</label>
-            <input type="text" id="pairAnswer" placeholder="Ответ">
-            <label>Эпохи (повторы для закрепления)</label>
-            <input type="number" id="pairEpochs" min="1" max="20" value="3">
-            <button onclick="trainPair()">🧠 Обучить пару</button>
-            <div class="log" id="pairLog">Готов к обучению пары.</div>
-        </div>
-
-        <div class="train-section">
-            <h3>💤 Сон и консолидация</h3>
-            <p style="font-size:12px; color:#666; margin-bottom:6px;">Запуск сна удаляет шумовые нейроны, укрепляет синапсы и переносит память в долгосрочное хранилище.</p>
-            <button onclick="sleepBrain()">💤 Запустить сон</button>
-            <div class="log" id="sleepLog">Готов к запуску сна.</div>
-        </div>
-
-        <div class="train-section">
-            <h3>🤖 Агент-исследователь</h3>
-            <p style="font-size:12px; color:#666; margin-bottom:6px;">Агент сам генерирует вопросы и обучает мозг новым фактам.</p>
-            <button id="agentToggleBtn" onclick="toggleAgent()">⏸ Остановить</button>
-            <label>Темы (через запятую)</label>
-            <input type="text" id="agentTopics" value="наука, природа, технологии, история, искусство, философия">
-            <label>Интервал (сек)</label>
-            <input type="number" id="agentInterval" value="120" min="10">
-            <label>Вопросов за цикл</label>
-            <input type="number" id="agentQCount" value="2" min="1" max="10">
-            <button onclick="updateAgentConfig()">⚙️ Обновить настройки</button>
-            <div class="log" id="agentLog">Агент активен.</div>
-        </div>
-    </div>
-</div>
-
-<script>
-    // --- Хранилище чатов и настроек ---
-    const STORAGE_KEY = 'brain_chats';
-    const SETTINGS_KEY = 'brain_settings';
-    let chats = [];
-    let currentChatId = null;
-    let lastQuestion = '';
-    let lastAnswer = '';
-    let lastFacts = [];
-
-    // --- Управление сворачиванием левой панели ---
-    let chatListCollapsed = false;
-
-    function toggleChatList() {
-        const panel = document.getElementById('chatList');
-        chatListCollapsed = !chatListCollapsed;
-        panel.classList.toggle('collapsed', chatListCollapsed);
-    }
-
-    // --- Настройки ---
-    function loadSettings() {
-        const stored = localStorage.getItem(SETTINGS_KEY);
-        if (stored) {
-            try {
-                const settings = JSON.parse(stored);
-                if (settings.temperature !== undefined) {
-                    document.getElementById('tempSlider').value = settings.temperature;
-                    document.getElementById('tempDisplay').textContent = settings.temperature;
-                }
-                if (settings.allowClarifying !== undefined) {
-                    document.getElementById('allowClarifying').checked = settings.allowClarifying;
-                }
-                if (settings.clarifyingDelay !== undefined) {
-                    document.getElementById('clarifyingDelay').value = settings.clarifyingDelay;
-                    document.getElementById('delayDisplay').textContent = settings.clarifyingDelay;
-                }
-                if (settings.interactiveMode !== undefined) {
-                    document.getElementById('interactiveMode').checked = settings.interactiveMode;
-                    const event = new Event('change');
-                    document.getElementById('interactiveMode').dispatchEvent(event);
-                }
-                if (settings.userTimeout !== undefined) {
-                    document.getElementById('userTimeout').value = settings.userTimeout;
-                }
-                if (settings.agentTopics !== undefined) {
-                    document.getElementById('agentTopics').value = settings.agentTopics;
-                }
-                if (settings.agentInterval !== undefined) {
-                    document.getElementById('agentInterval').value = settings.agentInterval;
-                }
-                if (settings.agentQCount !== undefined) {
-                    document.getElementById('agentQCount').value = settings.agentQCount;
-                }
-                if (settings.chatListCollapsed !== undefined) {
-                    chatListCollapsed = settings.chatListCollapsed;
-                    if (chatListCollapsed) {
-                        document.getElementById('chatList').classList.add('collapsed');
-                    } else {
-                        document.getElementById('chatList').classList.remove('collapsed');
-                    }
-                }
-            } catch(e) {
-                console.warn('Ошибка загрузки настроек:', e);
-            }
-        }
-    }
-
-    function saveSettings() {
-        const settings = {
-            temperature: parseFloat(document.getElementById('tempSlider').value),
-            allowClarifying: document.getElementById('allowClarifying').checked,
-            clarifyingDelay: parseFloat(document.getElementById('clarifyingDelay').value),
-            interactiveMode: document.getElementById('interactiveMode').checked,
-            userTimeout: parseInt(document.getElementById('userTimeout').value) || 30,
-            agentTopics: document.getElementById('agentTopics').value,
-            agentInterval: parseInt(document.getElementById('agentInterval').value) || 120,
-            agentQCount: parseInt(document.getElementById('agentQCount').value) || 2,
-            chatListCollapsed: chatListCollapsed
-        };
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-    }
-
-    document.addEventListener('DOMContentLoaded', function() {
-        const elements = [
-            document.getElementById('tempSlider'),
-            document.getElementById('allowClarifying'),
-            document.getElementById('clarifyingDelay'),
-            document.getElementById('interactiveMode'),
-            document.getElementById('userTimeout'),
-            document.getElementById('agentTopics'),
-            document.getElementById('agentInterval'),
-            document.getElementById('agentQCount')
-        ];
-        elements.forEach(el => {
-            el.addEventListener('change', saveSettings);
-            if (el.type === 'range') el.addEventListener('input', saveSettings);
-        });
-        document.getElementById('agentTopics').addEventListener('blur', saveSettings);
-        document.getElementById('userTimeout').addEventListener('blur', saveSettings);
-        document.getElementById('agentInterval').addEventListener('blur', saveSettings);
-        document.getElementById('agentQCount').addEventListener('blur', saveSettings);
-    });
-
-    // --- Чаты ---
-    function loadChats() {
-        const stored = localStorage.getItem(STORAGE_KEY);
-        if (stored) {
-            try {
-                chats = JSON.parse(stored);
-            } catch(e) {
-                chats = [];
-            }
-        }
-        if (!chats.length) {
-            const firstId = Date.now().toString();
-            chats = [{ id: firstId, name: 'Новый чат', messages: [] }];
-            currentChatId = firstId;
-            saveChats();
-        } else {
-            currentChatId = chats[0].id;
-        }
-        renderChatList();
-        loadCurrentChat();
-    }
-
-    function saveChats() {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(chats));
-    }
-
-    function getCurrentChat() {
-        return chats.find(c => c.id === currentChatId);
-    }
-
-    function renderChatList() {
-        const container = document.getElementById('chatItems');
-        container.innerHTML = '';
-        chats.forEach(chat => {
-            const div = document.createElement('div');
-            div.className = 'chat-item' + (chat.id === currentChatId ? ' active' : '');
-            const nameSpan = document.createElement('span');
-            nameSpan.className = 'chat-name';
-            nameSpan.textContent = chat.name;
-            nameSpan.ondblclick = function(e) {
-                e.stopPropagation();
-                const newName = prompt('Введите новое имя чата:', chat.name);
-                if (newName && newName.trim().length > 0) {
-                    chat.name = newName.trim();
-                    saveChats();
-                    renderChatList();
-                }
-            };
-            const delBtn = document.createElement('button');
-            delBtn.className = 'delete-btn';
-            delBtn.textContent = '✕';
-            delBtn.onclick = (e) => {
-                e.stopPropagation();
-                deleteChat(chat.id);
-            };
-            div.appendChild(nameSpan);
-            div.appendChild(delBtn);
-            div.onclick = () => switchChat(chat.id);
-            container.appendChild(div);
-        });
-    }
-
-    function switchChat(chatId) {
-        if (chatId === currentChatId) return;
-        const chat = chats.find(c => c.id === chatId);
-        if (!chat) return;
-        currentChatId = chatId;
-        renderChatList();
-        loadCurrentChat();
-        document.getElementById('learnPosBtn').style.display = 'none';
-        document.getElementById('learnNegBtn').style.display = 'none';
-        lastQuestion = '';
-        lastAnswer = '';
-        lastFacts = [];
-    }
-
-    function loadCurrentChat() {
-        const chat = getCurrentChat();
-        if (!chat) return;
-        const container = document.getElementById('messages');
-        container.innerHTML = '';
-        if (chat.messages.length === 0) {
-            const msgDiv = document.createElement('div');
-            msgDiv.className = 'message bot';
-            msgDiv.innerHTML = 'Привет! Я Smart Brain. Задай мне вопрос.<div class="time">' + new Date().toLocaleTimeString() + '</div>';
-            container.appendChild(msgDiv);
-        } else {
-            chat.messages.forEach(msg => {
-                const div = document.createElement('div');
-                div.className = 'message ' + msg.role;
-                if (msg.isAgentOrClarifying) div.classList.add('agent-question');
-                div.innerHTML = msg.text + '<div class="time">' + new Date(msg.time).toLocaleTimeString() + '</div>';
-                container.appendChild(div);
-            });
-        }
-        highlightCodeBlocks();
-        const msgs = chat.messages;
-        for (let i = msgs.length - 1; i >= 0; i--) {
-            if (msgs[i].role === 'user') {
-                lastQuestion = msgs[i].text;
-                for (let j = i + 1; j < msgs.length; j++) {
-                    if (msgs[j].role === 'assistant') {
-                        lastAnswer = msgs[j].text;
-                        lastFacts = msgs[j].facts || [];
-                        break;
-                    }
-                }
-                break;
-            }
-        }
-        document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
-    }
-
-    function createNewChat() {
-        const id = Date.now().toString();
-        const name = 'Новый чат';
-        chats.push({ id, name, messages: [] });
-        saveChats();
-        switchChat(id);
-        const chat = getCurrentChat();
-        if (chat) {
-            chat.messages.push({
-                role: 'assistant',
-                text: 'Привет! Я Smart Brain. Задай мне вопрос.',
-                facts: null,
-                isAgentOrClarifying: false,
-                time: new Date().toISOString()
-            });
-            saveChats();
-            renderChatList();
-            loadCurrentChat();
-        }
-    }
-
-    function deleteChat(chatId) {
-        if (chats.length <= 1) {
-            alert('Нельзя удалить последний чат.');
-            return;
-        }
-        if (!confirm('Удалить чат?')) return;
-        const index = chats.findIndex(c => c.id === chatId);
-        if (index === -1) return;
-        chats.splice(index, 1);
-        if (currentChatId === chatId) {
-            currentChatId = chats[0].id;
-        }
-        saveChats();
-        renderChatList();
-        loadCurrentChat();
-    }
-
-    function autoRenameChat(chatId, firstMessage) {
-        const chat = chats.find(c => c.id === chatId);
-        if (!chat) return;
-        if (chat.name !== 'Новый чат') return;
-        let newName = firstMessage.trim();
-        if (newName.length > 25) newName = newName.substring(0, 25) + '...';
-        if (newName.length === 0) return;
-        chat.name = newName;
-        saveChats();
-        renderChatList();
-    }
-
-    // --- Подсветка кода ---
-    function highlightCodeBlocks() {
-        document.querySelectorAll('.message pre code').forEach(block => {
-            if (!block.dataset.highlighted) {
-                hljs.highlightElement(block);
-                block.dataset.highlighted = 'true';
-            }
-        });
-    }
-
-    // --- Форматирование текста с подсветкой кода ---
-    function formatMessage(text) {
-        const codeBlockRegex = /```(\w*)\n([\s\S]*?)```/g;
-        let result = '';
-        let lastIndex = 0;
-        let match;
-        while ((match = codeBlockRegex.exec(text)) !== null) {
-            const lang = match[1] || 'text';
-            const code = match[2];
-            const before = text.substring(lastIndex, match.index);
-            result += escapeHtml(before).replace(/\n/g, '<br>');
-            result += `<pre><code class="language-${lang}">${escapeHtml(code)}</code><button class="copy-btn" onclick="copyCode(this)">Копировать</button></pre>`;
-            lastIndex = match.index + match[0].length;
-        }
-        result += escapeHtml(text.substring(lastIndex)).replace(/\n/g, '<br>');
-        return result;
-    }
-
-    function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-    }
-
-    function copyCode(btn) {
-        const pre = btn.parentElement;
-        const code = pre.querySelector('code');
-        if (code) {
-            navigator.clipboard.writeText(code.textContent).then(() => {
-                btn.textContent = '✅';
-                setTimeout(() => { btn.textContent = 'Копировать'; }, 2000);
-            }).catch(() => {});
-        }
-    }
-
-    // --- Добавление сообщения с анимацией печати ---
-    function addMessage(text, sender, facts, isAgentOrClarifying, animate = false) {
-        const container = document.getElementById('messages');
-        const div = document.createElement('div');
-        div.className = 'message ' + sender;
-        if (isAgentOrClarifying) div.classList.add('agent-question');
-
-        const factsHtml = (sender === 'bot' && facts && facts.length > 0) ?
-            '<div class="facts-indicator">📚 использовано фактов: ' + facts.length + '</div>' : '';
-        const timeHtml = '<div class="time">' + new Date().toLocaleTimeString() + '</div>';
-
-        if (sender === 'user' || !animate) {
-            const formatted = formatMessage(text);
-            div.innerHTML = formatted + factsHtml + timeHtml;
-            container.appendChild(div);
-            container.scrollTop = container.scrollHeight;
-            highlightCodeBlocks();
-            saveMessageToChat(div.innerHTML, sender, facts, isAgentOrClarifying);
-        } else {
-            div.innerHTML = '';
-            container.appendChild(div);
-            container.scrollTop = container.scrollHeight;
-
-            const words = text.split(/(\s+)/);
-            let fullText = '';
-            let currentIndex = 0;
-
-            function typeNext() {
-                if (currentIndex < words.length) {
-                    fullText += words[currentIndex];
-                    currentIndex++;
-                    div.textContent = fullText;
-                    container.scrollTop = container.scrollHeight;
-                    setTimeout(typeNext, 10 + Math.random() * 20);
-                } else {
-                    const formatted = formatMessage(fullText);
-                    div.innerHTML = formatted + factsHtml + timeHtml;
-                    container.scrollTop = container.scrollHeight;
-                    highlightCodeBlocks();
-                    saveMessageToChat(div.innerHTML, sender, facts, isAgentOrClarifying);
-                }
-            }
-            typeNext();
-        }
-    }
-
-    function saveMessageToChat(html, sender, facts, isAgentOrClarifying) {
-        const chat = getCurrentChat();
-        if (chat) {
-            const hasUserMessage = chat.messages.some(m => m.role === 'user');
-            if (sender === 'user' && !hasUserMessage) {
-                const tempDiv = document.createElement('div');
-                tempDiv.innerHTML = html;
-                const text = tempDiv.textContent || '';
-                autoRenameChat(chat.id, text);
-            }
-            chat.messages.push({
-                role: sender,
-                text: html,
-                facts: facts || null,
-                isAgentOrClarifying: isAgentOrClarifying || false,
-                time: new Date().toISOString()
-            });
-            saveChats();
-        }
-    }
-
-    // --- Отправка сообщения ---
-    async function sendMessage() {
-        const input = document.getElementById('questionInput');
-        const text = input.value.trim();
-        if (!text) return;
-        input.value = '';
-
-        if (interactiveMode && currentAgentQuestion) {
-            const q = currentAgentQuestion;
-            currentAgentQuestion = null;
-            document.getElementById('interactiveLog').textContent = 'Ответ отправлен агенту.';
-            try {
-                await fetch('/agent/submit_answer', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ question: q, answer: text })
-                });
-                addMessage(text, 'user');
-                addMessage('✅ Ответ принят и изучен.', 'bot', null, false, false);
-                loadStats();
-            } catch(e) {
-                addMessage('❌ Ошибка при отправке ответа: ' + e.message, 'bot', null, false, false);
-            }
-            return;
-        }
-
-        addMessage(text, 'user', null, false, false);
-        const sendBtn = document.getElementById('sendBtn');
-        sendBtn.disabled = true;
-
-        try {
-            const temp = parseFloat(document.getElementById('tempSlider').value);
-            const allowClarifying = document.getElementById('allowClarifying').checked;
-
-            const res = await fetch('/ask', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    question: text,
-                    temperature: temp,
-                    allow_clarifying: allowClarifying
-                })
-            });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.detail || 'Ошибка');
-
-            const answer = data.answer || 'Нет ответа.';
-            lastQuestion = text;
-            lastAnswer = answer;
-            lastFacts = data.facts || [];
-
-            addMessage(answer, 'bot', lastFacts, false, true);
-            renderFacts(lastFacts);
-            loadStats();
-
-            if (data.clarifying_question && allowClarifying) {
-                const delay = parseFloat(document.getElementById('clarifyingDelay').value) * 1000;
-                const typingDiv = document.createElement('div');
-                typingDiv.className = 'message bot typing';
-                typingDiv.id = 'typing-' + Date.now();
-                typingDiv.innerHTML = '<span class="dots">печатает</span>';
-                document.getElementById('messages').appendChild(typingDiv);
-                const typingId = typingDiv.id;
-                const messagesContainer = document.getElementById('messages');
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
-
-                setTimeout(() => {
-                    const el = document.getElementById(typingId);
-                    if (el) el.remove();
-                    addMessage('🤔 ' + data.clarifying_question, 'bot', null, true, false);
-                }, delay);
-            }
-
-            document.getElementById('learnPosBtn').style.display = 'inline-block';
-            document.getElementById('learnNegBtn').style.display = 'inline-block';
-        } catch(e) {
-            addMessage('❌ Ошибка: ' + e.message, 'bot', null, false, false);
-        } finally {
-            sendBtn.disabled = false;
-        }
-    }
-
-    // --- Остальные функции (без изменений) ---
-    async function loadStats() {
-        try {
-            const res = await fetch('/stats');
-            const data = await res.json();
-            document.getElementById('statNeurons').textContent = data.neurons;
-            document.getElementById('statSynapses').textContent = data.synapses;
-            document.getElementById('statConcepts').textContent = data.concepts;
-            document.getElementById('statKB').textContent = data.knowledge_base;
-            document.getElementById('statMemory').textContent = data.memory_entries || 0;
-        } catch(e) { console.error('Stats error', e); }
-    }
-
-    function renderFacts(facts) {
-        const container = document.getElementById('factsList');
-        if (!facts || facts.length === 0) {
-            container.innerHTML = '<p style="color:#999; font-size:14px;">Нет фактов.</p>';
-            return;
-        }
-        let html = '';
-        facts.forEach(f => {
-            const scoreText = f.score ? f.score.toFixed(2) : '?';
-            html += `<div class="fact-item"><div class="q">${f.q}</div><div class="a">${f.a}</div><div class="score">score: ${scoreText}</div></div>`;
-        });
-        container.innerHTML = html;
-    }
-
-    let interactiveMode = false;
-    let currentAgentQuestion = null;
-    let pollIntervalId = null;
-
-    document.getElementById('interactiveMode').addEventListener('change', function() {
-        interactiveMode = this.checked;
-        if (interactiveMode) {
-            document.getElementById('interactiveLog').textContent = 'Интерактивный режим включён.';
-            startPolling();
-        } else {
-            document.getElementById('interactiveLog').textContent = 'Интерактивный режим выключен.';
-            stopPolling();
-            currentAgentQuestion = null;
-        }
-        updateAgentInteractiveConfig();
-        saveSettings();
-    });
-
-    function startPolling() {
-        if (pollIntervalId) return;
-        pollIntervalId = setInterval(async () => {
-            if (!interactiveMode) return;
-            try {
-                const res = await fetch('/agent/next_question');
-                const data = await res.json();
-                if (data.question) {
-                    currentAgentQuestion = data.question;
-                    addMessage('🤖 Агент спрашивает: ' + data.question, 'bot', null, true, false);
-                    document.getElementById('interactiveLog').textContent = 'Ожидается ваш ответ.';
-                }
-            } catch(e) { console.error('Polling error', e); }
-        }, 5000);
-    }
-
-    function stopPolling() {
-        if (pollIntervalId) {
-            clearInterval(pollIntervalId);
-            pollIntervalId = null;
-        }
-    }
-
-    async function updateAgentInteractiveConfig() {
-        const interactive = document.getElementById('interactiveMode').checked;
-        const timeout = parseInt(document.getElementById('userTimeout').value) || 30;
-        try {
-            await fetch('/agent/config', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    interactive_mode: interactive,
-                    user_question_timeout: timeout
-                })
-            });
-        } catch(e) { console.error('Error updating agent config:', e); }
-    }
-
-    let agentRunning = true;
-    async function toggleAgent() {
-        const btn = document.getElementById('agentToggleBtn');
-        const action = agentRunning ? 'stop' : 'start';
-        try {
-            const res = await fetch('/agent/' + action, { method: 'POST' });
-            if (res.ok) {
-                agentRunning = !agentRunning;
-                btn.textContent = agentRunning ? '⏸ Остановить' : '▶️ Запустить';
-                document.getElementById('agentLog').textContent = 'Агент ' + (agentRunning ? 'запущен' : 'остановлен');
-            }
-        } catch(e) { console.error(e); }
-    }
-
-    async function updateAgentConfig() {
-        const topics = document.getElementById('agentTopics').value.split(',').map(s => s.trim()).filter(Boolean);
-        const interval = parseInt(document.getElementById('agentInterval').value);
-        const qCount = parseInt(document.getElementById('agentQCount').value);
-        if (!topics.length || interval < 1 || qCount < 1) {
-            alert('Проверьте настройки');
-            return;
-        }
-        try {
-            const res = await fetch('/agent/config', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ topics, interval, questions_per_cycle: qCount })
-            });
-            const data = await res.json();
-            document.getElementById('agentLog').textContent = '✅ Настройки обновлены: темы=' + data.topics.join(', ');
-        } catch(e) { console.error(e); }
-        saveSettings();
-    }
-
-    async function trainTopic() {
-        const topic = document.getElementById('trainTopic').value.trim();
-        if (!topic) return alert('Введите тему');
-        const numPairs = parseInt(document.getElementById('trainNumPairs').value) || 30;
-        const temp = parseFloat(document.getElementById('trainTemp').value) || 0.7;
-        const negRatio = parseFloat(document.getElementById('trainNegRatio').value) || 0.2;
-        const integrate = document.getElementById('trainIntegrate').checked;
-        const epochs = parseInt(document.getElementById('trainEpochs').value) || 1;
-
-        document.getElementById('trainLog').textContent = '⏳ Обучение...';
-        try {
-            const res = await fetch('/train_topic', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ topic, num_pairs: numPairs, temperature: temp, negative_ratio: negRatio, integrate, epochs })
-            });
-            const data = await res.json();
-            document.getElementById('trainLog').textContent = data.message || 'Готово';
-            loadStats();
-        } catch(e) {
-            document.getElementById('trainLog').textContent = '❌ Ошибка';
-        }
-    }
-
-    async function trainPair() {
-        const q = document.getElementById('pairQuestion').value.trim();
-        const a = document.getElementById('pairAnswer').value.trim();
-        const epochs = parseInt(document.getElementById('pairEpochs').value) || 1;
-        if (!q || !a) return alert('Введите вопрос и ответ');
-        document.getElementById('pairLog').textContent = '⏳ Обучение...';
-        try {
-            const res = await fetch('/train_pair', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ question: q, answer: a, epochs })
-            });
-            const data = await res.json();
-            document.getElementById('pairLog').textContent = '✅ Пара выучена за ' + data.epochs + ' эпох(и)';
-            loadStats();
-        } catch(e) {
-            document.getElementById('pairLog').textContent = '❌ Ошибка';
-        }
-    }
-
-    async function sleepBrain() {
-        document.getElementById('sleepLog').textContent = '⏳ Запуск сна...';
-        try {
-            const res = await fetch('/sleep', { method: 'POST' });
-            const data = await res.json();
-            document.getElementById('sleepLog').textContent = '✅ Сон завершен';
-            loadStats();
-        } catch(e) {
-            document.getElementById('sleepLog').textContent = '❌ Ошибка';
-        }
-    }
-
-    async function learnLastPair() {
-        if (!lastQuestion || !lastAnswer) { alert('Нет пары для обучения.'); return; }
-        await doLearn(lastQuestion, lastAnswer, 'positive');
-    }
-    async function learnLastPairNeg() {
-        if (!lastQuestion || !lastAnswer) { alert('Нет пары для обучения.'); return; }
-        await doLearn(lastQuestion, lastAnswer, 'negative');
-    }
-
-    async function doLearn(q, a, type) {
-        try {
-            const url = type === 'negative' ? '/learn_neg' : '/learn';
-            const res = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ question: q, answer: a })
-            });
-            if (res.ok) {
-                alert('✅ ' + (type === 'positive' ? 'Обучено' : 'Отрицание обучено'));
-                loadStats();
-                document.getElementById('learnPosBtn').style.display = 'none';
-                document.getElementById('learnNegBtn').style.display = 'none';
-            }
-        } catch(e) { alert('Ошибка: ' + e.message); }
-    }
-
-    let settingsOpen = false;
-    function toggleSettings() {
-        settingsOpen = !settingsOpen;
-        document.getElementById('settingsPanel').classList.toggle('open', settingsOpen);
-        // Сохраняем состояние (опционально)
-        saveSettings();
-    }
-
-    window.sendMessage = sendMessage;
-    window.loadStats = loadStats;
-    window.trainTopic = trainTopic;
-    window.trainPair = trainPair;
-    window.sleepBrain = sleepBrain;
-    window.toggleSettings = toggleSettings;
-    window.toggleChatList = toggleChatList;
-    window.learnLastPair = learnLastPair;
-    window.learnLastPairNeg = learnLastPairNeg;
-    window.doLearn = doLearn;
-    window.toggleAgent = toggleAgent;
-    window.updateAgentConfig = updateAgentConfig;
-    window.updateAgentInteractiveConfig = updateAgentInteractiveConfig;
-    window.createNewChat = createNewChat;
-    window.deleteChat = deleteChat;
-    window.copyCode = copyCode;
-
-    // Инициализация
-    loadSettings();
-    loadChats();
-    loadStats();
-    if (window.innerWidth < 768) {
-        // На мобильных устройствах по умолчанию скрываем правую панель и сворачиваем чаты?
-        // Можно оставить как есть.
-    }
-</script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="/static/js/app.js"></script>
 </body>
 </html>

@@ -1,10 +1,10 @@
-# agent.py (обновлён)
+# agent.py (полностью исправленный для v6)
 import time
 import threading
 import random
 from typing import List, Optional
 from openai import OpenAI
-from smart_brain_v4 import Brain, Teacher
+from smart_brain_v6 import Brain, Teacher
 
 class BrainAgent:
     def __init__(
@@ -54,9 +54,16 @@ class BrainAgent:
         print("[Agent] Остановлен.")
 
     def _run(self):
+        cycle_counter = 0
         while not self._stop_flag:
             if self.enabled:
                 self._cycle()
+                cycle_counter += 1
+                # Автосохранение каждые 10 циклов (для надёжности)
+                if cycle_counter % 10 == 0:
+                    self.brain.save()
+                    self.brain.save_dialog_history()
+                    print("[Agent] Автосохранение выполнено.")
             for _ in range(self.interval):
                 if self._stop_flag:
                     break
@@ -113,7 +120,9 @@ class BrainAgent:
 
             return
 
-        # Если интерактивный режим выключен – самообучение (без изменений)
+        # ------------------------------------------------------------
+        # НЕИНТЕРАКТИВНЫЙ РЕЖИМ (самообучение)
+        # ------------------------------------------------------------
         topic = random.choice(self.topics)
         questions = self._generate_questions(topic, self.questions_per_cycle)
         for q in questions:
@@ -121,22 +130,30 @@ class BrainAgent:
                 break
             result = self.brain.generate_answer(q, temperature=self.temperature, use_rag=True)
             answer = result["text"]
-            score, improved = self.teacher.evaluate(q, answer)
+            score, improved, details = self.teacher.evaluate(q, answer)
+
             if score >= 0.7:
                 target = improved if improved != answer else answer
                 if target.lower() != q.lower():
                     self.brain.learn_pair(q, target)
+                    self.brain.save()                     # <-- СОХРАНЕНИЕ
+                    self.brain.save_dialog_history()      # <-- СОХРАНЕНИЕ ИСТОРИИ
                     print(f"[Agent] Выучено: {q} -> {target}")
             elif score <= 0.3:
                 if improved != answer and improved.lower() != q.lower():
                     self.brain.learn_negative_pair(q, answer)
                     self.brain.learn_pair(q, improved)
+                    self.brain.save()                     # <-- СОХРАНЕНИЕ
+                    self.brain.save_dialog_history()
                     print(f"[Agent] Отрицание и обучение: {q} -> {improved}")
                 else:
                     self.brain.learn_negative_pair(q, answer)
+                    self.brain.save()                     # <-- СОХРАНЕНИЕ
+                    self.brain.save_dialog_history()
                     print(f"[Agent] Отрицание: {q} -> {answer}")
             else:
                 self.brain.dialog_memory.add_turn(q, answer, self.brain.text_to_embedding(q))
+                self.brain.save_dialog_history()          # <-- СОХРАНЕНИЕ ТОЛЬКО ИСТОРИИ
                 print(f"[Agent] Диалог сохранён: {q} -> {answer}")
             time.sleep(1)
 
@@ -151,6 +168,8 @@ class BrainAgent:
     def submit_answer(self, question: str, answer: str):
         if self.active_question == question:
             self.brain.learn_pair(question, answer)
+            self.brain.save()                             # <-- СОХРАНЕНИЕ
+            self.brain.save_dialog_history()              # <-- СОХРАНЕНИЕ ИСТОРИИ
             print(f"[Agent] Пользователь ответил на '{question}' -> '{answer}', выучено.")
             self.active_question = None
             self.waiting_for_answer = False
