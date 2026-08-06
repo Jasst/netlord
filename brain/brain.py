@@ -14,58 +14,156 @@ from collections import deque
 from typing import List, Dict, Optional, Any, Tuple
 
 from brain.config import BrainConfig
-from brain.graph import DifferentiableNeuralGraph
+from brain.graph import DifferentiableNeuralGraph, HierarchicalGraph, NodeType
 from brain.memory import HierarchicalMemory
 from brain.llm import LLMInterface
 from brain.utils import EmbeddingProvider, random_vector, cosine_similarity
 from brain.search import WebSearcher
 
-class Brain(nn.Module):
+
+class CuriosityModule:
+    def __init__(self, lr: float = 0.01):
+        self.lr = lr
+
+    def compute_reward(self, query_vec: torch.Tensor, predicted_vec: torch.Tensor, actual_vec: torch.Tensor) -> float:
+        # ошибка предсказания (MSE)
+        error = F.mse_loss(predicted_vec, actual_vec)
+        return error.item()  # чем больше ошибка, тем выше любопытство
+
+
+class Planner:
+    def __init__(self, llm: LLMInterface):
+        self.llm = llm
+
+    def plan(self, question: str, context: str) -> List[str]:
+        prompt = f"Составь план действий для ответа на вопрос: {question}\nКонтекст: {context}\nПлан (каждый пункт с новой строки):"
+        plan_text = self.llm.generate(prompt, max_tokens=60, temperature=0.5)
+        lines = [line.strip() for line in plan_text.split('\n') if line.strip()]
+        return lines if lines else ["answer_directly"]
+
+
+class Reflector:
+    def __init__(self, llm: LLMInterface):
+        self.llm = llm
+
+    def should_reflect(self, answer: str) -> bool:
+        # Простая эвристика: если ответ короткий или содержит "не знаю"
+        if len(answer.split()) < 3 or "не знаю" in answer.lower():
+            return True
+        return False
+
+    def reflect(self, question: str, answer: str) -> str:
+        prompt = f"Исправь и улучши ответ на вопрос '{question}'. Текущий ответ: '{answer}'. Улучшенный ответ:"
+        improved = self.llm.generate(prompt, max_tokens=150, temperature=0.3)
+        return improved if improved.strip() else answer
+
+
+class EWC:
+    """Elastic Weight Consolidation для защиты важных весов"""
+    def __init__(self, model: nn.Module, lambda_: float = 0.1):
+        self.model = model
+        self.lambda_ = lambda_
+        self.fisher = {}
+        self.opt_params = {}
+
+    def compute_fisher(self, dataset_loader):
+        # Упрощённо: вычисляем диагональ Fisher по батчу данных
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.fisher[name] = torch.zeros_like(param)
+        self.model.train()
+        for inputs, targets in dataset_loader:  # нужен DataLoader
+            self.model.zero_grad()
+            outputs = self.model(inputs)
+            loss = F.cross_entropy(outputs, targets)
+            loss.backward()
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    self.fisher[name] += param.grad.data ** 2
+        for name in self.fisher:
+            self.fisher[name] /= len(dataset_loader)
+        self.opt_params = {n: p.clone() for n, p in self.model.named_parameters() if p.requires_grad}
+
+    def penalty(self) -> torch.Tensor:
+        loss = 0.0
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.fisher:
+                loss += (self.fisher[name] * (param - self.opt_params[name]) ** 2).sum()
+        return self.lambda_ * loss
+
+
+class CognitiveBrain(nn.Module):
     def __init__(self, config: BrainConfig):
         super().__init__()
         self.config = config
         self.dim = config.dim_embedding
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Компоненты
+        # Эмбеддер
         self.embedder = EmbeddingProvider(dim=self.dim, model_name=config.embedding_model)
-        self.graph = DifferentiableNeuralGraph(
-            dim=self.dim,
-            max_nodes=config.max_neurons,
-            hidden_dim=config.gnn_hidden_dim,
-            num_heads=config.gnn_num_heads,
-            num_layers=config.gnn_num_layers
-        ).to(self.device)
+
+        # Граф (иерархический или обычный)
+        if config.use_hierarchical_graph:
+            self.graph = HierarchicalGraph(
+                dims=config.graph_levels,
+                num_heads=config.gnn_num_heads,
+                num_layers=config.gnn_num_layers,
+                attn_heads=config.attention_heads
+            ).to(self.device)
+        else:
+            self.graph = DifferentiableNeuralGraph(
+                dim=self.dim,
+                max_nodes=config.max_neurons,
+                hidden_dim=config.gnn_hidden_dim,
+                num_heads=config.gnn_num_heads,
+                num_layers=config.gnn_num_layers
+            ).to(self.device)
+
+        # Память
         self.memory = HierarchicalMemory(
             dim=self.dim,
             working_size=config.working_memory_size,
             episodic_capacity=config.episodic_capacity
         )
+
+        # LLM
         self.llm = LLMInterface(
             model_name=config.llm_model,
             use_openai_api=config.use_openai_api,
             api_key=config.openai_api_key
         )
+
+        # Поиск
         self.searcher = WebSearcher(max_results=5)
 
+        # Оптимизатор
         self.optimizer = optim.Adam(self.graph.parameters(), lr=config.learning_rate)
+
+        # Счётчики
         self.step_counter = 0
         self._learn_counter = 0
 
-        # Совместимость
+        # Диалоговая история
         self.dialog_memory = []
         self.concept_index = {}
         self.knowledge_base = []
         self.lock = threading.RLock()
         self.short_memory = deque(maxlen=100)
 
+        # Улучшенные модули (опционально)
+        self.curiosity = CuriosityModule(lr=config.curiosity_lr) if config.enable_curiosity else None
+        self.planner = Planner(self.llm) if config.enable_planning else None
+        self.reflector = Reflector(self.llm) if config.enable_reflection else None
+        self.ewc = EWC(self.graph, lambda_=config.ewc_lambda) if config.enable_ewc else None
+
+        # Инициализация графа
         self._init_architecture()
 
     def _init_architecture(self):
-        # Инициализируем граф несколькими случайными узлами
+        # Добавляем стартовые узлы
         for i in range(10):
             emb = random_vector(self.dim)
-            self.graph.add_node(emb, label=f"init_{i}", cluster="hidden", layer=0)
+            self.graph.add_node(emb, label=f"init_{i}", cluster="hidden", layer=0, node_type=NodeType.CONCEPT)
 
     def forward(self, input_vec: torch.Tensor) -> torch.Tensor:
         return self.graph(input_vec)
@@ -73,11 +171,11 @@ class Brain(nn.Module):
     def text_to_embedding(self, text: str) -> torch.Tensor:
         return self.embedder.get_embedding(text).to(self.device)
 
-    # ---------- Обучение пары (положительный пример) ----------
-    def learn_pair(self, input_text: str, output_text: str, reinforce_boost: float = 0.15, epochs: int = 1):
+    # ---------- Обучение ----------
+    def learn_pair(self, input_text: str, output_text: str, reward: float = 1.0, epochs: int = 1):
         with self.lock:
             for _ in range(epochs):
-                self._learn_from_pair(input_text, output_text, reward=1.0)
+                self._learn_from_pair(input_text, output_text, reward=reward)
                 time.sleep(0.05)
             self._learn_counter += epochs
             if self._learn_counter % self.config.checkpoint_every == 0:
@@ -87,77 +185,92 @@ class Brain(nn.Module):
         q_vec = self.text_to_embedding(q)
         a_vec = self.text_to_embedding(a)
 
-        # Находим или создаём узлы
-        q_nid = self.graph.find_most_similar(q_vec, threshold=0.6)
+        q_nid = self.graph.find_most_similar(0, q_vec, threshold=0.6) if hasattr(self.graph, 'find_most_similar') and hasattr(self.graph, 'levels') else \
+                self.graph.find_most_similar(q_vec, threshold=0.6)
         if q_nid is None:
-            q_nid = self.graph.add_node(q_vec, label=q[:30], cluster="concept", layer=0)
+            q_nid = self.graph.add_node(q_vec, label=q[:30], cluster="concept", layer=0, node_type=NodeType.CONCEPT)
             self.concept_index[self._normalize(q)] = q_nid
 
-        a_nid = self.graph.find_most_similar(a_vec, threshold=0.6)
+        a_nid = self.graph.find_most_similar(0, a_vec, threshold=0.6) if hasattr(self.graph, 'find_most_similar') and hasattr(self.graph, 'levels') else \
+                self.graph.find_most_similar(a_vec, threshold=0.6)
         if a_nid is None:
-            a_nid = self.graph.add_node(a_vec, label=a[:30], cluster="concept", layer=0)
+            a_nid = self.graph.add_node(a_vec, label=a[:30], cluster="concept", layer=0, node_type=NodeType.CONCEPT)
             self.concept_index[self._normalize(a)] = a_nid
 
-        # Добавляем синапс
         self.graph.add_synapse(q_nid, a_nid, weight=0.2 * reward)
 
-        # Контрастивная потеря
         loss = self._contrastive_loss(q_nid, a_nid)
+        if self.ewc is not None:
+            loss += self.ewc.penalty()
         loss.backward()
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-        # Сохраняем в knowledge_base
         self._add_to_knowledge_base(q, a, q_vec, a_vec)
 
+        # Добавляем в семантическую память (упрощённо)
+        if hasattr(self, 'memory'):
+            self.memory.add_semantic_triple(q, "has_answer", a, confidence=reward)
+
     def _contrastive_loss(self, q_nid: int, a_nid: int) -> torch.Tensor:
-        updated = self.graph.forward()  # [N, dim]
-        emb_q = updated[q_nid - 1]
-        emb_a = updated[a_nid - 1]
-        # Нормализуем
+        # Используем forward для получения обновлённых эмбеддингов
+        updated = self.graph.forward()
+        # В иерархическом графе нужно получить эмбеддинги с нужного уровня (0)
+        if hasattr(self.graph, 'levels'):
+            emb_q = self.graph.levels[0].node_emb[q_nid - 1]  # предполагаем уровень 0
+            emb_a = self.graph.levels[0].node_emb[a_nid - 1]
+        else:
+            emb_q = updated[q_nid - 1]
+            emb_a = updated[a_nid - 1]
         emb_q = F.normalize(emb_q.unsqueeze(0), p=2, dim=1)
         emb_a = F.normalize(emb_a.unsqueeze(0), p=2, dim=1)
         sim = F.cosine_similarity(emb_q, emb_a, dim=1)
         loss = -torch.log(torch.sigmoid(sim * 10.0)).mean()
-        # Регуляризация весов
-        edge_w = self.graph.get_edge_weights()
-        if edge_w.numel() > 0:
-            loss += 1e-4 * torch.norm(edge_w, p=2)
+        # регуляризация весов рёбер
+        if hasattr(self.graph, 'get_edge_weights'):
+            edge_w = self.graph.get_edge_weights()
+            if edge_w.numel() > 0:
+                loss += 1e-4 * torch.norm(edge_w, p=2)
         return loss
 
     def learn_negative_pair(self, input_text: str, output_text: str, penalty: float = 0.15):
         with self.lock:
             q_vec = self.text_to_embedding(input_text)
             a_vec = self.text_to_embedding(output_text)
-            q_nid = self.graph.find_most_similar(q_vec, threshold=0.0)
-            a_nid = self.graph.find_most_similar(a_vec, threshold=0.0)
+            q_nid = self.graph.find_most_similar(0, q_vec, threshold=0.0) if hasattr(self.graph, 'find_most_similar') and hasattr(self.graph, 'levels') else \
+                    self.graph.find_most_similar(q_vec, threshold=0.0)
+            a_nid = self.graph.find_most_similar(0, a_vec, threshold=0.0) if hasattr(self.graph, 'find_most_similar') and hasattr(self.graph, 'levels') else \
+                    self.graph.find_most_similar(a_vec, threshold=0.0)
             if q_nid is None:
-                q_nid = self.graph.add_node(q_vec, label=input_text[:30], cluster="output", layer=0)
+                q_nid = self.graph.add_node(q_vec, label=input_text[:30], cluster="output", layer=0, node_type=NodeType.CONCEPT)
             if a_nid is None:
-                a_nid = self.graph.add_node(a_vec, label=output_text[:30], cluster="output", layer=0)
+                a_nid = self.graph.add_node(a_vec, label=output_text[:30], cluster="output", layer=0, node_type=NodeType.CONCEPT)
             self.graph.add_synapse(q_nid, a_nid, weight=-penalty)
             self._learn_counter += 1
             if self._learn_counter % self.config.checkpoint_every == 0:
                 self.save()
 
-    # ---------- Основной шаг (с гибридным поиском) ----------
+    # ---------- Основной шаг с улучшениями ----------
     def step(self, input_text: str, use_search: bool = False) -> Dict[str, Any]:
         self.step_counter += 1
-        # Обработка команд "запомни/забудь" перенесена в app.py, здесь не дублируем.
 
-        # 1. Проверка на запросы о криптовалютах (пример)
+        # 1. Планирование (если включено)
+        if self.planner is not None:
+            context = self._build_context(input_text, [], None)  # временный контекст
+            plan = self.planner.plan(input_text, context)
+            if "search" in plan or "поиск" in plan:
+                use_search = True
+
+        # 2. Проверка на криптовалюту (быстрый ответ)
         lower = input_text.lower()
         if any(kw in lower for kw in ["биткоин", "btc", "курс биткоина"]):
             price = self._get_crypto_price("bitcoin", "usd")
             if price is not None:
-                return {
-                    "input": input_text,
-                    "answer": f"Текущий курс BTC/USD: ${price:.2f}",
-                    "activated_neurons": [],
-                    "memory_results": []
-                }
+                answer = f"Текущий курс BTC/USD: ${price:.2f}"
+                self._update_after_step(input_text, answer)
+                return {"input": input_text, "answer": answer, "activated_neurons": [], "memory_results": []}
 
-        # 2. Принудительный интернет-поиск
+        # 3. Поиск (если запрошен)
         if use_search:
             enhanced = self._enhance_search_query(input_text)
             results = self.searcher.search(enhanced)
@@ -166,62 +279,69 @@ class Brain(nn.Module):
                 answer = self.llm.generate(context, max_tokens=300, temperature=0.3)
             else:
                 answer = "Не удалось найти информацию."
+            self._update_after_step(input_text, answer)
             return {"input": input_text, "answer": answer, "activated_neurons": [], "memory_results": []}
 
-        # 3. Гибридный поиск: FAISS + граф
+        # 4. Основной поток: память + граф
         query_vec = self.text_to_embedding(input_text)
-        # Поиск в эпизодической памяти
         memory_results = self.memory.retrieve(query_vec, k=5)
 
-        # Поиск в графе (ассоциации)
-        start_nid = self.graph.find_most_similar(query_vec, threshold=0.5)
+        start_nid = self.graph.find_most_similar(0, query_vec, threshold=0.5) if hasattr(self.graph, 'find_most_similar') and hasattr(self.graph, 'levels') else \
+                    self.graph.find_most_similar(query_vec, threshold=0.5)
         if start_nid is None:
-            start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0)
+            start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0, node_type=NodeType.SENSORY)
 
-        # Активируем граф (forward pass)
+        # Обновление графа
         updated = self.graph.forward()
 
-        # Формируем контекст для LLM
+        # 5. Генерация ответа
         context = self._build_context(input_text, memory_results, start_nid)
         answer = self.llm.generate(context, max_tokens=300, temperature=0.7)
 
-        # Сохраняем в рабочую память
+        # 6. Рефлексия (если включена)
+        if self.reflector is not None and self.reflector.should_reflect(answer):
+            improved = self.reflector.reflect(input_text, answer)
+            if improved != answer:
+                answer = improved
+                # дополнительное обучение на улучшении
+                self.learn_pair(input_text, answer, reward=0.9)
+
+        # 7. Внутреннее вознаграждение (любопытство)
+        if self.curiosity is not None:
+            # предсказание ответа по запросу (можно использовать эмбеддинг ответа)
+            predicted_vec = self.graph.forward()  # или что-то более осмысленное
+            actual_vec = self.text_to_embedding(answer)
+            reward = self.curiosity.compute_reward(query_vec, predicted_vec[start_nid-1] if start_nid is not None else query_vec, actual_vec)
+            # обучаемся с этим вознаграждением (но не перебарщиваем)
+            if reward > 0.1:
+                self.learn_pair(input_text, answer, reward=min(reward, 1.0))
+
+        # 8. Сохранение в память
         self.memory.add_working(query_vec, {"text": input_text, "answer": answer})
 
+        self._update_after_step(input_text, answer)
         return {
             "input": input_text,
             "answer": answer,
-            "activated_neurons": [start_nid],
+            "activated_neurons": [start_nid] if start_nid else [],
             "memory_results": memory_results
         }
 
+    def _update_after_step(self, question: str, answer: str):
+        # Сохраняем диалог
+        self.dialog_memory.append({"user": question, "assistant": answer, "time": time.time()})
+        if len(self.dialog_memory) > 1000:
+            self.dialog_memory = self.dialog_memory[-1000:]
+
     def step_stream(self, input_text: str, use_search: bool = False):
-        # Аналогично step, но с генерацией токенов
-        lower = input_text.lower()
-        if use_search:
-            enhanced = self._enhance_search_query(input_text)
-            results = self.searcher.search(enhanced)
-            if results:
-                context = self._build_search_context(input_text, enhanced, results)
-                for token in self.llm.generate_stream(context, max_tokens=300, temperature=0.3):
-                    yield token
-                return
-            else:
-                yield "Не удалось найти информацию."
-                return
+        # Аналогично step, но с генерацией потока
+        # Для простоты используем обычный step и возвращаем токены
+        result = self.step(input_text, use_search)
+        answer = result["answer"]
+        for token in answer.split():
+            yield token + " "
 
-        query_vec = self.text_to_embedding(input_text)
-        memory_results = self.memory.retrieve(query_vec, k=5)
-        start_nid = self.graph.find_most_similar(query_vec, threshold=0.5)
-        if start_nid is None:
-            start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0)
-        self.graph.forward()
-
-        context = self._build_context(input_text, memory_results, start_nid)
-        for token in self.llm.generate_stream(context, max_tokens=300, temperature=0.7):
-            yield token
-
-    # ---------- Вспомогательные методы ----------
+    # ---------- Вспомогательные ----------
     def _normalize(self, text: str) -> str:
         return re.sub(r'\s+', ' ', text.strip().lower())
 
@@ -232,7 +352,7 @@ class Brain(nn.Module):
         self.knowledge_base.append({
             "q": q,
             "a": a,
-            "emb": (q_vec + a_vec) / 2,  # усреднённый эмбеддинг
+            "emb": (q_vec + a_vec) / 2,
             "time": time.time(),
             "confidence": 0.5,
             "access_count": 0
@@ -247,14 +367,14 @@ class Brain(nn.Module):
             for res in memory_results[:3]:
                 meta = res.get("metadata", {})
                 context += f"- {meta.get('text', '')}\n"
-        # Добавляем знания из базы знаний (поиск по сходству)
         kb_facts = self._search_knowledge_base(query, top_k=3)
         if kb_facts:
             context += "Из базы знаний:\n" + "\n".join(kb_facts) + "\n"
-        # Ассоциация из графа
-        label = self.graph.neuron_labels.get(start_nid, "")
-        if label:
-            context += f"Ассоциация: {label}\n"
+        # Получить метку узла (если есть)
+        if hasattr(self.graph, 'node_labels') and start_nid in self.graph.node_labels:
+            label = self.graph.node_labels.get(start_nid, "")
+            if label:
+                context += f"Ассоциация: {label}\n"
         context += "Отвечай кратко и по существу. Если не знаешь, скажи: 'Я не знаю'."
         return context
 
@@ -295,15 +415,16 @@ class Brain(nn.Module):
             return None
 
     def _enhance_search_query(self, query: str) -> str:
-        # Простое улучшение (добавляем дату)
         return query + " " + time.strftime("%d.%m.%Y")
 
-    # ---------- Сон (консолидация) ----------
     def sleep(self, duration_steps: int = 10):
         with self.lock:
             print("💤 Сон... (консолидация памяти)")
-            self.memory.consolidate()
-            # Также можно обучить GNN на эпизодах (здесь пропускаем)
+            self.memory.consolidate(threshold=0.05)
+            # Если есть EWC, можно пересчитать Fisher
+            if self.ewc is not None:
+                # Здесь нужен даталоадер, упростим
+                pass
             print("😴 Сон завершён")
 
     # ---------- Сохранение / загрузка ----------
@@ -311,15 +432,17 @@ class Brain(nn.Module):
         path = model_dir or self.config.model_dir
         os.makedirs(path, exist_ok=True)
         torch.save(self.graph.state_dict(), f"{path}/graph.pth")
+        # Сохраняем рёбра
         with open(f"{path}/edges.pkl", "wb") as f:
-            pickle.dump((self.graph._edges, [w.detach().cpu().numpy() for w in self.graph._edge_weights]), f)
-        # Сохраняем метаданные
+            if hasattr(self.graph, '_edges') and hasattr(self.graph, '_edge_weights'):
+                edges = self.graph._edges
+                weights = [w.detach().cpu().numpy() for w in self.graph._edge_weights]
+                pickle.dump((edges, weights), f)
         meta = {
             "step_counter": self.step_counter,
             "learn_counter": self._learn_counter,
             "concept_index": self.concept_index,
             "knowledge_base": self.knowledge_base,
-            "num_neurons": self.graph.node_emb.shape[0],
         }
         with open(f"{path}/meta.json", "w") as f:
             json.dump(meta, f, default=lambda o: o.tolist() if isinstance(o, torch.Tensor) else o)
@@ -330,7 +453,6 @@ class Brain(nn.Module):
         path = model_dir or self.config.model_dir
         if not os.path.exists(path):
             return
-        # Загружаем state_dict графа
         graph_path = f"{path}/graph.pth"
         if os.path.exists(graph_path):
             state_dict = torch.load(graph_path, map_location=self.device)
@@ -339,9 +461,10 @@ class Brain(nn.Module):
         if os.path.exists(edges_path):
             with open(edges_path, "rb") as f:
                 edges, weights = pickle.load(f)
-            self.graph._edges = edges
-            self.graph._edge_weights = nn.ParameterList([nn.Parameter(torch.tensor(w)) for w in weights])
-            self.graph._rebuild_edges()
+            if hasattr(self.graph, '_edges') and hasattr(self.graph, '_edge_weights'):
+                self.graph._edges = edges
+                self.graph._edge_weights = nn.ParameterList([nn.Parameter(torch.tensor(w)) for w in weights])
+                self.graph._rebuild_edges()
         meta_path = f"{path}/meta.json"
         if os.path.exists(meta_path):
             with open(meta_path, "r") as f:
@@ -368,14 +491,17 @@ class Brain(nn.Module):
                 self.dialog_memory = json.load(f)
 
     def get_stats(self) -> Dict[str, Any]:
+        num_nodes = self.graph.node_emb.shape[0] if hasattr(self.graph, 'node_emb') else sum(g.node_emb.shape[0] for g in self.graph.levels)
+        num_edges = len(self.graph._edges) if hasattr(self.graph, '_edges') else 0
         return {
-            "neurons": self.graph.node_emb.shape[0],
-            "synapses": len(self.graph._edges),
+            "neurons": num_nodes,
+            "synapses": num_edges,
             "concepts": len(self.concept_index),
             "knowledge_base": len(self.knowledge_base),
             "memory": {
                 "working": len(self.memory.working),
                 "episodic": self.memory.episodic.index.ntotal,
+                "semantic": len(self.memory.semantic_memory.triples),
             },
             "step_counter": self.step_counter,
         }

@@ -3,9 +3,8 @@ import asyncio
 import json
 import os
 import time
-import secrets
 import torch
-from fastapi import FastAPI, Request, HTTPException, Depends, Header, File, UploadFile, Form
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -15,18 +14,12 @@ import atexit
 import signal
 import sys
 
-from brain import Brain, BrainConfig
-from brain.llm import LLMInterface
+from brain import CognitiveBrain, BrainConfig
 
 torch.set_default_dtype(torch.float32)
 
-# Настройки
 LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
-ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY") or secrets.token_urlsafe(24)
-if not os.environ.get("ADMIN_API_KEY"):
-    print(f"[SECURITY] ADMIN_API_KEY сгенерирован: {ADMIN_API_KEY}")
 
-# Инициализация мозга
 config = BrainConfig(
     dim_embedding=384,
     gnn_hidden_dim=256,
@@ -35,29 +28,25 @@ config = BrainConfig(
     max_synapses=500000,
     working_memory_size=10,
     episodic_capacity=50000,
-    model_dir="brain_model_v8",
+    model_dir="brain_model_v9",
     learning_rate=1e-4,
     checkpoint_every=50,
     embedding_model="intfloat/e5-large-v2",
     llm_model="Qwen/Qwen2-7B-Instruct",
-    use_openai_api=False,  # или True, если есть ключ
-    openai_api_key=os.getenv("OPENAI_API_KEY")
+    use_openai_api=False,
+    openai_api_key=os.getenv("OPENAI_API_KEY"),
+    enable_curiosity=True,
+    enable_planning=True,
+    enable_reflection=True,
+    enable_ewc=True,
 )
-brain = Brain(config)
+brain = CognitiveBrain(config)
 brain.load()
 brain.load_dialog_history()
 
-# FastAPI приложение
-app = FastAPI(title="Smart Brain v8")
+app = FastAPI(title="Smart Brain v9")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Защита административных эндпоинтов
-def require_admin(x_admin_key: str = Header(default="")):
-    if not secrets.compare_digest(x_admin_key, ADMIN_API_KEY):
-        raise HTTPException(status_code=401, detail="Неверный X-Admin-Key")
-    return True
-
-# Модели запросов
 class AskRequest(BaseModel):
     question: str
     temperature: float = 0.7
@@ -74,14 +63,11 @@ class TrainTopicRequest(BaseModel):
     negative_ratio: float = 0.2
     epochs: int = 1
 
-# ---------- Эндпоинты ----------
 @app.post("/ask")
 async def ask(req: AskRequest):
     try:
-        # Обработка "запомни/забудь" – упрощённо (можно вынести в отдельные эндпоинты)
         result = await asyncio.to_thread(brain.step, req.question, use_search=req.use_search)
         answer = result["answer"]
-        # Сохраняем в историю
         brain.dialog_memory.append({"user": req.question, "assistant": answer, "time": time.time()})
         await asyncio.to_thread(brain.save_dialog_history)
         return {
@@ -109,7 +95,7 @@ async def ask_stream(req: AskRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/learn", dependencies=[Depends(require_admin)])
+@app.post("/learn")
 async def learn(req: LearnRequest):
     try:
         await asyncio.to_thread(brain.learn_pair, req.question, req.answer)
@@ -118,11 +104,9 @@ async def learn(req: LearnRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/train_topic", dependencies=[Depends(require_admin)])
+@app.post("/train_topic")
 async def train_topic(req: TrainTopicRequest):
-    # Генерация пар с помощью LLM и обучение (упрощённо)
     try:
-        # Здесь используем llm для генерации пар (можно вынести в отдельную функцию)
         pairs = await asyncio.to_thread(_generate_training_pairs, req.topic, req.num_pairs)
         for q, a in pairs:
             brain.learn_pair(q, a, epochs=req.epochs)
@@ -133,7 +117,6 @@ async def train_topic(req: TrainTopicRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 def _generate_training_pairs(topic: str, num_pairs: int) -> List[tuple]:
-    # Используем llm для генерации
     prompt = f"Сгенерируй {num_pairs} пар 'вопрос|ответ' по теме '{topic}'. Формат: каждая пара на новой строке, разделённая '|'."
     response = brain.llm.generate(prompt, max_tokens=num_pairs*30, temperature=0.9)
     pairs = []
@@ -147,12 +130,12 @@ def _generate_training_pairs(topic: str, num_pairs: int) -> List[tuple]:
 async def stats():
     return brain.get_stats()
 
-@app.post("/sleep", dependencies=[Depends(require_admin)])
+@app.post("/sleep")
 async def sleep_brain():
     await asyncio.to_thread(brain.sleep)
     return {"status": "sleep_done"}
 
-@app.post("/chat/clear", dependencies=[Depends(require_admin)])
+@app.post("/chat/clear")
 async def clear_chat():
     brain.dialog_memory.clear()
     await asyncio.to_thread(brain.save_dialog_history)
@@ -167,7 +150,6 @@ async def index():
     with open("templates/index.html", "r", encoding="utf-8") as f:
         return f.read()
 
-# ---------- Завершение ----------
 def save_brain():
     print("\n💾 Сохраняем модель...")
     brain.save()

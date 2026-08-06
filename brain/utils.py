@@ -7,10 +7,6 @@ from typing import Optional, List
 from transformers import AutoTokenizer, AutoModel
 
 class EmbeddingProvider:
-    """
-    Современный эмбеддер на базе transformer (E5, BGE и т.п.).
-    Выходные векторы нормализованы.
-    """
     def __init__(self, dim: int = 384, model_name: str = "intfloat/e5-large-v2"):
         self.dim = dim
         self.model_name = model_name
@@ -22,14 +18,11 @@ class EmbeddingProvider:
     def get_embedding(self, text: str) -> torch.Tensor:
         if text in self._cache:
             return self._cache[text].clone()
-        # Для E5 нужно добавлять префикс "query: " или "passage: "
-        # Здесь мы используем как query (для поиска)
         if "e5" in self.model_name.lower():
             text = "query: " + text
         inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
         with torch.no_grad():
             outputs = self.model(**inputs)
-            # Среднее по токенам (mean pooling)
             emb = outputs.last_hidden_state.mean(dim=1).squeeze(0)
             emb = F.normalize(emb, p=2, dim=0)
         self._cache[text] = emb.clone()
@@ -37,7 +30,6 @@ class EmbeddingProvider:
 
     def get_embeddings_batch(self, texts: List[str]) -> List[torch.Tensor]:
         return [self.get_embedding(t) for t in texts]
-
 
 def random_vector(dim: int) -> torch.Tensor:
     v = torch.randn(dim)
@@ -50,3 +42,8 @@ def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
 
 def hash_text(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
+
+def compute_importance(access_count: int, age: float, max_age: float = 30*24*3600) -> float:
+    # важность = частота доступа * (1 - возраст/макс_возраст)
+    age_factor = max(0, 1 - age / max_age)
+    return (access_count + 1) * age_factor

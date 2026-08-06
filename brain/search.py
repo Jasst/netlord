@@ -1,11 +1,6 @@
 # brain/search.py
-"""
-Модуль для бесплатного интернет-поиска через DuckDuckGo.
-Использует библиотеку duckduckgo-search (установите: pip install duckduckgo-search)
-"""
 from typing import List, Dict, Optional
-from ddgs import DDGS   # вместо from duckduckgo_search import DDGS
-
+from duckduckgo_search import DDGS
 
 class WebSearcher:
     def __init__(self, max_results: int = 3, timeout: int = 10):
@@ -13,9 +8,6 @@ class WebSearcher:
         self.timeout = timeout
 
     def search(self, query: str) -> List[Dict[str, str]]:
-        """
-        Выполняет поиск и возвращает список словарей с полями 'title', 'body', 'href'.
-        """
         results = []
         try:
             with DDGS(timeout=self.timeout) as ddgs:
@@ -31,7 +23,6 @@ class WebSearcher:
             return []
 
     def format_results(self, results: List[Dict[str, str]]) -> str:
-        """Форматирует результаты для вставки в промпт."""
         if not results:
             return "Ничего не найдено."
         lines = []
