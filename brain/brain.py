@@ -22,7 +22,7 @@ from brain.search import WebSearcher
 
 
 # ----------------------------------------------------------------------
-# Вспомогательные модули (любопытство, планирование, рефлексия, EWC)
+# Вспомогательные модули
 # ----------------------------------------------------------------------
 class CuriosityModule:
     def __init__(self, lr: float = 0.01):
@@ -188,7 +188,7 @@ class CognitiveBrain(nn.Module):
         a_vec = self.text_to_embedding(a)
 
         # Поиск или создание узла для вопроса
-        if hasattr(self.graph, 'levels'):  # иерархический граф
+        if hasattr(self.graph, 'levels'):
             q_nid = self.graph.find_most_similar(q_vec, level_idx=0, threshold=0.6)
         else:
             q_nid = self.graph.find_most_similar(q_vec, threshold=0.6)
@@ -221,14 +221,13 @@ class CognitiveBrain(nn.Module):
             self.memory.add_semantic_triple(q, "has_answer", a, confidence=reward)
 
     def _contrastive_loss(self, q_nid: int, a_nid: int) -> torch.Tensor:
-        updated = self.graph.forward()
-        # Получаем эмбеддинги узлов (для иерархического графа берём уровень 0)
+        # Берём эмбеддинги узлов напрямую с уровня 0 (гарантированно размерность dim_embedding)
         if hasattr(self.graph, 'levels'):
             emb_q = self.graph.levels[0].node_emb[q_nid - 1]
             emb_a = self.graph.levels[0].node_emb[a_nid - 1]
         else:
-            emb_q = updated[q_nid - 1]
-            emb_a = updated[a_nid - 1]
+            emb_q = self.graph.node_emb[q_nid - 1]
+            emb_a = self.graph.node_emb[a_nid - 1]
         emb_q = F.normalize(emb_q.unsqueeze(0), p=2, dim=1)
         emb_a = F.normalize(emb_a.unsqueeze(0), p=2, dim=1)
         sim = F.cosine_similarity(emb_q, emb_a, dim=1)
@@ -266,7 +265,7 @@ class CognitiveBrain(nn.Module):
     def step(self, input_text: str, use_search: bool = False) -> Dict[str, Any]:
         self.step_counter += 1
 
-        # Планирование (если включено)
+        # Планирование
         if self.planner is not None:
             context = self._build_context(input_text, [], None)
             plan = self.planner.plan(input_text, context)
@@ -282,7 +281,7 @@ class CognitiveBrain(nn.Module):
                 self._update_after_step(input_text, answer)
                 return {"input": input_text, "answer": answer, "activated_neurons": [], "memory_results": []}
 
-        # Поиск в интернете (если запрошен)
+        # Поиск в интернете
         if use_search:
             enhanced = self._enhance_search_query(input_text)
             results = self.searcher.search(enhanced)
@@ -294,11 +293,10 @@ class CognitiveBrain(nn.Module):
             self._update_after_step(input_text, answer)
             return {"input": input_text, "answer": answer, "activated_neurons": [], "memory_results": []}
 
-        # Основной поток: память + граф
+        # Основной поток
         query_vec = self.text_to_embedding(input_text)
         memory_results = self.memory.retrieve(query_vec, k=5)
 
-        # Поиск стартового узла в графе
         if hasattr(self.graph, 'levels'):
             start_nid = self.graph.find_most_similar(query_vec, level_idx=0, threshold=0.5)
         else:
@@ -307,14 +305,14 @@ class CognitiveBrain(nn.Module):
         if start_nid is None:
             start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0, node_type=NodeType.SENSORY)
 
-        # Обновление графа
-        updated = self.graph.forward()
+        # Обновление графа (вызов forward для распространения сигналов)
+        _ = self.graph.forward()
 
         # Генерация ответа
         context = self._build_context(input_text, memory_results, start_nid)
         answer = self.llm.generate(context, max_tokens=300, temperature=0.7)
 
-        # Рефлексия (если включена)
+        # Рефлексия
         if self.reflector is not None and self.reflector.should_reflect(answer):
             improved = self.reflector.reflect(input_text, answer)
             if improved != answer:
@@ -322,14 +320,15 @@ class CognitiveBrain(nn.Module):
                 self.learn_pair(input_text, answer, reward=0.9)
 
         # Внутреннее вознаграждение (любопытство)
+        # ИСПРАВЛЕНО: используем query_vec как предсказание (размерность совпадает с actual_vec)
         if self.curiosity is not None:
-            predicted_vec = self.graph.forward()
+            predicted_vec = query_vec  # предсказание – сам запрос (или можно использовать эмбеддинг ответа)
             actual_vec = self.text_to_embedding(answer)
-            reward = self.curiosity.compute_reward(query_vec, predicted_vec[start_nid-1] if start_nid is not None else query_vec, actual_vec)
+            reward = self.curiosity.compute_reward(query_vec, predicted_vec, actual_vec)
             if reward > 0.1:
                 self.learn_pair(input_text, answer, reward=min(reward, 1.0))
 
-        # Сохранение в рабочую память
+        # Сохранение в память
         self.memory.add_working(query_vec, {"text": input_text, "answer": answer})
         self._update_after_step(input_text, answer)
 
@@ -430,7 +429,6 @@ class CognitiveBrain(nn.Module):
         with self.lock:
             print("💤 Сон... (консолидация памяти)")
             self.memory.consolidate(threshold=0.05)
-            # Если есть EWC, можно пересчитать Fisher (здесь упрощённо)
             print("😴 Сон завершён")
 
     # ---------- Сохранение / загрузка ----------
