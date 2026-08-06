@@ -44,7 +44,6 @@ class BrainAgent:
         self.active_question = None
         self.waiting_for_answer = False
 
-        # Для отслеживания тем с низкой уверенностью
         self.topic_confidence = {t: 0.5 for t in self.topics}
 
     def start(self):
@@ -85,7 +84,6 @@ class BrainAgent:
     def _interactive_cycle(self):
         if self.active_question is not None:
             return
-        # Выбираем тему с низкой уверенностью для исследования
         topic = self._select_topic_for_exploration()
         question = self._generate_question_for_topic(topic)
         if not question:
@@ -110,7 +108,6 @@ class BrainAgent:
             print(f"[Agent] Ответ получен на вопрос: {question}")
 
     def _autonomous_cycle(self):
-        # Самообучение через self-play
         topic = self._select_topic_for_exploration()
         for _ in range(self.self_play_rounds):
             q = self._generate_question_for_topic(topic)
@@ -128,19 +125,15 @@ class BrainAgent:
                     self._update_topic_confidence(topic, 0.8)
                 else:
                     self.brain.learn_negative_pair(q, answer)
-                    # ищем альтернативный ответ через поиск
                     search_result = self.brain.step(q, use_search=True)
                     if search_result["answer"] != "Не удалось найти информацию.":
                         self.brain.learn_pair(q, search_result["answer"], reward=0.6)
             time.sleep(0.5)
-        # после цикла консолидация
         self.brain.sleep()
 
     def _select_topic_for_exploration(self) -> str:
-        # Выбираем тему с наименьшей уверенностью + случайность
         if random.random() < self.exploration_factor:
             return random.choice(self.topics)
-        # иначе выбираем тему с минимальной уверенностью
         return min(self.topic_confidence, key=self.topic_confidence.get)
 
     def _update_topic_confidence(self, topic: str, score: float):

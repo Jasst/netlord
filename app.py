@@ -18,7 +18,8 @@ from brain import CognitiveBrain, BrainConfig
 
 torch.set_default_dtype(torch.float32)
 
-LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
+# Адрес локального LLM-сервера (LM Studio / vLLM / etc.)
+LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://192.168.0.13:1234/v1")
 
 config = BrainConfig(
     dim_embedding=384,
@@ -35,11 +36,13 @@ config = BrainConfig(
     llm_model="Qwen/Qwen2-7B-Instruct",
     use_openai_api=False,
     openai_api_key=os.getenv("OPENAI_API_KEY"),
+    llm_base_url=LM_STUDIO_BASE_URL,      # <-- используем адрес из переменной
     enable_curiosity=True,
     enable_planning=True,
     enable_reflection=True,
     enable_ewc=True,
 )
+
 brain = CognitiveBrain(config)
 brain.load()
 brain.load_dialog_history()

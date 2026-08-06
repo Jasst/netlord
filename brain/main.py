@@ -36,7 +36,6 @@ def interactive_mode(brain: CognitiveBrain):
                 brain.learn_pair(q, a, reward=1.0)
                 print("Выучено!")
                 continue
-        # Обычный диалог
         result = brain.step(user_input)
         answer = result["answer"]
         print(f"Brain: {answer}")
@@ -47,6 +46,6 @@ def interactive_mode(brain: CognitiveBrain):
             print("Дообучено на улучшении.")
 
 if __name__ == "__main__":
-    config = BrainConfig()
+    config = BrainConfig()  # здесь уже прописан адрес в классе
     brain = CognitiveBrain(config)
     interactive_mode(brain)
