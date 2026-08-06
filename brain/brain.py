@@ -109,7 +109,6 @@ class Brain(nn.Module):
         query_vec = self.text_to_embedding(input_text)
         answer_vec = self.text_to_embedding(answer_text)
 
-        # Получаем или создаём нейроны (как раньше)
         q_nid = self.graph.find_most_similar(query_vec, threshold=0.7)
         a_nid = self.graph.find_most_similar(answer_vec, threshold=0.7)
         if q_nid is None:
@@ -121,17 +120,16 @@ class Brain(nn.Module):
             norm_a = self.normalize_text(answer_text)
             self.concept_index[norm_a] = a_nid
 
-        # Добавляем синапс (вес положительный)
         if q_nid is not None and a_nid is not None:
             self.graph.add_synapse(q_nid, a_nid, weight=0.2)
+            # ---- НОВОЕ: пересоздаём оптимизатор, чтобы он видел новый параметр ----
+            self._rebuild_optimizer()
 
-        # ---- НОВАЯ ЧАСТЬ: обучение через GAT + регуляризация ----
         loss = self._update_graph_and_loss(q_nid, a_nid, input_text, answer_text)
         loss.backward()
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-        # Добавляем в knowledge_base и память (как раньше)
         self._add_to_knowledge_base(input_text, answer_text)
         self.memory.add_episodic(query_vec + answer_vec, {"q": input_text, "a": answer_text, "reward": reward})
         if self.step_counter % 50 == 0:
@@ -455,7 +453,7 @@ class Brain(nn.Module):
         if start_nid is None:
             start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0)
 
-       
+
 
         # Формируем контекст
         context = f"Вопрос: {input_text}\n"
@@ -489,6 +487,9 @@ class Brain(nn.Module):
             "activated_neurons": [start_nid],
             "memory_results": memory_results
         }
+
+    def _rebuild_optimizer(self):
+        self.optimizer = optim.Adam(self.graph.parameters(), lr=self.config.learning_rate)
 
     # ---------- step_stream (без изменений, кроме добавления KB – опционально) ----------
     def step_stream(self, input_text: str, use_search: bool = False):

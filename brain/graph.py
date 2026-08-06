@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
-from typing import List, Tuple, Optional
+from typing import Optional, List
 
 class DifferentiableNeuralGraph(nn.Module):
     def __init__(self, dim: int, max_nodes: int = 5000, hidden_dim: int = 128, num_heads: int = 4):
@@ -16,21 +16,21 @@ class DifferentiableNeuralGraph(nn.Module):
         self.register_buffer("node_mask", torch.zeros(1, dtype=torch.bool))
         self.node_emb = nn.Parameter(self.node_emb)
 
-        # GAT слои (теперь с edge_dim=1 для использования весов синапсов)
+        # GAT слои (с поддержкой edge_attr)
         self.gat1 = GATConv(dim, hidden_dim, heads=num_heads, concat=True, edge_dim=1)
         self.gat2 = GATConv(hidden_dim * num_heads, dim, heads=1, concat=False, edge_dim=1)
         self.update_scale = nn.Parameter(torch.tensor(0.1))
 
-        # Метаданные узлов и рёбер
+        # Метаданные узлов
         self.neuron_labels = {}
         self.neuron_clusters = {}
         self.neuron_layers = {}
         self._next_nid = 1
 
-        # Список рёбер (from, to, weight) – будем хранить как тензоры
-        self._edges = []  # временный список для накопления
-        self._edge_index = None   # тензор 2 x E
-        self._edge_weight = None  # тензор E x 1
+        # ---- НОВОЕ: обучаемые веса синапсов ----
+        self._edge_weights = nn.ParameterList()   # каждый вес – отдельный параметр
+        self._edges = []            # список (from_id, to_id) – для индексов
+        self._edge_index = None     # тензор 2 x E (перестраивается при изменении)
 
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden", layer: int = 0) -> int:
         embedding = embedding.float()
@@ -52,50 +52,42 @@ class DifferentiableNeuralGraph(nn.Module):
         self.neuron_clusters[nid] = cluster
         self.neuron_layers[nid] = layer
 
-        # После добавления узла перестраиваем edge_index/weight, так как индексы сместились
         self._rebuild_edges()
         return nid
 
     def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1) -> int:
-        # Добавляем в список, а не сразу в тензор
-        self._edges.append((from_id, to_id, weight))
-        # Индекс ребра = len(self._edges) - 1
+        # Добавляем ребро в список (без веса, вес хранится в _edge_weights)
+        self._edges.append((from_id, to_id))
+        # Добавляем новый параметр (вес) в ParameterList
+        self._edge_weights.append(nn.Parameter(torch.tensor(weight, dtype=torch.float)))
+        # Перестраиваем edge_index
         self._rebuild_edges()
         return len(self._edges) - 1
 
     def _rebuild_edges(self):
-        """Преобразует список _edges в тензоры edge_index и edge_weight."""
+        """Перестраивает _edge_index на основе _edges (индексы рёбер)."""
         if not self._edges:
             self._edge_index = torch.zeros((2, 0), dtype=torch.long)
-            self._edge_weight = torch.zeros((0, 1), dtype=torch.float)
             return
-
-        u = []
-        v = []
-        w = []
-        for (f, t, wt) in self._edges:
-            # индексы с 0 (т.к. в PyG нумерация с 0)
-            u.append(f - 1)
-            v.append(t - 1)
-            w.append(wt)
+        u = [f - 1 for f, _ in self._edges]
+        v = [t - 1 for _, t in self._edges]
         self._edge_index = torch.tensor([u, v], dtype=torch.long)
-        self._edge_weight = torch.tensor(w, dtype=torch.float).view(-1, 1)
 
     def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Применяет GAT к текущим эмбеддингам и возвращает обновлённые.
-        Если x не задан, использует self.node_emb.
-        """
         if x is None:
             x = self.node_emb.float()
-        # Убедимся, что edge_index и edge_weight актуальны
         if self._edge_index is None or self._edge_index.size(1) == 0:
-            return x  # нет рёбер – без изменений
+            return x
 
-        # Передаём edge_attr (веса) в GAT
-        h = F.elu(self.gat1(x, self._edge_index, edge_attr=self._edge_weight))
-        h = F.elu(self.gat2(h, self._edge_index, edge_attr=self._edge_weight))
-        # Плавное обновление (residual)
+        # Собираем все веса из ParameterList в один тензор (сохраняя градиенты)
+        if len(self._edge_weights) > 0:
+            # torch.stack сохраняет градиенты, т.к. каждый элемент – Parameter
+            edge_attr = torch.stack(self._edge_weights).view(-1, 1)  # [E, 1]
+        else:
+            edge_attr = torch.zeros((0, 1), device=x.device)
+
+        h = F.elu(self.gat1(x, self._edge_index, edge_attr=edge_attr))
+        h = F.elu(self.gat2(h, self._edge_index, edge_attr=edge_attr))
         delta = torch.tanh(self.update_scale) * (h - x)
         return x + delta
 
@@ -115,7 +107,8 @@ class DifferentiableNeuralGraph(nn.Module):
         return None
 
     def get_edge_weights(self) -> torch.Tensor:
-        """Возвращает текущие веса синапсов (для регуляризации)."""
-        if self._edge_weight is None:
+        """Возвращает все веса синапсов как тензор (для регуляризации)."""
+        if len(self._edge_weights) == 0:
             return torch.tensor([])
-        return self._edge_weight.flatten()
+        # Собираем в плоский тензор (сохраняя градиенты)
+        return torch.cat([w.view(1) for w in self._edge_weights])
