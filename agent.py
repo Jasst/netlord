@@ -8,7 +8,14 @@ from openai import OpenAI
 from brain import CognitiveBrain
 from brain.teacher import Teacher
 
+
 class BrainAgent:
+    """
+    ИСПРАВЛЕНО: _generate_question_for_topic не хранил историю уже заданных вопросов —
+    в паре с min(topic_confidence) (агент упорно возвращается к самой "слабой" теме)
+    это регулярно давало один и тот же/почти тот же вопрос из цикла в цикл. Добавлена
+    память недавних вопросов по теме + явный запрет модели их повторять.
+    """
     def __init__(
         self,
         brain: CognitiveBrain,
@@ -23,6 +30,7 @@ class BrainAgent:
         user_question_timeout: int = 30,
         self_play_rounds: int = 3,
         exploration_factor: float = 0.2,
+        history_per_topic: int = 15,
     ):
         self.brain = brain
         self.teacher = teacher
@@ -36,6 +44,7 @@ class BrainAgent:
         self.user_question_timeout = user_question_timeout
         self.self_play_rounds = self_play_rounds
         self.exploration_factor = exploration_factor
+        self.history_per_topic = history_per_topic
 
         self._stop_flag = False
         self._thread = None
@@ -45,6 +54,7 @@ class BrainAgent:
         self.waiting_for_answer = False
 
         self.topic_confidence = {t: 0.5 for t in self.topics}
+        self.asked_questions: Dict[str, List[str]] = {t: [] for t in self.topics}
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -141,18 +151,30 @@ class BrainAgent:
             self.topic_confidence[topic] = 0.8 * self.topic_confidence[topic] + 0.2 * score
 
     def _generate_question_for_topic(self, topic: str) -> Optional[str]:
+        recent = self.asked_questions.setdefault(topic, [])[-self.history_per_topic:]
+        avoid_block = "\n".join(f"- {q}" for q in recent) if recent else "(пока нет)"
         try:
             response = self.llm.chat.completions.create(
                 model="local-model",
                 messages=[
-                    {"role": "system", "content": "Ты — исследовательский агент. Придумай один вопрос по теме для пользователя."},
-                    {"role": "user", "content": f"Тема: {topic}. Сформулируй один вопрос (только вопрос, без пояснений)."}
+                    {"role": "system", "content": (
+                        "Ты — исследовательский агент. Придумай ОДИН новый, содержательный вопрос "
+                        "по заданной теме. Вопрос НЕ должен повторять и не должен быть перефразировкой "
+                        "уже заданных вопросов из списка ниже."
+                    )},
+                    {"role": "user", "content": (
+                        f"Тема: {topic}.\nУже заданные вопросы по этой теме:\n{avoid_block}\n"
+                        "Сформулируй один новый вопрос (только вопрос, без пояснений и нумерации)."
+                    )}
                 ],
-                max_tokens=30,
-                temperature=0.8,
+                max_tokens=40,
+                temperature=max(self.temperature, 0.9),  # чуть выше — меньше шаблонности
             )
             q = response.choices[0].message.content.strip()
-            if q and '?' in q:
+            if q and "?" in q and q not in recent:
+                self.asked_questions[topic].append(q)
+                if len(self.asked_questions[topic]) > self.history_per_topic * 4:
+                    self.asked_questions[topic] = self.asked_questions[topic][-self.history_per_topic * 2:]
                 return q
             return None
         except Exception as e:

@@ -6,12 +6,16 @@ from torch_geometric.nn import GATv2Conv, LayerNorm
 from typing import Optional, List, Tuple, Dict, Any
 from enum import Enum
 
+from brain.utils import grow_parameter_in_optimizer
+
+
 class NodeType(Enum):
     SENSORY = 0
     CONCEPT = 1
     MOTOR = 2
     EMOTIONAL = 3
     ATTENTION = 4
+
 
 # ----------------------------------------------------------------------
 # Базовый дифференцируемый граф (один уровень)
@@ -34,8 +38,6 @@ class DifferentiableNeuralGraph(nn.Module):
             self.norms.append(LayerNorm(out_dim))
             in_dim = out_dim
 
-        # skip_proj больше не нужен, так как мы отказываемся от skip при несовпадении размерностей
-        # self.skip_proj = nn.Linear(dim, dim)  # закомментировано
         self.act = nn.ELU()
 
         self._edges: List[Tuple[int, int]] = []
@@ -47,20 +49,37 @@ class DifferentiableNeuralGraph(nn.Module):
         self.node_clusters: Dict[int, str] = {}
 
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden",
-                 layer: int = 0, node_type: NodeType = NodeType.CONCEPT) -> int:
+                 layer: int = 0, node_type: NodeType = NodeType.CONCEPT,
+                 optimizer=None) -> int:
+        """
+        optimizer: если передан self.optimizer из CognitiveBrain, новая версия node_emb
+        сразу синхронизируется с оптимизатором (см. utils.grow_parameter_in_optimizer) —
+        без этого добавленные узлы никогда не обучаются градиентным спуском.
+        """
         embedding = F.normalize(embedding.float(), p=2, dim=0)
-        nid = self.node_emb.shape[0] + 1
-        new_emb = embedding.unsqueeze(0)
-        self.node_emb = nn.Parameter(torch.cat([self.node_emb.data, new_emb], dim=0))
+        old_param = self.node_emb
+        num_old_rows = old_param.shape[0]
+        with torch.no_grad():
+            new_data = torch.cat([old_param.data, embedding.unsqueeze(0)], dim=0)
+        nid = num_old_rows + 1
+        self.node_emb = nn.Parameter(new_data)
         self.node_labels[nid] = label
         self.node_types[nid] = node_type
         self.node_clusters[nid] = cluster
+
+        if optimizer is not None:
+            grow_parameter_in_optimizer(optimizer, old_param, self.node_emb, num_old_rows)
         return nid
 
-    def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1) -> int:
+    def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1, optimizer=None) -> int:
         self._edges.append((from_id, to_id))
-        self._edge_weights.append(nn.Parameter(torch.tensor(weight, dtype=torch.float)))
+        new_w = nn.Parameter(torch.tensor(weight, dtype=torch.float))
+        self._edge_weights.append(new_w)
         self._rebuild_edges()
+
+        if optimizer is not None and optimizer.param_groups:
+            # Новый вес ребра тоже отсутствовал в снимке параметров оптимизатора — добавляем явно.
+            optimizer.param_groups[0]["params"].append(new_w)
         return len(self._edges) - 1
 
     def _rebuild_edges(self):
@@ -77,7 +96,6 @@ class DifferentiableNeuralGraph(nn.Module):
         if self._edge_index is None or self._edge_index.size(1) == 0:
             return x
 
-        # Явное преобразование весов рёбер в список тензоров
         if len(self._edge_weights) > 0:
             weights = [w for w in self._edge_weights]
             edge_attr = torch.stack(weights).view(-1, 1)
@@ -89,11 +107,9 @@ class DifferentiableNeuralGraph(nn.Module):
             h_new = layer(h, self._edge_index, edge_attr=edge_attr)
             h_new = norm(h_new)
             h_new = self.act(h_new)
-            # Если размерности совпадают – добавляем skip connection
             if h.shape == h_new.shape:
                 h = h + h_new
             else:
-                # Иначе просто заменяем
                 h = h_new
         return h
 
@@ -127,41 +143,49 @@ class HierarchicalGraph(nn.Module):
         self.attentions = nn.ModuleList()
 
         for i, d in enumerate(dims):
-            # Чтобы избежать проблем с размерностями, hidden_dim = d (можно и d*2, но тогда skip не работает)
-            # Рекомендую hidden_dim = d для единообразия
             level_graph = DifferentiableNeuralGraph(
                 dim=d,
                 max_nodes=5000,
-                hidden_dim=d,               # было d*2 – исправлено на d
+                hidden_dim=d,
                 num_heads=num_heads,
                 num_layers=num_layers
             )
             self.levels.append(level_graph)
             self.attentions.append(nn.MultiheadAttention(d, attn_heads, batch_first=True))
             if i < len(dims) - 1:
-                self.cross_attn.append(nn.Linear(d, dims[i+1]))
+                self.cross_attn.append(nn.Linear(d, dims[i + 1]))
 
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden",
                  layer: int = 0, node_type: NodeType = NodeType.CONCEPT,
-                 level_idx: int = 0) -> int:
-        return self.levels[level_idx].add_node(embedding, label, cluster, layer, node_type)
+                 level_idx: int = 0, optimizer=None) -> int:
+        return self.levels[level_idx].add_node(embedding, label, cluster, layer, node_type,
+                                                 optimizer=optimizer)
 
-    def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1, level_idx: int = 0) -> int:
-        return self.levels[level_idx].add_synapse(from_id, to_id, weight)
+    def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1,
+                     level_idx: int = 0, optimizer=None) -> int:
+        return self.levels[level_idx].add_synapse(from_id, to_id, weight, optimizer=optimizer)
 
     def find_most_similar(self, query: torch.Tensor, level_idx: int = 0, threshold: float = 0.8) -> Optional[int]:
         return self.levels[level_idx].find_most_similar(query, threshold)
 
     def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
-        h = x if x is not None else self.levels[0].node_emb
+        # ПРИМЕЧАНИЕ: при x=None каждый уровень использует свои собственные узлы
+        # (self.levels[i].node_emb) через forward(None) -> берём x с уровня i,
+        # а не протаскиваем cross_attn-проекцию предыдущего уровня как ошибочную замену
+        # содержимого следующего уровня.
+        outputs = []
+        h = x
         for i, (g, attn) in enumerate(zip(self.levels, self.attentions)):
-            h = g(h) if h is not None else g()
-            # self-attention
-            h, _ = attn(h.unsqueeze(0), h.unsqueeze(0), h.unsqueeze(0))
-            h = h.squeeze(0)
+            level_input = h if h is not None else None
+            h_level = g(level_input)
+            h_level, _ = attn(h_level.unsqueeze(0), h_level.unsqueeze(0), h_level.unsqueeze(0))
+            h_level = h_level.squeeze(0)
+            outputs.append(h_level)
             if i < len(self.levels) - 1:
-                h = self.cross_attn[i](h)
-        return h
+                h = self.cross_attn[i](h_level)
+            else:
+                h = h_level
+        return outputs[0]
 
     def get_level_embeddings(self, level_idx: int) -> torch.Tensor:
         return self.levels[level_idx].node_emb

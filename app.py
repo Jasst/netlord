@@ -18,13 +18,10 @@ from brain import CognitiveBrain, BrainConfig
 
 torch.set_default_dtype(torch.float32)
 
-# Адрес локального LLM-сервера (можно переопределить через переменную окружения)
 LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://192.168.0.13:1234/v1")
 
-# Создаём конфиг с нужными параметрами, НЕ переопределяем dim_embedding и graph_levels
 config = BrainConfig(
     llm_base_url=LM_STUDIO_BASE_URL,
-    # остальные параметры берутся из config.py
 )
 
 brain = CognitiveBrain(config)
@@ -34,15 +31,18 @@ brain.load_dialog_history()
 app = FastAPI(title="Smart Brain v10")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
 class AskRequest(BaseModel):
     question: str
     temperature: float = 0.7
     use_search: bool = False
     allow_clarifying: bool = True
 
+
 class LearnRequest(BaseModel):
     question: str
     answer: str
+
 
 class TrainTopicRequest(BaseModel):
     topic: str
@@ -50,12 +50,15 @@ class TrainTopicRequest(BaseModel):
     negative_ratio: float = 0.2
     epochs: int = 1
 
+
 @app.post("/ask")
 async def ask(req: AskRequest):
     try:
-        result = await asyncio.to_thread(brain.step, req.question, use_search=req.use_search)
+        # ИСПРАВЛЕНО: req.temperature раньше нигде не использовался — step() теперь его принимает.
+        result = await asyncio.to_thread(
+            brain.step, req.question, use_search=req.use_search, temperature=req.temperature
+        )
         answer = result["answer"]
-        brain.dialog_memory.append({"user": req.question, "assistant": answer, "time": time.time()})
         await asyncio.to_thread(brain.save_dialog_history)
         return {
             "question": req.question,
@@ -66,21 +69,22 @@ async def ask(req: AskRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/ask_stream")
 async def ask_stream(req: AskRequest):
     try:
-        gen = await asyncio.to_thread(brain.step_stream, req.question, use_search=req.use_search)
+        gen = await asyncio.to_thread(brain.step_stream, req.question, req.use_search)
         async def generate():
             full = ""
             for token in gen:
                 full += token
                 yield f"data: {json.dumps({'token': token})}\n\n"
             yield f"data: {json.dumps({'done': True, 'full_answer': full})}\n\n"
-            brain.dialog_memory.append({"user": req.question, "assistant": full, "time": time.time()})
             await asyncio.to_thread(brain.save_dialog_history)
         return StreamingResponse(generate(), media_type="text/event-stream")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/learn")
 async def learn(req: LearnRequest):
@@ -90,6 +94,7 @@ async def learn(req: LearnRequest):
         return {"status": "learned"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/train_topic")
 async def train_topic(req: TrainTopicRequest):
@@ -103,9 +108,10 @@ async def train_topic(req: TrainTopicRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 def _generate_training_pairs(topic: str, num_pairs: int) -> List[tuple]:
     prompt = f"Сгенерируй {num_pairs} пар 'вопрос|ответ' по теме '{topic}'. Формат: каждая пара на новой строке, разделённая '|'."
-    response = brain.llm.generate(prompt, max_tokens=num_pairs*30, temperature=0.9)
+    response = brain.llm.generate(prompt, max_tokens=num_pairs * 30, temperature=0.9)
     pairs = []
     for line in response.splitlines():
         if '|' in line:
@@ -113,14 +119,17 @@ def _generate_training_pairs(topic: str, num_pairs: int) -> List[tuple]:
             pairs.append((q.strip(), a.strip()))
     return pairs[:num_pairs]
 
+
 @app.get("/stats")
 async def stats():
     return brain.get_stats()
+
 
 @app.post("/sleep")
 async def sleep_brain():
     await asyncio.to_thread(brain.sleep)
     return {"status": "sleep_done"}
+
 
 @app.post("/chat/clear")
 async def clear_chat():
@@ -128,19 +137,23 @@ async def clear_chat():
     await asyncio.to_thread(brain.save_dialog_history)
     return {"status": "cleared"}
 
+
 @app.get("/chat/messages")
 async def get_messages(limit: int = 50):
     return {"messages": brain.dialog_memory[-limit:]}
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
     with open("templates/index.html", "r", encoding="utf-8") as f:
         return f.read()
 
+
 def save_brain():
     print("\n💾 Сохраняем модель...")
     brain.save()
     brain.save_dialog_history()
+
 
 atexit.register(save_brain)
 signal.signal(signal.SIGINT, lambda s, f: (save_brain(), sys.exit(0)))

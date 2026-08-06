@@ -6,66 +6,87 @@ import time
 from collections import deque
 from typing import List, Dict, Any, Optional, Tuple
 
+
 class VectorMemoryIndex:
+    """
+    ИСПРАВЛЕНО: IndexHNSWFlat НЕ поддерживает remove_ids() — вызов кидает исключение
+    (или в некоторых версиях faiss тихо ничего не делает). Раньше это происходило
+    и при вытеснении по capacity в add(), и в consolidate() — то есть после заполнения
+    памяти новые записи фактически переставали попадать в индекс (если исключение
+    гасилось выше по стеку) либо приложение падало. Итог — ретривер годами возвращал
+    один и тот же старый набор воспоминаний, отсюда повторяющиеся ответы.
+
+    Заменено на IndexIDMap2(IndexFlatIP) с явными устойчивыми id (не позиция в списке —
+    она "плывёт" при удалениях). remove_ids на ID-mapped flat-индексе поддерживается
+    корректно. Векторы уже L2-нормализованы в EmbeddingProvider, поэтому inner product
+    эквивалентен косинусной близости.
+    """
     def __init__(self, dim: int = 384, capacity: int = 50000):
         self.dim = dim
         self.capacity = capacity
-        self.index = faiss.IndexHNSWFlat(dim, 32)
-        self.index.hnsw.efConstruction = 200
-        self.metadata = []          # list of dict
-        self.timestamps = []
-        self.access_counts = []     # для вычисления важности
-        self.importance_scores = []
+        self.index = faiss.IndexIDMap2(faiss.IndexFlatIP(dim))
+        self._next_id = 0
+        self.metadata: Dict[int, Dict] = {}
+        self.timestamps: Dict[int, float] = {}
+        self.access_counts: Dict[int, int] = {}
+        self.importance_scores: Dict[int, float] = {}
 
     def add(self, vector: np.ndarray, meta: Dict) -> int:
         if len(self.metadata) >= self.capacity:
-            # Удаляем наименее важную запись
-            min_imp_idx = np.argmin(self.importance_scores)
-            self.index.remove_ids(np.array([min_imp_idx]))
-            self.metadata.pop(min_imp_idx)
-            self.timestamps.pop(min_imp_idx)
-            self.access_counts.pop(min_imp_idx)
-            self.importance_scores.pop(min_imp_idx)
-        self.index.add(vector.reshape(1, -1).astype('float32'))
-        idx = len(self.metadata)
-        self.metadata.append(meta)
-        self.timestamps.append(time.time())
-        self.access_counts.append(0)
-        self.importance_scores.append(0.5)  # начальная важность
-        return idx
+            self._evict_least_important()
+        vid = self._next_id
+        self._next_id += 1
+        self.index.add_with_ids(vector.reshape(1, -1).astype('float32'), np.array([vid], dtype=np.int64))
+        self.metadata[vid] = meta
+        self.timestamps[vid] = time.time()
+        self.access_counts[vid] = 0
+        self.importance_scores[vid] = 0.5
+        return vid
+
+    def _evict_least_important(self):
+        if not self.importance_scores:
+            return
+        worst_id = min(self.importance_scores, key=self.importance_scores.get)
+        self._remove_ids([worst_id])
+
+    def _remove_ids(self, ids: List[int]):
+        if not ids:
+            return
+        self.index.remove_ids(np.array(ids, dtype=np.int64))
+        for vid in ids:
+            self.metadata.pop(vid, None)
+            self.timestamps.pop(vid, None)
+            self.access_counts.pop(vid, None)
+            self.importance_scores.pop(vid, None)
 
     def search(self, query: np.ndarray, k: int = 5) -> List[Dict]:
         if self.index.ntotal == 0:
             return []
-        distances, indices = self.index.search(query.reshape(1, -1).astype('float32'), min(k, self.index.ntotal))
+        similarities, ids = self.index.search(query.reshape(1, -1).astype('float32'), min(k, self.index.ntotal))
         results = []
-        for i, idx in enumerate(indices[0]):
-            if idx >= 0 and idx < len(self.metadata):
-                self.access_counts[idx] += 1
-                self.importance_scores[idx] = self._compute_importance(idx)
-                results.append({
-                    "metadata": self.metadata[idx],
-                    "distance": float(distances[0][i]),
-                    "timestamp": self.timestamps[idx],
-                    "importance": self.importance_scores[idx]
-                })
+        for i, vid in enumerate(ids[0]):
+            vid = int(vid)
+            if vid == -1 or vid not in self.metadata:
+                continue
+            self.access_counts[vid] += 1
+            self.importance_scores[vid] = self._compute_importance(vid)
+            results.append({
+                "metadata": self.metadata[vid],
+                "distance": float(similarities[0][i]),  # inner product / cosine similarity (больше = ближе)
+                "timestamp": self.timestamps[vid],
+                "importance": self.importance_scores[vid],
+            })
         return results
 
-    def _compute_importance(self, idx: int) -> float:
-        # важность = частота доступа * (1 - возраст/жизнь)
-        age = time.time() - self.timestamps[idx]
-        age_factor = max(0, 1 - age / (30*24*3600))  # за месяц забываем
-        return (self.access_counts[idx] + 1) * age_factor
+    def _compute_importance(self, vid: int) -> float:
+        age = time.time() - self.timestamps[vid]
+        age_factor = max(0, 1 - age / (30 * 24 * 3600))  # за месяц забываем
+        return (self.access_counts[vid] + 1) * age_factor
 
     def consolidate(self, threshold: float = 0.1):
         """Удаляем записи с важностью ниже порога"""
-        to_remove = [i for i, imp in enumerate(self.importance_scores) if imp < threshold]
-        for idx in sorted(to_remove, reverse=True):
-            self.index.remove_ids(np.array([idx]))
-            del self.metadata[idx]
-            del self.timestamps[idx]
-            del self.access_counts[idx]
-            del self.importance_scores[idx]
+        to_remove = [vid for vid, imp in self.importance_scores.items() if imp < threshold]
+        self._remove_ids(to_remove)
 
 
 class HierarchicalMemory:
@@ -73,7 +94,7 @@ class HierarchicalMemory:
         self.dim = dim
         self.working = deque(maxlen=working_size)
         self.episodic = VectorMemoryIndex(dim, capacity=episodic_capacity)
-        self.semantic_memory = SemanticGraph()  # новый семантический граф
+        self.semantic_memory = SemanticGraph()
 
     def add_working(self, vector: torch.Tensor, context: Any = None):
         self.working.append({"vector": vector.detach().cpu().numpy(), "context": context, "time": time.time()})
@@ -106,7 +127,6 @@ class SemanticGraph:
         self.capacity = capacity
 
     def add_triple(self, subj: str, pred: str, obj: str, confidence: float = 1.0):
-        # Проверка на дубли
         for i, (s, p, o, c) in enumerate(self.triples):
             if s == subj and p == pred and o == obj:
                 self.triples[i] = (s, p, o, min(1.0, c + confidence * 0.1))
