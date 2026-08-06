@@ -2,20 +2,23 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F   # <-- обязательно
+import torch.nn.functional as F
 import json
 import os
 import time
 import re
 import threading
+import pickle
+import requests                          # ===== НОВОЕ: для API =====
 from collections import deque
 from typing import List, Dict, Optional, Any
-import pickle
+from brain.search import WebSearcher
 from brain.config import BrainConfig
 from brain.graph import DifferentiableNeuralGraph
 from brain.memory import HierarchicalMemory
 from brain.llm import LMStudioLLM
 from brain.utils import EmbeddingProvider, random_vector, cosine_similarity
+
 
 class Brain(nn.Module):
     def __init__(self, config: BrainConfig):
@@ -23,7 +26,7 @@ class Brain(nn.Module):
         self.config = config
         self.dim = config.dim_embedding
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+        self.searcher = WebSearcher(max_results=10)
         # Компоненты
         self.embedder = EmbeddingProvider(dim=self.dim)
         self.graph = DifferentiableNeuralGraph(
@@ -66,37 +69,7 @@ class Brain(nn.Module):
         return x
 
     def text_to_embedding(self, text: str) -> torch.Tensor:
-        return self.embedder.get_embedding(text).float().to(self.device)  # <-- добавлено .float()
-
-    # ---------- Основной шаг (step) ----------
-    def step(self, input_text: str) -> Dict[str, Any]:
-        self.step_counter += 1
-        query_vec = self.text_to_embedding(input_text)
-        memory_results = self.memory.retrieve(query_vec, k=3)
-
-        start_nid = self.graph.find_most_similar(query_vec, threshold=0.5)
-        if start_nid is None:
-            start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0)
-
-        self.forward(query_vec)   # обновляем состояния графа
-
-        context = f"Вопрос: {input_text}\n"
-        if memory_results:
-            context += "Из памяти:\n"
-            for res in memory_results:
-                context += f"- {res['metadata'].get('text', '')}\n"
-        label = self.graph.neuron_labels.get(start_nid, "")
-        context += f"Ассоциация: {label}\n"
-
-        answer = self.llm.generate(context, max_tokens=256, temperature=0.7)
-        self.memory.add_working(query_vec, {"text": input_text, "answer": answer})
-
-        return {
-            "input": input_text,
-            "answer": answer,
-            "activated_neurons": [start_nid],
-            "memory_results": memory_results
-        }
+        return self.embedder.get_embedding(text).float().to(self.device)
 
     # ---------- Уточняющий вопрос ----------
     def _generate_clarifying_question(self, user_input: str, answer: str,
@@ -136,7 +109,7 @@ class Brain(nn.Module):
         query_vec = self.text_to_embedding(input_text)
         answer_vec = self.text_to_embedding(answer_text)
 
-        # Получаем или создаём нейроны для вопроса и ответа
+        # Получаем или создаём нейроны (как раньше)
         q_nid = self.graph.find_most_similar(query_vec, threshold=0.7)
         a_nid = self.graph.find_most_similar(answer_vec, threshold=0.7)
         if q_nid is None:
@@ -148,25 +121,18 @@ class Brain(nn.Module):
             norm_a = self.normalize_text(answer_text)
             self.concept_index[norm_a] = a_nid
 
+        # Добавляем синапс (вес положительный)
         if q_nid is not None and a_nid is not None:
             self.graph.add_synapse(q_nid, a_nid, weight=0.2)
 
-            # Градиентное обновление эмбеддингов (контрастная потеря)
-            emb_q = self.graph.get_embedding_by_id(q_nid)
-            emb_a = self.graph.get_embedding_by_id(a_nid)
-            emb_q = F.normalize(emb_q.float().unsqueeze(0), p=2, dim=1)
-            emb_a = F.normalize(emb_a.float().unsqueeze(0), p=2, dim=1)
-            sim = F.cosine_similarity(emb_q, emb_a, dim=1)
-            loss = -torch.log(torch.sigmoid(sim * 10.0))
-            loss = loss.mean()
-            loss.backward()
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+        # ---- НОВАЯ ЧАСТЬ: обучение через GAT + регуляризация ----
+        loss = self._update_graph_and_loss(q_nid, a_nid, input_text, answer_text)
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
 
-        # Добавляем в knowledge_base
+        # Добавляем в knowledge_base и память (как раньше)
         self._add_to_knowledge_base(input_text, answer_text)
-
-        # Запись в эпизодическую память
         self.memory.add_episodic(query_vec + answer_vec, {"q": input_text, "a": answer_text, "reward": reward})
         if self.step_counter % 50 == 0:
             self.memory.consolidate()
@@ -199,7 +165,6 @@ class Brain(nn.Module):
 
     def learn_negative_pair(self, input_text: str, output_text: str, penalty: float = 0.15):
         with self.lock:
-            # Создаём тормозной синапс
             q_emb = self.text_to_embedding(input_text)
             a_emb = self.text_to_embedding(output_text)
             q_nid = self.graph.find_most_similar(q_emb, threshold=0.0)
@@ -217,11 +182,7 @@ class Brain(nn.Module):
     def sleep(self, duration_steps: int = 10):
         with self.lock:
             print("💤 Сон... (консолидация памяти)")
-            # Консолидируем память
             self.memory.consolidate()
-            # Можно добавить реплей опыта, но для простоты оставим только консолидацию
-            # И уменьшаем важность старых эпизодов (эмуляция забывания)
-            # В реальном FAISS сложно удалять, поэтому просто очистим рабочие
             self.memory.working.clear()
             print("😴 Сон завершён")
 
@@ -231,11 +192,9 @@ class Brain(nn.Module):
         os.makedirs(path, exist_ok=True)
         torch.save(self.graph.state_dict(), f"{path}/graph.pth")
 
-        # Сохраняем рёбра (синапсы)
         with open(f"{path}/edges.pkl", "wb") as f:
             pickle.dump(self.graph._edges, f)
 
-        # Подготавливаем knowledge_base для JSON (убираем тензоры)
         kb_serializable = []
         for item in self.knowledge_base:
             kb_serializable.append({
@@ -263,20 +222,17 @@ class Brain(nn.Module):
         if not os.path.exists(path):
             print(f"[Brain] Директория {path} не найдена, запуск с нуля.")
             return
-        # Загружаем метаданные
         meta_path = f"{path}/meta.json"
         if os.path.exists(meta_path):
             with open(meta_path, "r") as f:
                 meta = json.load(f)
             num_neurons = meta.get("num_neurons", 10)
-            # Добавляем недостающие нейроны, если их меньше, чем в сохранённой модели
             current_num = self.graph.node_emb.shape[0]
             if current_num < num_neurons:
                 for _ in range(num_neurons - current_num):
                     emb = random_vector(self.dim)
                     self.graph.add_node(emb, label="loaded", cluster="hidden", layer=0)
                 print(f"[Brain] Добавлено {num_neurons - current_num} нейронов для загрузки.")
-            # Загружаем state_dict графа
             graph_path = f"{path}/graph.pth"
             if os.path.exists(graph_path):
                 state_dict = torch.load(graph_path, map_location=self.device)
@@ -286,10 +242,8 @@ class Brain(nn.Module):
                     if key in model_state and model_state[key].shape == value.shape:
                         filtered_state[key] = value
                     else:
-                        print(
-                            f"[Brain] Пропуск загрузки {key}: размер {value.shape} -> {model_state[key].shape if key in model_state else 'not found'}")
+                        print(f"[Brain] Пропуск загрузки {key}: размер {value.shape} -> {model_state[key].shape if key in model_state else 'not found'}")
                 self.graph.load_state_dict(filtered_state, strict=False)
-            # Загружаем рёбра (синапсы)
             edges_path = f"{path}/edges.pkl"
             if os.path.exists(edges_path):
                 with open(edges_path, "rb") as f:
@@ -297,13 +251,338 @@ class Brain(nn.Module):
                 print(f"[Brain] Загружено {len(self.graph._edges)} синапсов.")
             else:
                 self.graph._edges = []
-            # Загружаем остальные метаданные
             self.step_counter = meta.get("step_counter", 0)
             self._learn_counter = meta.get("learn_counter", 0)
             self.concept_index = meta.get("concept_index", {})
             self.knowledge_base = meta.get("knowledge_base", [])
         self.load_dialog_history(os.path.join(path, "dialog_history.json"))
         print(f"[Brain] Модель загружена из {path}")
+
+    # =========================================================================
+    # НОВЫЕ ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+    # =========================================================================
+
+    # ----- Извлечение цены из текста (парсинг) -----
+    @staticmethod
+    def extract_price(text: str) -> Optional[float]:
+        patterns = [
+            r'(\d{1,3}(?:[ ,]\d{3})*(?:\.\d+)?)\s*[$€£]',   # 67,000 $
+            r'[$€£]\s*(\d{1,3}(?:[ ,]\d{3})*(?:\.\d+)?)',    # $ 67,000
+            r'(\d+)\s*(?:USD|BTC|USDT|RUB|руб)',             # 67000 USD
+            r'(\d+\.\d+)\s*[$€£]',                           # 123.45 $
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                raw = m.group(1).replace(' ', '').replace(',', '')
+                try:
+                    return float(raw)
+                except ValueError:
+                    continue
+        return None
+
+    # ----- Запрос курса криптовалют через CoinGecko API -----
+    @staticmethod
+    def get_crypto_price(crypto_id: str = "bitcoin", vs_currency: str = "usd") -> Optional[float]:
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={crypto_id}&vs_currencies={vs_currency}"
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get(crypto_id, {}).get(vs_currency)
+        except Exception as e:
+            print(f"[API] Ошибка запроса к CoinGecko: {e}")
+        return None
+
+    # ----- Поиск фактов в knowledge_base по сходству -----
+    def search_knowledge_base(self, query: str, top_k: int = 5) -> List[str]:
+        """
+        Возвращает строки фактов из knowledge_base, релевантных запросу.
+        """
+        results = []
+        if not self.knowledge_base:
+            return results
+        query_vec = self.text_to_embedding(query)
+        scored = []
+        for item in self.knowledge_base:
+            emb = item.get("emb")
+            if emb is None:
+                # если эмбеддинг не сохранён, вычисляем
+                emb = self.text_to_embedding(item["q"] + " " + item["a"])
+                item["emb"] = emb
+            sim = cosine_similarity(query_vec, emb)
+            scored.append((sim, item))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        threshold = 0.3
+        for sim, item in scored[:top_k]:
+            if sim >= threshold:
+                results.append(f"Q: {item['q']} -> A: {item['a']}")
+        return results
+
+    # =========================================================================
+    # ОСНОВНОЙ МЕТОД step (с изменениями)
+    # =========================================================================
+
+    def step(self, input_text: str, use_search: bool = False) -> Dict[str, Any]:
+        self.step_counter += 1
+        lower = input_text.lower()
+
+        # ===== НОВОЕ: обработка запросов о криптовалютах через API (до поиска) =====
+        crypto_keywords = ["биткоин", "btc", "bitcoin", "курс биткоина", "цена биткоина"]
+        if any(kw in lower for kw in crypto_keywords):
+            price = self.get_crypto_price("bitcoin", "usd")
+            if price is not None:
+                answer = f"Текущий курс биткоина (BTC/USD): ${price:.2f}"
+                return {
+                    "input": input_text,
+                    "answer": answer,
+                    "activated_neurons": [],
+                    "memory_results": []
+                }
+            # если API не ответил – идём дальше, возможно поиск или LLM
+
+        # ---- 0. ПРИНУДИТЕЛЬНЫЙ ПОИСК (если включена кнопка 🌐) ----
+        if use_search:
+            enhanced_query = self._enhance_search_query(input_text)
+            results = self.searcher.search(enhanced_query)
+            if results:
+                # ---- НОВОЕ: пытаемся извлечь цену из сниппетов ----
+                full_text = " ".join([r.get("title", "") + " " + r.get("body", "") for r in results])
+                price = self.extract_price(full_text)
+                if price is not None:
+                    answer = f"Курс биткоина (по данным поиска): ${price:.2f}"
+                    return {
+                        "input": input_text,
+                        "answer": answer,
+                        "activated_neurons": [],
+                        "memory_results": []
+                    }
+
+                # Если цена не найдена, передаём результаты в LLM
+                context = (
+                    f"Вопрос: {input_text}\n"
+                    f"Улучшенный запрос: {enhanced_query}\n"
+                    f"Результаты поиска в интернете:\n{self.searcher.format_results(results)}\n"
+                    "Важно: используй информацию из результатов поиска как достоверный источник. "
+                    "Если в них есть конкретные цифры, не сомневайся в них. Если данных нет, скажи: 'Я не знаю'."
+                )
+                answer = self.llm.generate(context, max_tokens=256, temperature=0.3)
+            else:
+                answer = "Не удалось найти информацию по вашему запросу."
+            return {
+                "input": input_text,
+                "answer": answer,
+                "activated_neurons": [],
+                "memory_results": []
+            }
+
+        # ---- 1. БЛОК ВОПРОСОВ О ПАМЯТИ / ОБУЧЕНИИ (без изменений) ----
+        memory_keywords = [
+            "обучил", "запомнил", "факты", "выучил", "узнал",
+            "какие данные", "чему научился", "что ты знаешь",
+            "твои знания", "что ты помнишь", "что запомнил",
+            "какие факты", "чему обучился", "какую тему"
+        ]
+        if any(phrase in lower for phrase in memory_keywords):
+            if self.knowledge_base:
+                sorted_kb = sorted(self.knowledge_base, key=lambda x: x.get('time', 0), reverse=True)
+                facts = []
+                for item in sorted_kb[:10]:
+                    facts.append(f"  • {item['q']} → {item['a']}")
+                answer = "Я запомнил следующие факты (последние 10):\n" + "\n".join(facts)
+            elif self.concept_index:
+                concepts = list(self.concept_index.keys())[:20]
+                answer = "Я знаю понятия: " + ", ".join(concepts)
+            else:
+                answer = "Я пока ничего не выучил в этом сеансе."
+            return {
+                "input": input_text,
+                "answer": answer,
+                "activated_neurons": [],
+                "memory_results": []
+            }
+
+        # ---- 2. БЛОК ВОПРОСОВ ОБ АРХИТЕКТУРЕ (без изменений) ----
+        architecture_keywords = [
+            "нейроны", "синапсы", "архитектура", "ассоциативная память",
+            "как ты устроен", "граф", "gnn", "нейросеть", "обучаешься",
+            "как работает твоя память"
+        ]
+        if any(phrase in lower for phrase in architecture_keywords):
+            answer = (
+                "Я — ассоциативная нейросеть с дифференцируемым графом (GNN).\n"
+                "• Мои нейроны — это обучаемые эмбеддинги (векторы).\n"
+                "• Синапсы — это рёбра графа, которые соединяют нейроны.\n"
+                "• Я обучаюсь через контрастную потерю — градиенты обновляют эмбеддинги нейронов и веса связей.\n"
+                "• У меня есть иерархическая память: рабочая (краткосрочная) и эпизодическая (FAISS).\n"
+                "• Знания сохраняются в нейронах и синапсах, а также в базе знаний (knowledge_base)."
+            )
+            return {
+                "input": input_text,
+                "answer": answer,
+                "activated_neurons": [],
+                "memory_results": []
+            }
+
+        # ---- 3. АВТОМАТИЧЕСКИЙ ПОИСК ПО КЛЮЧЕВЫМ СЛОВАМ (без изменений) ----
+        search_triggers = ["поищи", "найди", "актуальный", "сегодня", "новости", "интернет", "в сети"]
+        if any(phrase in lower for phrase in search_triggers):
+            enhanced_query = self._enhance_search_query(input_text)
+            results = self.searcher.search(enhanced_query)
+            if results:
+                context = (
+                    f"Вопрос: {input_text}\n"
+                    f"Улучшенный запрос: {enhanced_query}\n"
+                    f"Результаты поиска в интернете:\n{self.searcher.format_results(results)}\n"
+                    "Важно: используй информацию из результатов поиска как достоверный источник. "
+                    "Если в них есть конкретные цифры, не сомневайся в них. Если данных нет, скажи: 'Я не знаю'."
+                )
+                answer = self.llm.generate(context, max_tokens=256, temperature=0.3)
+            else:
+                answer = "Не удалось найти информацию по вашему запросу."
+            return {
+                "input": input_text,
+                "answer": answer,
+                "activated_neurons": [],
+                "memory_results": []
+            }
+
+        # ---- 4. ОБЫЧНЫЙ ОБРАБОТЧИК (граф + FAISS + LLM) С ДОБАВЛЕНИЕМ KNOWLEDGE_BASE ----
+        query_vec = self.text_to_embedding(input_text)
+        memory_results = self.memory.retrieve(query_vec, k=3)
+
+        start_nid = self.graph.find_most_similar(query_vec, threshold=0.5)
+        if start_nid is None:
+            start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0)
+
+        updated_emb = self.graph.forward()
+        self.graph.node_emb.data = updated_emb.data
+
+        # Формируем контекст
+        context = f"Вопрос: {input_text}\n"
+
+        # ===== НОВОЕ: добавляем факты из knowledge_base =====
+        kb_facts = self.search_knowledge_base(input_text, top_k=3)
+        if kb_facts:
+            context += "Из моей базы знаний:\n" + "\n".join(kb_facts) + "\n"
+
+        if memory_results:
+            context += "Из памяти:\n"
+            for res in memory_results:
+                context += f"- {res['metadata'].get('text', '')}\n"
+
+        label = self.graph.neuron_labels.get(start_nid, "")
+        context += f"Ассоциация: {label}\n"
+        context += "\nВажно: не выдумывай факты. Если в памяти нет достоверной информации, скажи: 'Я не знаю'."
+
+        # ===== НОВОЕ: логирование контекста (для отладки) =====
+        print("\n" + "="*50)
+        print("🧠 КОНТЕКСТ ДЛЯ LLM:")
+        print(context)
+        print("="*50 + "\n")
+
+        answer = self.llm.generate(context, max_tokens=256, temperature=0.7)
+        self.memory.add_working(query_vec, {"text": input_text, "answer": answer})
+
+        return {
+            "input": input_text,
+            "answer": answer,
+            "activated_neurons": [start_nid],
+            "memory_results": memory_results
+        }
+
+    # ---------- step_stream (без изменений, кроме добавления KB – опционально) ----------
+    def step_stream(self, input_text: str, use_search: bool = False):
+        lower = input_text.lower()
+
+        # ---- ПРОВЕРКА КОМАНД (память, архитектура) ----
+        memory_keywords = [
+            "обучил", "запомнил", "факты", "выучил", "узнал",
+            "какие данные", "чему научился", "что ты знаешь",
+            "твои знания", "что ты помнишь", "что запомнил",
+            "какие факты", "чему обучился", "какую тему"
+        ]
+        if any(phrase in lower for phrase in memory_keywords):
+            if self.knowledge_base:
+                sorted_kb = sorted(self.knowledge_base, key=lambda x: x.get('time', 0), reverse=True)
+                facts = []
+                for item in sorted_kb[:10]:
+                    facts.append(f"  • {item['q']} → {item['a']}")
+                answer = "Я запомнил следующие факты (последние 10):\n" + "\n".join(facts)
+            elif self.concept_index:
+                concepts = list(self.concept_index.keys())[:20]
+                answer = "Я знаю понятия: " + ", ".join(concepts)
+            else:
+                answer = "Я пока ничего не выучил в этом сеансе."
+            yield answer
+            return
+
+        architecture_keywords = [
+            "нейроны", "синапсы", "архитектура", "ассоциативная память",
+            "как ты устроен", "граф", "gnn", "нейросеть", "обучаешься",
+            "как работает твоя память"
+        ]
+        if any(phrase in lower for phrase in architecture_keywords):
+            answer = (
+                "Я — ассоциативная нейросеть с дифференцируемым графом (GNN).\n"
+                "• Мои нейроны — это обучаемые эмбеддинги (векторы).\n"
+                "• Синапсы — это рёбра графа, которые соединяют нейроны.\n"
+                "• Я обучаюсь через контрастную потерю — градиенты обновляют эмбеддинги нейронов и веса связей.\n"
+                "• У меня есть иерархическая память: рабочая (краткосрочная) и эпизодическая (FAISS).\n"
+                "• Знания сохраняются в нейронах и синапсах, а также в базе знаний (knowledge_base)."
+            )
+            yield answer
+            return
+
+        # ---- ОСНОВНАЯ ЛОГИКА (поиск + граф + LLM) ----
+        enhanced_query = None
+        results = None
+        if use_search:
+            enhanced_query = self._enhance_search_query(input_text)
+            results = self.searcher.search(enhanced_query)
+
+        query_vec = self.text_to_embedding(input_text)
+        memory_results = self.memory.retrieve(query_vec, k=3)
+
+        start_nid = self.graph.find_most_similar(query_vec, threshold=0.5)
+        if start_nid is None:
+            start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0)
+
+        self.forward(query_vec)
+
+        context = f"Вопрос: {input_text}\n"
+
+        # ===== НОВОЕ: добавляем факты из knowledge_base и в stream =====
+        kb_facts = self.search_knowledge_base(input_text, top_k=3)
+        if kb_facts:
+            context += "Из моей базы знаний:\n" + "\n".join(kb_facts) + "\n"
+
+        if use_search and results:
+            context += f"Улучшенный запрос: {enhanced_query}\n"
+            context += f"Результаты поиска в интернете:\n{self.searcher.format_results(results)}\n"
+            context += "Важно: используй информацию из результатов поиска как достоверный источник. "
+            context += "Если в них есть конкретные цифры, не сомневайся в них. Если данных нет, скажи: 'Я не знаю'.\n"
+        else:
+            if memory_results:
+                context += "Из памяти:\n"
+                for res in memory_results:
+                    context += f"- {res['metadata'].get('text', '')}\n"
+            label = self.graph.neuron_labels.get(start_nid, "")
+            context += f"Ассоциация: {label}\n"
+            context += "Важно: не выдумывай факты. Если в памяти нет достоверной информации, скажи: 'Я не знаю'.\n"
+
+        # ===== НОВОЕ: логирование (опционально) =====
+        print("\n" + "="*50)
+        print("🧠 КОНТЕКСТ ДЛЯ LLM (stream):")
+        print(context)
+        print("="*50 + "\n")
+
+        for token in self.llm.generate_stream(
+                context,
+                max_tokens=256,
+                temperature=0.7
+        ):
+            yield token
 
     # ---------- История диалогов ----------
     def save_dialog_history(self, filename: str = None):
@@ -348,12 +627,81 @@ class Brain(nn.Module):
             "embedding_cache": len(self.embedder._cache),
         }
 
-    # ---------- Дополнительные утилиты (для совместимости) ----------
+    def _update_graph_and_loss(self, q_nid: int, a_nid: int, input_text: str, answer_text: str) -> torch.Tensor:
+        """
+        Выполняет один шаг GAT, вычисляет контрастную потерю между обновлёнными эмбеддингами,
+        добавляет регуляризацию весов синапсов и возвращает общую потерю.
+        """
+        # 1. Пропускаем все эмбеддинги через GAT – получаем обновлённые
+        updated_emb = self.graph.forward()  # без аргументов, использует self.graph.node_emb
+
+        # 2. Сохраняем обновлённые эмбеддинги обратно в параметр
+        #    !!! важно: делаем это без разрыва графа (используем data)
+        self.graph.node_emb.data = updated_emb.data
+
+        # 3. Берём обновлённые эмбеддинги нужных узлов
+        emb_q = self.graph.get_embedding_by_id(q_nid)
+        emb_a = self.graph.get_embedding_by_id(a_nid)
+
+        # 4. Контрастная потеря (максимизируем косинусное сходство)
+        emb_q = F.normalize(emb_q.unsqueeze(0), p=2, dim=1)
+        emb_a = F.normalize(emb_a.unsqueeze(0), p=2, dim=1)
+        sim = F.cosine_similarity(emb_q, emb_a, dim=1)
+        contrast_loss = -torch.log(torch.sigmoid(sim * 10.0)).mean()
+
+        # 5. Регуляризация весов синапсов (L2)
+        edge_weights = self.graph.get_edge_weights()
+        if edge_weights.numel() > 0:
+            reg_loss = 1e-4 * torch.norm(edge_weights, p=2)  # коэффициент 1e-4
+        else:
+            reg_loss = torch.tensor(0.0, device=self.device)
+
+        total_loss = contrast_loss + reg_loss
+        return total_loss
+
+    # ---------- Дополнительные утилиты ----------
     def normalize_text(self, text: str) -> str:
         return re.sub(r'\s+', ' ', text.strip().lower())
 
+    def _enhance_search_query(self, query: str) -> str:
+        try:
+            today = time.strftime("%d.%m.%Y")
+            lower = query.lower()
+
+            currency_pairs = {
+                "доллар": "USD/RUB",
+                "евро": "EUR/RUB",
+                "юань": "CNY/RUB",
+                "йена": "JPY/RUB",
+                "ена": "JPY/RUB",
+                "фунт": "GBP/RUB",
+            }
+            pair = None
+            for key, val in currency_pairs.items():
+                if key in lower:
+                    pair = val
+                    break
+
+            if pair:
+                if "актуальн" in lower or "сегодня" in lower or "сейчас" in lower:
+                    return f"курс {pair} на {today}"
+                else:
+                    return f"курс {pair}"
+
+            if "погода" in lower:
+                return f"{query} {today}"
+            if "новости" in lower:
+                return f"{query} за {today}"
+
+            if "?" in query and "сегодня" not in lower:
+                return f"{query} сегодня"
+
+            return query
+        except Exception as e:
+            print(f"[Brain] Ошибка улучшения запроса: {e}")
+            return query
+
     def text_to_signal(self, text: str, energy: float = 1.0):
-        # Заглушка для совместимости с v6
         class FakeSignal:
             def __init__(self, emb, energy, text):
                 self.embedding = emb

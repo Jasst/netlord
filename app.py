@@ -1,11 +1,9 @@
 # app.py
 import asyncio
 from fastapi import FastAPI, Request, HTTPException, Depends, Header
-from fastapi.responses import HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel
-# Импорты из нового пакета brain
-from brain import Brain, BrainConfig, Teacher
-from brain.utils import cosine_similarity   # у нас есть такая функция
+import json
 import uvicorn
 import re
 import random
@@ -16,17 +14,19 @@ import signal
 import atexit
 import sys
 import secrets
-from agent import BrainAgent
+import torch
 from dotenv import load_dotenv
 from fastapi import File, UploadFile, Form
 from fastapi.staticfiles import StaticFiles
 import csv
 import io
-import time
-import torch
+
+# Импорты из пакета brain
+from brain import Brain, BrainConfig, Teacher
+from brain.utils import cosine_similarity
+from agent import BrainAgent
 
 torch.set_default_dtype(torch.float32)
-
 load_dotenv()
 
 app = FastAPI(title="Smart Brain v7 with LM Studio")
@@ -37,14 +37,13 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # ============================================================
 LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
 LM_STUDIO_API_KEY = os.environ.get("LM_STUDIO_API_KEY", "not-needed")
-
 llm_client = OpenAI(
     base_url=LM_STUDIO_BASE_URL,
     api_key=LM_STUDIO_API_KEY,
 )
 
 # ============================================================
-# Админ‑ключ
+# Админ-ключ
 # ============================================================
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY") or secrets.token_urlsafe(24)
 if not os.environ.get("ADMIN_API_KEY"):
@@ -61,29 +60,19 @@ def require_admin_key(x_admin_key: str = Header(default="")):
 # Инициализация мозга v7
 # ============================================================
 config = BrainConfig(
-    # Качество эмбеддингов – размерность 512 (в 4 раза выше, чем 128)
     dim_embedding=512,
-    # Скрытый слой GNN – тоже 512 для максимальной выразительности
     gnn_hidden_dim=512,
-    # 8 голов внимания – баланс между качеством и скоростью
     gnn_num_heads=8,
-    # До 200 000 нейронов – это ~200 000 понятий
     max_neurons=200000,
-    # До 5 000 000 синапсов (рёбер графа)
     max_synapses=5000000,
-    # Рабочая память – 20 последних запросов
     working_memory_size=20,
-    # Эпизодическая память – 20 000 записей в FAISS
     episodic_capacity=20000,
-    # Директория модели
     model_dir="brain_model_v7",
-    # Скорость обучения
     learning_rate=1e-4,
-    # Автосохранение каждые 50 шагов
     checkpoint_every=50,
 )
 brain = Brain(config=config)
-brain.load()  # загружает из config.model_dir
+brain.load()
 brain.load_dialog_history()
 
 teacher = Teacher(llm_client=llm_client)
@@ -133,12 +122,13 @@ agent = BrainAgent(
 # agent.start()
 
 # ============================================================
-# Pydantic модели (без изменений)
+# Pydantic модели
 # ============================================================
 class AskRequest(BaseModel):
     question: str
     temperature: float = 0.7
     allow_clarifying: bool = True
+    use_search: bool = False
 
 class LearnRequest(BaseModel):
     question: str
@@ -165,7 +155,7 @@ class AgentConfigRequest(BaseModel):
     user_question_timeout: int = None
 
 # ============================================================
-# Вспомогательные функции (запомни/забудь) – адаптированы для нового Brain
+# Вспомогательные функции (запомни/забудь) – без изменений
 # ============================================================
 def normalize_text(text: str) -> str:
     return re.sub(r'\s+', ' ', text.strip().lower())
@@ -197,7 +187,7 @@ def handle_remember_command(text: str) -> tuple[bool, str]:
     fact = extract_fact_from_command(text, REMEMBER_PATTERNS)
     if not fact:
         return False, ""
-    brain.learn_pair(text, fact)   # используем learn_pair
+    brain.learn_pair(text, fact)
     brain.save()
     response_text = f"✅ Я запомнил: «{fact}»."
     brain.dialog_memory.append({"user": text, "assistant": response_text, "time": time.time()})
@@ -224,10 +214,6 @@ def handle_forget_command(text: str) -> tuple[bool, str]:
             if _text_overlaps(norm_phrase, key):
                 to_delete.append((key, nid))
         for key, nid in to_delete:
-            # Удаление нейрона (в новом графе нет remove_neuron, но можно удалить из параметров)
-            # Просто удаляем из словарей и пересоздаём параметр – сложно.
-            # Для простоты просто удаляем из concept_index и knowledge_base
-            # В реальности нужно удалить нейрон, но здесь оставим как есть.
             if key in brain.concept_index:
                 del brain.concept_index[key]
             removed_any = True
@@ -250,7 +236,7 @@ def handle_forget_command(text: str) -> tuple[bool, str]:
     return True, response_text
 
 # ============================================================
-# Функции автообучения – адаптированы для нового Brain
+# Функции автообучения – без изменений
 # ============================================================
 def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float = 0.9) -> list:
     system_prompt = (
@@ -303,9 +289,6 @@ def generate_training_pairs(topic: str, num_pairs: int = 50, temperature: float 
         return []
 
 def integrate_new_concept(brain: Brain, concept_text: str, top_k: int = 5):
-    """Связывает новый концепт с похожими нейронами."""
-    # Для упрощения – пропускаем, так как у нас нет прямого доступа к нейронам по тексту.
-    # Вместо этого можно добавить в knowledge_base
     pass
 
 def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
@@ -356,14 +339,11 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
         brain.sleep(duration_steps=5)
         brain.save()
 
-        # ========== ДОБАВЛЕННАЯ ЧАСТЬ ==========
-        # Добавляем мета-факт об обучении, чтобы модель "знала" о своём обучении
         brain.learn_pair(
             f"я обучился теме {topic}",
             f"да, я выучил новые факты по теме {topic}"
         )
-        brain.save()  # сохраняем ещё раз, чтобы факт попал в память
-        # ======================================
+        brain.save()
 
         result["message"] = f"Обучение на тему '{topic}' завершено за {epochs} эпох(и)."
     except Exception as e:
@@ -372,13 +352,12 @@ def train_model_on_topic(brain: Brain, topic: str, num_pairs: int = 50,
     return result
 
 # ============================================================
-# API эндпоинты (без изменений, но адаптированы под новый Brain)
+# API эндпоинты
 # ============================================================
 
 @app.post("/ask")
 async def ask(req: AskRequest):
     try:
-        # 1. Обработка команд "запомни" и "забудь" (как в v6)
         handled, response = await asyncio.to_thread(handle_remember_command, req.question)
         if handled:
             return {"question": req.question, "answer": response, "facts": [], "known": True}
@@ -386,17 +365,13 @@ async def ask(req: AskRequest):
         if handled:
             return {"question": req.question, "answer": response, "facts": [], "known": True}
 
-        # 2. Основной запрос к мозгу (новый Brain v7)
-        result = await asyncio.to_thread(brain.step, req.question)
+        result = await asyncio.to_thread(brain.step, req.question, use_search=req.use_search)
         answer_text = result["answer"]
 
-        # 3. Преобразуем memory_results в формат фактов для фронтенда
         facts = []
         for mem in result.get("memory_results", []):
-            # Извлекаем текст из метаданных
             q = mem["metadata"].get("text", "")[:100]
             a = mem["metadata"].get("answer", "")[:200] if "answer" in mem["metadata"] else ""
-            # Чем меньше расстояние, тем выше релевантность (преобразуем в score от 0 до 1)
             score = max(0.0, min(1.0, 1.0 - mem.get("distance", 0.5)))
             if q or a:
                 facts.append({
@@ -406,7 +381,6 @@ async def ask(req: AskRequest):
                     "source": "memory"
                 })
 
-        # 4. Генерация уточняющего вопроса (если разрешено)
         clarifying = None
         if req.allow_clarifying:
             history = brain.dialog_memory[-5:] if brain.dialog_memory else []
@@ -415,10 +389,9 @@ async def ask(req: AskRequest):
                 req.question,
                 answer_text,
                 history,
-                facts   # передаём факты для контекста
+                facts
             )
 
-        # 5. Сохраняем диалог
         brain.dialog_memory.append({"user": req.question, "assistant": answer_text, "time": time.time()})
         await asyncio.to_thread(brain.save_dialog_history)
 
@@ -432,6 +405,34 @@ async def ask(req: AskRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/ask_stream")
+async def ask_stream(req: AskRequest):
+    try:
+        handled, response = await asyncio.to_thread(handle_remember_command, req.question)
+        if handled:
+            return {"question": req.question, "answer": response, "facts": [], "known": True}
+        handled, response = await asyncio.to_thread(handle_forget_command, req.question)
+        if handled:
+            return {"question": req.question, "answer": response, "facts": [], "known": True}
+
+        gen = await asyncio.to_thread(
+            brain.step_stream,
+            req.question,
+            use_search=req.use_search
+        )
+
+        async def generate():
+            full_answer = ""
+            for token in gen:
+                full_answer += token
+                yield f"data: {json.dumps({'token': token})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'full_answer': full_answer, 'facts': []})}\n\n"
+            brain.dialog_memory.append({"user": req.question, "assistant": full_answer, "time": time.time()})
+            await asyncio.to_thread(brain.save_dialog_history)
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/train_from_file")
 async def train_from_file(
@@ -554,7 +555,7 @@ async def sleep_brain():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Эндпоинты агента (без изменений) ---
+# --- Эндпоинты агента ---
 @app.post("/agent/start")
 async def agent_start():
     agent.start()
@@ -623,14 +624,12 @@ async def clear_chat():
     await asyncio.to_thread(brain.save_dialog_history)
     return {"status": "cleared"}
 
-# --- Главная страница ---
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = os.path.join("templates", "index.html")
     with open(html_path, "r", encoding="utf-8") as f:
         html_content = f.read()
     return HTMLResponse(content=html_content)
-
 
 if __name__ == "__main__":
     try:
