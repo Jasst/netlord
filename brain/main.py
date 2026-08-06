@@ -15,7 +15,7 @@ class TeacherSimple:
 
 def interactive_mode(brain: CognitiveBrain):
     teacher = TeacherSimple()
-    print("Smart Brain v9 – Когнитивный агент с планированием, рефлексией и любопытством")
+    print("Smart Brain v10 – Когнитивный агент с планированием, рефлексией и любопытством")
     print("Команды: learn <вопрос> => <ответ>, stats, exit")
     while True:
         user_input = input("> ").strip()
@@ -46,6 +46,6 @@ def interactive_mode(brain: CognitiveBrain):
             print("Дообучено на улучшении.")
 
 if __name__ == "__main__":
-    config = BrainConfig()  # здесь уже прописан адрес в классе
+    config = BrainConfig()   # теперь все параметры берутся из config.py
     brain = CognitiveBrain(config)
     interactive_mode(brain)

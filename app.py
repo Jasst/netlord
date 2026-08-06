@@ -18,36 +18,20 @@ from brain import CognitiveBrain, BrainConfig
 
 torch.set_default_dtype(torch.float32)
 
-# Адрес локального LLM-сервера (LM Studio / vLLM / etc.)
+# Адрес локального LLM-сервера (можно переопределить через переменную окружения)
 LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://192.168.0.13:1234/v1")
 
+# Создаём конфиг с нужными параметрами, НЕ переопределяем dim_embedding и graph_levels
 config = BrainConfig(
-    dim_embedding=384,
-    gnn_hidden_dim=256,
-    gnn_num_heads=4,
-    max_neurons=100000,
-    max_synapses=500000,
-    working_memory_size=10,
-    episodic_capacity=50000,
-    model_dir="brain_model_v9",
-    learning_rate=1e-4,
-    checkpoint_every=50,
-    embedding_model="intfloat/e5-large-v2",
-    llm_model="Qwen/Qwen2-7B-Instruct",
-    use_openai_api=False,
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
-    llm_base_url=LM_STUDIO_BASE_URL,      # <-- используем адрес из переменной
-    enable_curiosity=True,
-    enable_planning=True,
-    enable_reflection=True,
-    enable_ewc=True,
+    llm_base_url=LM_STUDIO_BASE_URL,
+    # остальные параметры берутся из config.py
 )
 
 brain = CognitiveBrain(config)
 brain.load()
 brain.load_dialog_history()
 
-app = FastAPI(title="Smart Brain v9")
+app = FastAPI(title="Smart Brain v10")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 class AskRequest(BaseModel):
