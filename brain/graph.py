@@ -13,8 +13,10 @@ class NodeType(Enum):
     EMOTIONAL = 3
     ATTENTION = 4
 
+# ----------------------------------------------------------------------
+# Базовый дифференцируемый граф (один уровень)
+# ----------------------------------------------------------------------
 class DifferentiableNeuralGraph(nn.Module):
-    """Исходный граф (сохранён для обратной совместимости)"""
     def __init__(self, dim: int, max_nodes: int = 5000, hidden_dim: int = 256,
                  num_heads: int = 4, num_layers: int = 3):
         super().__init__()
@@ -22,6 +24,7 @@ class DifferentiableNeuralGraph(nn.Module):
         self.max_nodes = max_nodes
         self.node_emb = nn.Parameter(torch.randn(1, dim) * 0.01)
         self.node_mask = torch.ones(1, dtype=torch.bool)
+
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         in_dim = dim
@@ -30,12 +33,14 @@ class DifferentiableNeuralGraph(nn.Module):
             self.layers.append(GATv2Conv(in_dim, out_dim, heads=num_heads, concat=False, edge_dim=1))
             self.norms.append(LayerNorm(out_dim))
             in_dim = out_dim
+
         self.skip_proj = nn.Linear(dim, dim)
         self.act = nn.ELU()
+
         self._edges: List[Tuple[int, int]] = []
         self._edge_weights = nn.ParameterList()
         self._edge_index = None
-        # метаданные
+
         self.node_labels: Dict[int, str] = {}
         self.node_types: Dict[int, NodeType] = {}
         self.node_clusters: Dict[int, str] = {}
@@ -74,6 +79,7 @@ class DifferentiableNeuralGraph(nn.Module):
             edge_attr = torch.stack(self._edge_weights).view(-1, 1)
         else:
             edge_attr = torch.zeros((0, 1), device=x.device)
+
         h = x
         for layer, norm in zip(self.layers, self.norms):
             h_new = layer(h, self._edge_index, edge_attr=edge_attr)
@@ -103,10 +109,10 @@ class DifferentiableNeuralGraph(nn.Module):
         return None
 
 
+# ----------------------------------------------------------------------
+# Иерархический граф с несколькими уровнями и self-attention
+# ----------------------------------------------------------------------
 class HierarchicalGraph(nn.Module):
-    """
-    Многоуровневый граф с self-attention и проекциями между уровнями.
-    """
     def __init__(self, dims: List[int], num_heads: int = 4, num_layers: int = 2, attn_heads: int = 8):
         super().__init__()
         self.levels = nn.ModuleList()
@@ -114,7 +120,6 @@ class HierarchicalGraph(nn.Module):
         self.attentions = nn.ModuleList()
 
         for i, d in enumerate(dims):
-            # каждый уровень – обычный граф (можно заменить на DifferentiableNeuralGraph)
             level_graph = DifferentiableNeuralGraph(
                 dim=d,
                 max_nodes=5000,
@@ -123,19 +128,27 @@ class HierarchicalGraph(nn.Module):
                 num_layers=num_layers
             )
             self.levels.append(level_graph)
-            # self-attention после каждого уровня
             self.attentions.append(nn.MultiheadAttention(d, attn_heads, batch_first=True))
             if i < len(dims) - 1:
                 self.cross_attn.append(nn.Linear(d, dims[i+1]))
 
-    def add_node(self, level_idx: int, embedding: torch.Tensor, **kwargs) -> int:
+    # ---------- Обёртки с необязательным level_idx (по умолчанию 0) ----------
+    def add_node(self, embedding: torch.Tensor, level_idx: int = 0, **kwargs) -> int:
+        """Добавляет узел на указанный уровень (по умолчанию уровень 0)."""
         return self.levels[level_idx].add_node(embedding, **kwargs)
 
-    def add_synapse(self, level_idx: int, from_id: int, to_id: int, weight: float = 0.1) -> int:
+    def add_synapse(self, from_id: int, to_id: int, level_idx: int = 0, weight: float = 0.1) -> int:
         return self.levels[level_idx].add_synapse(from_id, to_id, weight)
 
-    def forward(self, x: Optional[torch.Tensor] = None, level_idx: int = 0) -> torch.Tensor:
-        # Прогон через все уровни (сверху вниз и обратно можно усложнить)
+    def find_most_similar(self, query: torch.Tensor, level_idx: int = 0, threshold: float = 0.8) -> Optional[int]:
+        """Поиск похожего узла на указанном уровне (по умолчанию уровень 0)."""
+        return self.levels[level_idx].find_most_similar(query, threshold)
+
+    def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Прямой проход через все уровни (сверху вниз).
+        Возвращает эмбеддинги последнего уровня.
+        """
         h = x if x is not None else self.levels[0].node_emb
         for i, (g, attn) in enumerate(zip(self.levels, self.attentions)):
             h = g(h) if h is not None else g()
@@ -149,5 +162,27 @@ class HierarchicalGraph(nn.Module):
     def get_level_embeddings(self, level_idx: int) -> torch.Tensor:
         return self.levels[level_idx].node_emb
 
-    def find_most_similar(self, level_idx: int, query: torch.Tensor, threshold: float = 0.8) -> Optional[int]:
-        return self.levels[level_idx].find_most_similar(query, threshold)
+    # Свойства для совместимости с вызовами, ожидающими атрибуты уровня 0
+    @property
+    def node_emb(self):
+        return self.levels[0].node_emb
+
+    @property
+    def _edges(self):
+        return self.levels[0]._edges
+
+    @property
+    def _edge_weights(self):
+        return self.levels[0]._edge_weights
+
+    @property
+    def node_labels(self):
+        return self.levels[0].node_labels
+
+    @property
+    def node_types(self):
+        return self.levels[0].node_types
+
+    @property
+    def node_clusters(self):
+        return self.levels[0].node_clusters
