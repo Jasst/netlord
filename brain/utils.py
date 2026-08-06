@@ -3,45 +3,50 @@ import torch
 import torch.nn.functional as F
 import hashlib
 import numpy as np
-from sentence_transformers import SentenceTransformer
-from typing import Optional
+from typing import Optional, List
+from transformers import AutoTokenizer, AutoModel
 
 class EmbeddingProvider:
-    def __init__(self, dim: int = 128, model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"):
+    """
+    Современный эмбеддер на базе transformer (E5, BGE и т.п.).
+    Выходные векторы нормализованы.
+    """
+    def __init__(self, dim: int = 384, model_name: str = "intfloat/e5-large-v2"):
         self.dim = dim
-        self.model = SentenceTransformer(model_name)
+        self.model_name = model_name
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.model.eval()
         self._cache = {}
-        self._projection = None
-
-    def _project(self, vec: torch.Tensor) -> torch.Tensor:
-        src_dim = vec.shape[-1]
-        if src_dim == self.dim:
-            return vec.float()  # <-- добавлено .float()
-        if self._projection is None or self._projection.shape[0] != src_dim:
-            rng = np.random.RandomState(42)
-            proj = rng.randn(src_dim, self.dim).astype(np.float32)
-            self._projection = torch.from_numpy(proj)
-        return F.normalize(vec.float() @ self._projection, p=2, dim=-1)  # <-- .float()
 
     def get_embedding(self, text: str) -> torch.Tensor:
         if text in self._cache:
             return self._cache[text].clone()
-        emb = torch.from_numpy(self.model.encode(text, normalize_embeddings=True)).float()  # <-- добавлено .float()
-        emb = self._project(emb)
+        # Для E5 нужно добавлять префикс "query: " или "passage: "
+        # Здесь мы используем как query (для поиска)
+        if "e5" in self.model_name.lower():
+            text = "query: " + text
+        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            # Среднее по токенам (mean pooling)
+            emb = outputs.last_hidden_state.mean(dim=1).squeeze(0)
+            emb = F.normalize(emb, p=2, dim=0)
         self._cache[text] = emb.clone()
         return emb
 
-    def get_embeddings_batch(self, texts: list) -> list:
+    def get_embeddings_batch(self, texts: List[str]) -> List[torch.Tensor]:
         return [self.get_embedding(t) for t in texts]
 
-def hash_text(text: str) -> str:
-    return hashlib.md5(text.encode()).hexdigest()
 
 def random_vector(dim: int) -> torch.Tensor:
     v = torch.randn(dim)
-    return F.normalize(v.unsqueeze(0), p=2, dim=1).squeeze(0)
+    return F.normalize(v, p=2, dim=0)
 
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
-    a = F.normalize(a.flatten().float(), p=2, dim=0)
-    b = F.normalize(b.flatten().float(), p=2, dim=0)
-    return float((a @ b).item())
+    a = F.normalize(a.flatten(), p=2, dim=0)
+    b = F.normalize(b.flatten(), p=2, dim=0)
+    return float(torch.dot(a, b).item())
+
+def hash_text(text: str) -> str:
+    return hashlib.md5(text.encode()).hexdigest()

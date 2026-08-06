@@ -1,41 +1,63 @@
 # brain/llm.py
+import openai
 from openai import OpenAI
+from typing import Optional, Iterator
+import os
 
-class LMStudioLLM:
-    def __init__(self, base_url: str = "http://127.0.0.1:1234/v1", api_key: str = "not-needed"):
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+class LLMInterface:
+    def __init__(self, model_name: str = "Qwen/Qwen2-7B-Instruct",
+                 use_openai_api: bool = False, api_key: Optional[str] = None,
+                 base_url: Optional[str] = None):
+        self.model_name = model_name
+        self.use_openai_api = use_openai_api
+        if use_openai_api:
+            openai.api_key = api_key or os.getenv("OPENAI_API_KEY")
+            self.client = openai.OpenAI(api_key=openai.api_key)
+        else:
+            # Локальная модель через transformers (или LM Studio)
+            if base_url is not None:
+                # Поддержка LM Studio / vLLM
+                self.client = OpenAI(base_url=base_url, api_key="not-needed")
+            else:
+                # Загрузка локальной модели через pipeline
+                from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+                self.model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)
+                self.pipeline = pipeline("text-generation", model=self.model, tokenizer=self.tokenizer)
+                self.client = None
 
     def generate(self, prompt: str, max_tokens: int = 256, temperature: float = 0.7) -> str:
-        """Не потоковый метод (для совместимости)"""
-        try:
+        if self.use_openai_api or self.client is not None:
+            # API-стиль (OpenAI или LM Studio)
+            messages = [{"role": "user", "content": prompt}]
             response = self.client.chat.completions.create(
-                model="local-model",
-                messages=[{"role": "user", "content": prompt}],
+                model=self.model_name if self.use_openai_api else "local-model",
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
             return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"Ошибка LM Studio: {e}")
-            return "Извините, LM Studio недоступна."
+        else:
+            # Локальный pipeline
+            result = self.pipeline(prompt, max_new_tokens=max_tokens, temperature=temperature, do_sample=True)
+            return result[0]["generated_text"][len(prompt):].strip()
 
-    def generate_stream(self, prompt: str, max_tokens: int = 256, temperature: float = 0.7):
-        """
-        Генерирует ответ по токенам (генератор).
-        Возвращает итератор строк (chunks).
-        """
-        try:
-            response = self.client.chat.completions.create(
-                model="local-model",
-                messages=[{"role": "user", "content": prompt}],
+    def generate_stream(self, prompt: str, max_tokens: int = 256, temperature: float = 0.7) -> Iterator[str]:
+        if self.use_openai_api or self.client is not None:
+            messages = [{"role": "user", "content": prompt}]
+            stream = self.client.chat.completions.create(
+                model=self.model_name if self.use_openai_api else "local-model",
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                stream=True,  # <-- потоковый режим
+                stream=True,
             )
-            for chunk in response:
+            for chunk in stream:
                 content = chunk.choices[0].delta.content
                 if content:
                     yield content
-        except Exception as e:
-            print(f"Ошибка LM Studio stream: {e}")
-            yield "Извините, LM Studio недоступна."
+        else:
+            # Для локальной модели по токенам – сложнее, можно сгенерировать целиком и выдать по словам
+            full = self.generate(prompt, max_tokens, temperature)
+            for word in full.split():
+                yield word + " "
