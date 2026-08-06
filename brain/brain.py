@@ -455,8 +455,7 @@ class Brain(nn.Module):
         if start_nid is None:
             start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0)
 
-        updated_emb = self.graph.forward()
-        self.graph.node_emb.data = updated_emb.data
+       
 
         # Формируем контекст
         context = f"Вопрос: {input_text}\n"
@@ -628,31 +627,23 @@ class Brain(nn.Module):
         }
 
     def _update_graph_and_loss(self, q_nid: int, a_nid: int, input_text: str, answer_text: str) -> torch.Tensor:
-        """
-        Выполняет один шаг GAT, вычисляет контрастную потерю между обновлёнными эмбеддингами,
-        добавляет регуляризацию весов синапсов и возвращает общую потерю.
-        """
         # 1. Пропускаем все эмбеддинги через GAT – получаем обновлённые
         updated_emb = self.graph.forward()  # без аргументов, использует self.graph.node_emb
 
-        # 2. Сохраняем обновлённые эмбеддинги обратно в параметр
-        #    !!! важно: делаем это без разрыва графа (используем data)
-        self.graph.node_emb.data = updated_emb.data
+        # 2. Берём эмбеддинги нужных узлов из обновлённого тензора (НЕ из node_emb!)
+        emb_q = updated_emb[q_nid - 1]  # индексы с 0
+        emb_a = updated_emb[a_nid - 1]
 
-        # 3. Берём обновлённые эмбеддинги нужных узлов
-        emb_q = self.graph.get_embedding_by_id(q_nid)
-        emb_a = self.graph.get_embedding_by_id(a_nid)
-
-        # 4. Контрастная потеря (максимизируем косинусное сходство)
+        # 3. Контрастная потеря (максимизируем косинусное сходство)
         emb_q = F.normalize(emb_q.unsqueeze(0), p=2, dim=1)
         emb_a = F.normalize(emb_a.unsqueeze(0), p=2, dim=1)
         sim = F.cosine_similarity(emb_q, emb_a, dim=1)
         contrast_loss = -torch.log(torch.sigmoid(sim * 10.0)).mean()
 
-        # 5. Регуляризация весов синапсов (L2)
+        # 4. Регуляризация весов синапсов (L2)
         edge_weights = self.graph.get_edge_weights()
         if edge_weights.numel() > 0:
-            reg_loss = 1e-4 * torch.norm(edge_weights, p=2)  # коэффициент 1e-4
+            reg_loss = 1e-4 * torch.norm(edge_weights, p=2)
         else:
             reg_loss = torch.tensor(0.0, device=self.device)
 
