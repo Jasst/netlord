@@ -34,11 +34,12 @@ class DifferentiableNeuralGraph(nn.Module):
             self.norms.append(LayerNorm(out_dim))
             in_dim = out_dim
 
-        self.skip_proj = nn.Linear(dim, dim)
+        # skip_proj больше не нужен, так как мы отказываемся от skip при несовпадении размерностей
+        # self.skip_proj = nn.Linear(dim, dim)  # закомментировано
         self.act = nn.ELU()
 
         self._edges: List[Tuple[int, int]] = []
-        self._edge_weights = nn.ParameterList()   # будем хранить параметры
+        self._edge_weights = nn.ParameterList()
         self._edge_index = None
 
         self.node_labels: Dict[int, str] = {}
@@ -76,10 +77,9 @@ class DifferentiableNeuralGraph(nn.Module):
         if self._edge_index is None or self._edge_index.size(1) == 0:
             return x
 
-        # Исправленная обработка весов рёбер – явное преобразование в список тензоров
+        # Явное преобразование весов рёбер в список тензоров
         if len(self._edge_weights) > 0:
-            # Преобразуем ParameterList в список тензоров, затем в стек
-            weights = [w for w in self._edge_weights]   # список параметров
+            weights = [w for w in self._edge_weights]
             edge_attr = torch.stack(weights).view(-1, 1)
         else:
             edge_attr = torch.zeros((0, 1), device=x.device)
@@ -89,10 +89,12 @@ class DifferentiableNeuralGraph(nn.Module):
             h_new = layer(h, self._edge_index, edge_attr=edge_attr)
             h_new = norm(h_new)
             h_new = self.act(h_new)
+            # Если размерности совпадают – добавляем skip connection
             if h.shape == h_new.shape:
                 h = h + h_new
             else:
-                h = h_new + self.skip_proj(h)
+                # Иначе просто заменяем
+                h = h_new
         return h
 
     def get_node_embeddings(self) -> torch.Tensor:
@@ -101,7 +103,6 @@ class DifferentiableNeuralGraph(nn.Module):
     def get_edge_weights(self) -> torch.Tensor:
         if len(self._edge_weights) == 0:
             return torch.tensor([])
-        # Явное преобразование в список
         weights = [w for w in self._edge_weights]
         return torch.cat([w.view(1) for w in weights])
 
@@ -126,10 +127,12 @@ class HierarchicalGraph(nn.Module):
         self.attentions = nn.ModuleList()
 
         for i, d in enumerate(dims):
+            # Чтобы избежать проблем с размерностями, hidden_dim = d (можно и d*2, но тогда skip не работает)
+            # Рекомендую hidden_dim = d для единообразия
             level_graph = DifferentiableNeuralGraph(
                 dim=d,
                 max_nodes=5000,
-                hidden_dim=d*2,
+                hidden_dim=d,               # было d*2 – исправлено на d
                 num_heads=num_heads,
                 num_layers=num_layers
             )
@@ -138,7 +141,6 @@ class HierarchicalGraph(nn.Module):
             if i < len(dims) - 1:
                 self.cross_attn.append(nn.Linear(d, dims[i+1]))
 
-    # ---------- Методы с корректным порядком аргументов ----------
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden",
                  layer: int = 0, node_type: NodeType = NodeType.CONCEPT,
                  level_idx: int = 0) -> int:
@@ -164,11 +166,9 @@ class HierarchicalGraph(nn.Module):
     def get_level_embeddings(self, level_idx: int) -> torch.Tensor:
         return self.levels[level_idx].node_emb
 
-    # Добавляем метод get_edge_weights для совместимости (возвращаем веса уровня 0)
     def get_edge_weights(self) -> torch.Tensor:
         return self.levels[0].get_edge_weights()
 
-    # Свойства для совместимости с кодом, обращающимся к атрибутам уровня 0
     @property
     def node_emb(self):
         return self.levels[0].node_emb
