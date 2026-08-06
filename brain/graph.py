@@ -38,7 +38,7 @@ class DifferentiableNeuralGraph(nn.Module):
         self.act = nn.ELU()
 
         self._edges: List[Tuple[int, int]] = []
-        self._edge_weights = nn.ParameterList()
+        self._edge_weights = nn.ParameterList()   # будем хранить параметры
         self._edge_index = None
 
         self.node_labels: Dict[int, str] = {}
@@ -75,8 +75,12 @@ class DifferentiableNeuralGraph(nn.Module):
             x = self.node_emb
         if self._edge_index is None or self._edge_index.size(1) == 0:
             return x
+
+        # Исправленная обработка весов рёбер – явное преобразование в список тензоров
         if len(self._edge_weights) > 0:
-            edge_attr = torch.stack(self._edge_weights).view(-1, 1)
+            # Преобразуем ParameterList в список тензоров, затем в стек
+            weights = [w for w in self._edge_weights]   # список параметров
+            edge_attr = torch.stack(weights).view(-1, 1)
         else:
             edge_attr = torch.zeros((0, 1), device=x.device)
 
@@ -97,7 +101,9 @@ class DifferentiableNeuralGraph(nn.Module):
     def get_edge_weights(self) -> torch.Tensor:
         if len(self._edge_weights) == 0:
             return torch.tensor([])
-        return torch.cat([w.view(1) for w in self._edge_weights])
+        # Явное преобразование в список
+        weights = [w for w in self._edge_weights]
+        return torch.cat([w.view(1) for w in weights])
 
     def find_most_similar(self, query: torch.Tensor, threshold: float = 0.8) -> Optional[int]:
         if self.node_emb.shape[0] == 0:
@@ -136,21 +142,15 @@ class HierarchicalGraph(nn.Module):
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden",
                  layer: int = 0, node_type: NodeType = NodeType.CONCEPT,
                  level_idx: int = 0) -> int:
-        """Добавляет узел на указанный уровень (по умолчанию уровень 0)."""
         return self.levels[level_idx].add_node(embedding, label, cluster, layer, node_type)
 
     def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1, level_idx: int = 0) -> int:
         return self.levels[level_idx].add_synapse(from_id, to_id, weight)
 
     def find_most_similar(self, query: torch.Tensor, level_idx: int = 0, threshold: float = 0.8) -> Optional[int]:
-        """Поиск похожего узла на указанном уровне (по умолчанию уровень 0)."""
         return self.levels[level_idx].find_most_similar(query, threshold)
 
     def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Прямой проход через все уровни (сверху вниз).
-        Возвращает эмбеддинги последнего уровня.
-        """
         h = x if x is not None else self.levels[0].node_emb
         for i, (g, attn) in enumerate(zip(self.levels, self.attentions)):
             h = g(h) if h is not None else g()
@@ -163,6 +163,10 @@ class HierarchicalGraph(nn.Module):
 
     def get_level_embeddings(self, level_idx: int) -> torch.Tensor:
         return self.levels[level_idx].node_emb
+
+    # Добавляем метод get_edge_weights для совместимости (возвращаем веса уровня 0)
+    def get_edge_weights(self) -> torch.Tensor:
+        return self.levels[0].get_edge_weights()
 
     # Свойства для совместимости с кодом, обращающимся к атрибутам уровня 0
     @property
