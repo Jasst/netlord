@@ -113,12 +113,17 @@ class EWC:
 # Основной класс CognitiveBrain
 # ----------------------------------------------------------------------
 class CognitiveBrain(nn.Module):
+    # ИЗМЕНЕНО: LLM здесь — не источник знаний, а язык выражения графа.
+    # Она не должна "думать за себя" — думает граф (spreading activation),
+    # LLM только облекает уже активированные графом ассоциации в связный текст.
     SYSTEM_PROMPT = (
-        "Ты — Smart Brain, локальный когнитивный ассистент с растущей графовой памятью "
-        "и базой знаний. Отвечай кратко, по существу и опираясь на переданный контекст. "
-        "Не повторяй дословно свои предыдущие ответы, если пользователь явно не просит "
-        "повторить. Если контекста недостаточно для точного ответа — честно скажи об этом, "
-        "не выдумывай факты."
+        "Ты — речевой аппарат когнитивного графа Smart Brain, а не самостоятельный источник знаний. "
+        "Ниже дан 'поток ассоциаций' — концепты и факты, которые граф активировал в ответ на вопрос "
+        "через распространение активации по своим связям (это и есть его мышление и память). "
+        "Твоя задача — связно, естественно и кратко сформулировать ответ, опираясь ТОЛЬКО на эти "
+        "активированные ассоциации и данные из памяти/базы знаний ниже. Не добавляй факты, которых "
+        "там нет, и не рассуждай от себя. Если активированных ассоциаций недостаточно для ответа — "
+        "прямо скажи, что граф пока не связал с этим вопросом ничего релевантного."
     )
 
     def __init__(self, config: BrainConfig):
@@ -248,12 +253,14 @@ class CognitiveBrain(nn.Module):
             self.memory.add_semantic_triple(q, "has_answer", a, confidence=reward)
 
     def _contrastive_loss(self, q_nid: int, a_nid: int) -> torch.Tensor:
-        if hasattr(self.graph, 'levels'):
-            emb_q = self.graph.levels[0].node_emb[q_nid - 1]
-            emb_a = self.graph.levels[0].node_emb[a_nid - 1]
-        else:
-            emb_q = self.graph.node_emb[q_nid - 1]
-            emb_a = self.graph.node_emb[a_nid - 1]
+        # ИЗМЕНЕНО: раньше loss считался по СЫРЫМ node_emb — GATv2Conv/LayerNorm/attention
+        # не получали ни одного градиента за всё время работы системы (мёртвый код).
+        # Теперь loss считается по h = graph.forward() — контекстуализированному эмбеддингу
+        # (с учётом соседей по графу), поэтому слои message passing реально обучаются
+        # различать, какие связи усиливают смысл, а какие — шум.
+        h = self.graph.forward()
+        emb_q = h[q_nid - 1]
+        emb_a = h[a_nid - 1]
         emb_q = F.normalize(emb_q.unsqueeze(0), p=2, dim=1)
         emb_a = F.normalize(emb_a.unsqueeze(0), p=2, dim=1)
         sim = F.cosine_similarity(emb_q, emb_a, dim=1)
@@ -315,7 +322,7 @@ class CognitiveBrain(nn.Module):
                     context,
                     system=self.SYSTEM_PROMPT,
                     history=self._recent_history(),
-                    max_tokens=300,
+                    max_tokens=2000,
                     temperature=temperature if temperature is not None else 0.3,
                 )
             else:
@@ -326,23 +333,30 @@ class CognitiveBrain(nn.Module):
         query_vec = self.text_to_embedding(input_text, is_query=True)
         memory_results = self.memory.retrieve(query_vec, k=5)
 
+        # ИЗМЕНЕНО: точку входа в граф ищем по КОНТЕКСТУАЛИЗИРОВАННОМУ эмбеддингу
+        # (find_most_similar_contextual), а не по сырому — так на выбор узла уже влияют
+        # его связи в графе, а не только буквальный текст.
         if hasattr(self.graph, 'levels'):
-            start_nid = self.graph.find_most_similar(query_vec, level_idx=0, threshold=0.5)
+            start_nid = self.graph.find_most_similar_contextual(query_vec, level_idx=0, threshold=0.5)
         else:
-            start_nid = self.graph.find_most_similar(query_vec, threshold=0.5)
+            start_nid = self.graph.find_most_similar_contextual(query_vec, threshold=0.5)
 
         if start_nid is None:
             start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0,
                                              node_type=NodeType.SENSORY, optimizer=self.optimizer)
 
-        _ = self.graph.forward()
+        # ГЛАВНОЕ ИЗМЕНЕНИЕ: "мышление" — активация растекается по синапсам от start_nid,
+        # выявляя, какие концепты граф реально ассоциирует с вопросом (не просто похожие
+        # по тексту, а связанные через цепочку обучения). Это и есть работа нейросети,
+        # а не просто lookup по векторам.
+        thought_stream = self.graph.spreading_activation(start_nid, steps=3, decay=0.6, top_k=6)
 
-        context = self._build_context(input_text, memory_results, start_nid)
+        context = self._build_context(input_text, memory_results, start_nid, thought_stream)
         answer = self.llm.generate(
             context,
             system=self.SYSTEM_PROMPT,
             history=self._recent_history(),
-            max_tokens=300,
+            max_tokens=2000,
             temperature=temperature if temperature is not None else 0.7,
         )
 
@@ -365,7 +379,8 @@ class CognitiveBrain(nn.Module):
         return {
             "input": input_text,
             "answer": answer,
-            "activated_neurons": [start_nid] if start_nid else [],
+            "activated_neurons": [start_nid] + [nid for nid, _ in thought_stream] if start_nid else [],
+            "thought_stream": thought_stream,  # видимая "мысль" графа — полезно для отладки/UI
             "memory_results": memory_results
         }
 
@@ -409,8 +424,26 @@ class CognitiveBrain(nn.Module):
         if len(self.knowledge_base) > self.config.max_kb_size:
             self.knowledge_base.pop(0)
 
-    def _build_context(self, query: str, memory_results: List[Dict], start_nid: int) -> str:
+    def _build_context(self, query: str, memory_results: List[Dict], start_nid: int,
+                        thought_stream: Optional[List[Tuple[int, float]]] = None) -> str:
         context = f"Вопрос: {query}\n"
+
+        # ГЛАВНОЕ: поток ассоциаций графа — то, что реально "подумал" граф через
+        # spreading activation. Раньше здесь была одна строка "Ассоциация: <label>"
+        # от узла, найденного простым cosine-поиском; теперь — цепочка связанных
+        # концептов с силой активации, ранжированная тем, как узлы реально связаны
+        # в обученном графе.
+        node_labels = getattr(self.graph, 'node_labels', {})
+        start_label = node_labels.get(start_nid, "")
+        if start_label:
+            context += f"Отправная ассоциация графа: {start_label}\n"
+        if thought_stream:
+            context += "Поток ассоциаций графа (концепт — сила активации):\n"
+            for nid, strength in thought_stream:
+                label = node_labels.get(nid, "")
+                if label:
+                    context += f"- {label} (активация: {strength:.2f})\n"
+
         if memory_results:
             context += "Из эпизодической памяти:\n"
             for res in memory_results[:3]:
@@ -419,11 +452,8 @@ class CognitiveBrain(nn.Module):
         kb_facts = self._search_knowledge_base(query, top_k=3)
         if kb_facts:
             context += "Из базы знаний:\n" + "\n".join(kb_facts) + "\n"
-        if hasattr(self.graph, 'node_labels') and start_nid in self.graph.node_labels:
-            label = self.graph.node_labels.get(start_nid, "")
-            if label:
-                context += f"Ассоциация: {label}\n"
-        context += "Отвечай кратко и по существу. Если не знаешь, скажи: 'Я не знаю'."
+
+        context += "Сформулируй ответ на основе потока ассоциаций и данных выше. Если ничего релевантного не активировано, скажи: 'Я не знаю'."
         return context
 
     def _build_search_context(self, query: str, enhanced: str, results: List[Dict]) -> str:
@@ -444,6 +474,9 @@ class CognitiveBrain(nn.Module):
             emb = item.get("emb")
             if emb is None:
                 continue
+            # Если emb оказался списком (при загрузке из JSON), преобразуем в тензор
+            if isinstance(emb, list):
+                emb = torch.tensor(emb, dtype=torch.float32)
             sim = cosine_similarity(q_vec, emb)
             scored.append((sim, item))
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -494,22 +527,71 @@ class CognitiveBrain(nn.Module):
         self.save_dialog_history(os.path.join(path, "dialog_history.json"))
         print(f"[Brain] Модель сохранена в {path}")
 
+    # ---------- НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ АДАПТАЦИИ РАЗМЕРОВ ----------
+    def _resize_parameter(self, param: nn.Parameter, new_shape: tuple) -> nn.Parameter:
+        """Изменяет размер параметра, копируя старые данные (если они помещаются)."""
+        if param.shape == new_shape:
+            return param
+        with torch.no_grad():
+            new_data = torch.randn(new_shape, dtype=param.dtype, device=param.device) * 0.01
+            # Копируем существующие данные, если они есть
+            if param.dim() >= 2:
+                min_rows = min(param.shape[0], new_shape[0])
+                new_data[:min_rows] = param.data[:min_rows]
+            else:
+                # Для одномерных (bias и т.п.)
+                min_len = min(param.numel(), new_shape[0])
+                new_data[:min_len] = param.data[:min_len]
+        return nn.Parameter(new_data)
+
+    # ---------- ИСПРАВЛЕННЫЙ МЕТОД load() ----------
     def load(self, model_dir: str = None):
         path = model_dir or self.config.model_dir
         if not os.path.exists(path):
+            print(f"[Brain] Папка модели {path} не найдена, начинаем с нуля.")
             return
+
         graph_path = f"{path}/graph.pth"
         if os.path.exists(graph_path):
             state_dict = torch.load(graph_path, map_location=self.device)
+
+            # ---- АДАПТАЦИЯ РАЗМЕРОВ ПАРАМЕТРОВ ----
+            # Рекурсивно обходим все параметры графа и изменяем их размер под state_dict
+            def adapt_params(module, prefix=""):
+                for name, param in list(module.named_parameters(recurse=False)):
+                    full_name = prefix + name if prefix else name
+                    if full_name in state_dict:
+                        saved_shape = state_dict[full_name].shape
+                        if param.shape != saved_shape:
+                            print(f"[Brain] Адаптация {full_name}: {param.shape} -> {saved_shape}")
+                            new_param = self._resize_parameter(param, saved_shape)
+                            setattr(module, name, new_param)
+                # Рекурсивно для дочерних модулей
+                for child_name, child in module.named_children():
+                    adapt_params(child, prefix + child_name + ".")
+
+            adapt_params(self.graph)
+
+            # Теперь загружаем state_dict (размеры совпадают)
             self.graph.load_state_dict(state_dict, strict=False)
+
+        # ---- ЗАГРУЗКА РЁБЕР (исправлено для иерархического графа) ----
         edges_path = f"{path}/edges.pkl"
         if os.path.exists(edges_path):
             with open(edges_path, "rb") as f:
                 edges, weights = pickle.load(f)
-            if hasattr(self.graph, '_edges') and hasattr(self.graph, '_edge_weights'):
+            # Если граф иерархический, работаем с уровнем 0
+            if hasattr(self.graph, 'levels'):
+                level0 = self.graph.levels[0]
+                level0._edges = edges
+                level0._edge_weights = nn.ParameterList([nn.Parameter(torch.tensor(w)) for w in weights])
+                level0._rebuild_edges()
+            else:
                 self.graph._edges = edges
                 self.graph._edge_weights = nn.ParameterList([nn.Parameter(torch.tensor(w)) for w in weights])
                 self.graph._rebuild_edges()
+
+        # Загрузка метаданных
         meta_path = f"{path}/meta.json"
         if os.path.exists(meta_path):
             with open(meta_path, "r") as f:
@@ -518,7 +600,14 @@ class CognitiveBrain(nn.Module):
             self._learn_counter = meta.get("learn_counter", 0)
             self.concept_index = meta.get("concept_index", {})
             self.knowledge_base = meta.get("knowledge_base", [])
+
+            # ---- ПРЕОБРАЗОВАНИЕ EMBEDDINGS ИЗ СПИСКОВ В ТЕНЗОРЫ ----
+            for item in self.knowledge_base:
+                if "emb" in item and isinstance(item["emb"], list):
+                    item["emb"] = torch.tensor(item["emb"], dtype=torch.float32)
+
         self.load_dialog_history(os.path.join(path, "dialog_history.json"))
+
         # ВАЖНО: после load() state_dict графа заменяется целиком (torch.load),
         # поэтому старый self.optimizer, созданный в __init__ на "пустом" графе,
         # снова рассинхронизирован с параметрами. Пересобираем его с нуля —

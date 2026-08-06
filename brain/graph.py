@@ -43,19 +43,19 @@ class DifferentiableNeuralGraph(nn.Module):
         self._edges: List[Tuple[int, int]] = []
         self._edge_weights = nn.ParameterList()
         self._edge_index = None
+        # Кэш смежности для spreading activation (не требует градиента — только для "мышления")
+        self._adjacency: Dict[int, List[Tuple[int, float]]] = {}
 
         self.node_labels: Dict[int, str] = {}
         self.node_types: Dict[int, NodeType] = {}
         self.node_clusters: Dict[int, str] = {}
 
+    # ------------------------------------------------------------------
+    # Рост графа (память / обучаемость)
+    # ------------------------------------------------------------------
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden",
                  layer: int = 0, node_type: NodeType = NodeType.CONCEPT,
                  optimizer=None) -> int:
-        """
-        optimizer: если передан self.optimizer из CognitiveBrain, новая версия node_emb
-        сразу синхронизируется с оптимизатором (см. utils.grow_parameter_in_optimizer) —
-        без этого добавленные узлы никогда не обучаются градиентным спуском.
-        """
         embedding = F.normalize(embedding.float(), p=2, dim=0)
         old_param = self.node_emb
         num_old_rows = old_param.shape[0]
@@ -78,19 +78,38 @@ class DifferentiableNeuralGraph(nn.Module):
         self._rebuild_edges()
 
         if optimizer is not None and optimizer.param_groups:
-            # Новый вес ребра тоже отсутствовал в снимке параметров оптимизатора — добавляем явно.
             optimizer.param_groups[0]["params"].append(new_w)
         return len(self._edges) - 1
 
     def _rebuild_edges(self):
         if not self._edges:
             self._edge_index = torch.zeros((2, 0), dtype=torch.long)
+            self._adjacency = {}
             return
         u = [f - 1 for f, _ in self._edges]
         v = [t - 1 for _, t in self._edges]
         self._edge_index = torch.tensor([u, v], dtype=torch.long)
 
+        # Смежность для spreading activation — синапс трактуем как направленный,
+        # но с более слабой "обратной тягой", как в биологических сетях (обратный
+        # сигнал слабее прямого, но не нулевой — иначе граф был бы чисто иерархическим).
+        adjacency: Dict[int, List[Tuple[int, float]]] = {}
+        for (f, t), w_param in zip(self._edges, self._edge_weights):
+            w = float(w_param.detach())
+            adjacency.setdefault(f, []).append((t, w))
+            adjacency.setdefault(t, []).append((f, w * 0.5))
+        self._adjacency = adjacency
+
+    # ------------------------------------------------------------------
+    # "Мышление" — message passing + spreading activation
+    # ------------------------------------------------------------------
     def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Контекстуализирует эмбеддинг каждого узла его соседями через GATv2.
+        Это единственное место, где реально обучаются GAT/LayerNorm — их выход
+        теперь используется и для сравнения похожести, и в contrastive loss,
+        а не отбрасывается.
+        """
         if x is None:
             x = self.node_emb
         if self._edge_index is None or self._edge_index.size(1) == 0:
@@ -113,6 +132,45 @@ class DifferentiableNeuralGraph(nn.Module):
                 h = h_new
         return h
 
+    def spreading_activation(self, start_id: int, steps: int = 3, decay: float = 0.6,
+                              top_k: int = 6, min_activation: float = 0.05) -> List[Tuple[int, float]]:
+        """
+        Это и есть "мышление" графа: активация запускается в узле start_id и растекается
+        по синапсам на steps шагов, ослабевая с decay на каждом хопе и по весу ребра.
+        Возвращает top_k наиболее "возбуждённых" узлов (кроме самого start_id) —
+        это ассоциативный поток мыслей графа, который дальше LLM просто озвучивает.
+
+        Не участвует в backward — это управляющая логика "что вспомнить", а не обучаемый вес.
+        """
+        n = self.node_emb.shape[0]
+        if n == 0 or start_id < 1 or start_id > n:
+            return []
+
+        activation = torch.zeros(n)
+        activation[start_id - 1] = 1.0
+
+        for _ in range(steps):
+            new_activation = activation.clone() * 0.25  # остаточное затухание (забывание)
+            nonzero = (activation > min_activation).nonzero(as_tuple=True)[0]
+            for idx in nonzero.tolist():
+                nid = idx + 1
+                a = activation[idx].item()
+                for neighbor, w in self._adjacency.get(nid, []):
+                    if 1 <= neighbor <= n:
+                        new_activation[neighbor - 1] += a * w * decay
+            activation = torch.clamp(new_activation, max=5.0)
+
+        activation[start_id - 1] = 0.0  # сам триггер не возвращаем как "ассоциацию"
+        k = min(top_k, n)
+        if k == 0:
+            return []
+        topk_vals, topk_idx = torch.topk(activation, k)
+        return [
+            (int(idx.item()) + 1, float(val.item()))
+            for idx, val in zip(topk_idx, topk_vals)
+            if val.item() > min_activation
+        ]
+
     def get_node_embeddings(self) -> torch.Tensor:
         return self.node_emb
 
@@ -123,9 +181,28 @@ class DifferentiableNeuralGraph(nn.Module):
         return torch.cat([w.view(1) for w in weights])
 
     def find_most_similar(self, query: torch.Tensor, threshold: float = 0.8) -> Optional[int]:
+        """Строгое сравнение по СЫРОМУ содержимому узла — используется при обучении,
+        чтобы не плодить дублирующие узлы для почти идентичного текста."""
         if self.node_emb.shape[0] == 0:
             return None
         sim = F.cosine_similarity(query.unsqueeze(0), self.node_emb, dim=1)
+        best_idx = torch.argmax(sim).item()
+        if sim[best_idx] >= threshold:
+            return best_idx + 1
+        return None
+
+    def find_most_similar_contextual(self, query: torch.Tensor, threshold: float = 0.6) -> Optional[int]:
+        """
+        Сравнение по КОНТЕКСТУАЛИЗИРОВАННОМУ (после message passing) эмбеддингу узла —
+        используется при поиске точки входа для "мышления"/ответа. Значение узла здесь
+        формируется не только его исходным текстом, но и тем, с чем он связан в графе —
+        то есть граф уже привносит "понимание", а не просто хранит вектора.
+        """
+        with torch.no_grad():
+            h = self.forward()
+        if h.shape[0] == 0:
+            return None
+        sim = F.cosine_similarity(query.unsqueeze(0), h, dim=1)
         best_idx = torch.argmax(sim).item()
         if sim[best_idx] >= threshold:
             return best_idx + 1
@@ -168,11 +245,14 @@ class HierarchicalGraph(nn.Module):
     def find_most_similar(self, query: torch.Tensor, level_idx: int = 0, threshold: float = 0.8) -> Optional[int]:
         return self.levels[level_idx].find_most_similar(query, threshold)
 
+    def find_most_similar_contextual(self, query: torch.Tensor, level_idx: int = 0,
+                                      threshold: float = 0.6) -> Optional[int]:
+        return self.levels[level_idx].find_most_similar_contextual(query, threshold)
+
+    def spreading_activation(self, start_id: int, level_idx: int = 0, **kwargs) -> List[Tuple[int, float]]:
+        return self.levels[level_idx].spreading_activation(start_id, **kwargs)
+
     def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # ПРИМЕЧАНИЕ: при x=None каждый уровень использует свои собственные узлы
-        # (self.levels[i].node_emb) через forward(None) -> берём x с уровня i,
-        # а не протаскиваем cross_attn-проекцию предыдущего уровня как ошибочную замену
-        # содержимого следующего уровня.
         outputs = []
         h = x
         for i, (g, attn) in enumerate(zip(self.levels, self.attentions)):
