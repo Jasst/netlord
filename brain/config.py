@@ -5,7 +5,7 @@ from typing import Optional, List
 @dataclass
 class BrainConfig:
     # Базовые размерности
-    dim_embedding: int = 384
+    dim_embedding: int = 1024                     # изменено с 384 на 1024
     max_kb_size: int = 10000
 
     # Параметры графа
@@ -15,7 +15,7 @@ class BrainConfig:
     max_neurons: int = 100000
     max_synapses: int = 500000
     use_hierarchical_graph: bool = True
-    graph_levels: List[int] = field(default_factory=lambda: [384, 256, 128])
+    graph_levels: List[int] = field(default_factory=lambda: [1024, 512, 256])  # изменено
     attention_heads: int = 8
 
     # Память
@@ -25,11 +25,11 @@ class BrainConfig:
     semantic_graph_path: str = "semantic_graph.pth"
 
     # Модели
-    embedding_model: str = "intfloat/e5-large-v2"
+    embedding_model: str = "intfloat/e5-large-v2"   # оставляем, размерность 1024
     llm_model: str = "Qwen/Qwen2-7B-Instruct"
     use_openai_api: bool = False
     openai_api_key: Optional[str] = None
-    llm_base_url: Optional[str] = "http://192.168.0.13:1234/v1"   # <-- АДРЕС ЛОКАЛЬНОГО СЕРВЕРА
+    llm_base_url: Optional[str] = "http://192.168.0.13:1234/v1"
 
     # Оптимизация
     learning_rate: float = 1e-4
