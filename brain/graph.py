@@ -132,12 +132,14 @@ class HierarchicalGraph(nn.Module):
             if i < len(dims) - 1:
                 self.cross_attn.append(nn.Linear(d, dims[i+1]))
 
-    # ---------- Обёртки с необязательным level_idx (по умолчанию 0) ----------
-    def add_node(self, embedding: torch.Tensor, level_idx: int = 0, **kwargs) -> int:
+    # ---------- Методы с корректным порядком аргументов ----------
+    def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden",
+                 layer: int = 0, node_type: NodeType = NodeType.CONCEPT,
+                 level_idx: int = 0) -> int:
         """Добавляет узел на указанный уровень (по умолчанию уровень 0)."""
-        return self.levels[level_idx].add_node(embedding, **kwargs)
+        return self.levels[level_idx].add_node(embedding, label, cluster, layer, node_type)
 
-    def add_synapse(self, from_id: int, to_id: int, level_idx: int = 0, weight: float = 0.1) -> int:
+    def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1, level_idx: int = 0) -> int:
         return self.levels[level_idx].add_synapse(from_id, to_id, weight)
 
     def find_most_similar(self, query: torch.Tensor, level_idx: int = 0, threshold: float = 0.8) -> Optional[int]:
@@ -162,7 +164,7 @@ class HierarchicalGraph(nn.Module):
     def get_level_embeddings(self, level_idx: int) -> torch.Tensor:
         return self.levels[level_idx].node_emb
 
-    # Свойства для совместимости с вызовами, ожидающими атрибуты уровня 0
+    # Свойства для совместимости с кодом, обращающимся к атрибутам уровня 0
     @property
     def node_emb(self):
         return self.levels[0].node_emb
