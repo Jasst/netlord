@@ -18,6 +18,7 @@ let interactiveMode = false;
 let currentAgentQuestion = null;
 let pollIntervalId = null;
 let agentRunning = true;
+let searchEnabled = false;
 
 // ---------- DOM refs ----------
 const $ = id => document.getElementById(id);
@@ -50,6 +51,7 @@ const factsList = $('factsList');
 const settingsPanel = $('settingsPanel');
 const chatList = $('chatList');
 const overlayEl = $('overlay');
+const searchToggleBtn = $('searchToggleBtn');
 
 // ---------- Вспомогательные функции ----------
 function stripHtml(html) {
@@ -117,7 +119,11 @@ function bindEvents() {
     document.getElementById('newChatBtn').addEventListener('click', createNewChat);
     learnPosBtn.addEventListener('click', () => learnLastPair('positive'));
     learnNegBtn.addEventListener('click', () => learnLastPair('negative'));
-
+    searchToggleBtn.addEventListener('click', () => {
+        searchEnabled = !searchEnabled;
+        searchToggleBtn.classList.toggle('active', searchEnabled);
+        searchToggleBtn.textContent = searchEnabled ? '🌐' : '🌐';
+    });
     applyAgentConfigBtn.addEventListener('click', updateAgentInteractiveConfig);
     trainTopicBtn.addEventListener('click', trainTopic);
     trainPairBtn.addEventListener('click', trainPair);
@@ -320,6 +326,7 @@ function loadCurrentChat() {
     const hasPair = !!(lastQuestion && lastAnswer);
     learnPosBtn.style.display = hasPair ? 'inline-flex' : 'none';
     learnNegBtn.style.display = hasPair ? 'inline-flex' : 'none';
+    searchToggleBtn.style.display = hasPair ? 'inline-flex' : 'none';
     renderFacts(lastFacts);
 
     requestAnimationFrame(() => {
@@ -335,7 +342,6 @@ function createNewChat() {
     switchChat(id);
 }
 
-
 let pendingDeleteChatId = null;
 
 function showConfirm(message, onConfirm) {
@@ -345,7 +351,6 @@ function showConfirm(message, onConfirm) {
     const cancelBtn = document.getElementById('confirmCancelBtn');
     msg.textContent = message;
     modal.style.display = 'flex';
-    // Убираем старые обработчики
     const newOk = okBtn.cloneNode(true);
     const newCancel = cancelBtn.cloneNode(true);
     okBtn.parentNode.replaceChild(newOk, okBtn);
@@ -389,18 +394,12 @@ function deleteChat(chatId) {
 function autoRenameChat(chatId, firstMessage) {
     const chat = chats.find(c => c.id === chatId);
     if (!chat || chat.name !== 'Новый чат') return;
-
     let newName = firstMessage.trim();
     if (!newName) return;
-
-    // Удаляем временные метки
     newName = newName.replace(/\d{1,2}:\d{2}(:\d{2})?/g, '').trim();
-
-    // Берём первые 6 слов, но не более 40 символов
     const words = newName.split(/\s+/);
     let name = words.slice(0, 6).join(' ');
     if (name.length > 40) name = name.substring(0, 40) + '…';
-
     chat.name = name || 'Новый чат';
     saveChats();
     renderChatList();
@@ -477,16 +476,44 @@ function saveMessageToChat(html, sender, facts, isAgentOrClarifying) {
 }
 
 function formatMessage(text) {
+    // Сначала обрабатываем блоки кода — они не должны подвергаться маркдауну и абзацам
     const codeBlockRegex = /```(\w*)\n([\s\S]*?)```/g;
-    let result = '', lastIndex = 0, match;
+    let parts = [];
+    let lastIndex = 0;
+    let match;
     while ((match = codeBlockRegex.exec(text)) !== null) {
         const lang = match[1] || 'text';
         const code = match[2];
-        result += escapeHtml(text.substring(lastIndex, match.index)).replace(/\n/g, '<br>');
-        result += `<pre><code class="language-${lang}">${escapeHtml(code)}</code><button class="copy-btn" onclick="window.copyCode(this)">Копировать</button></pre>`;
+        const before = text.substring(lastIndex, match.index);
+        if (before) parts.push({ type: 'text', content: before });
+        parts.push({ type: 'code', lang, code });
         lastIndex = match.index + match[0].length;
     }
-    result += escapeHtml(text.substring(lastIndex)).replace(/\n/g, '<br>');
+    if (lastIndex < text.length) {
+        parts.push({ type: 'text', content: text.substring(lastIndex) });
+    }
+
+    // Функция для обработки текста (маркдаун + абзацы)
+    function processText(content) {
+        // Экранируем HTML
+        let escaped = escapeHtml(content);
+        // Простой маркдаун: **жирный** и *курсив*
+        escaped = escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+        escaped = escaped.replace(/\*(.+?)\*/g, '<em>$1</em>');
+        // Разбиваем на абзацы по двойному переносу строки (или больше)
+        const paragraphs = escaped.split(/\n\s*\n/);
+        return paragraphs.map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join('');
+    }
+
+    let result = '';
+    for (const part of parts) {
+        if (part.type === 'code') {
+            // Блок кода: не трогаем, просто вставляем как pre/code с кнопкой копирования
+            result += `<pre><code class="language-${part.lang}">${escapeHtml(part.code)}</code><button class="copy-btn" onclick="window.copyCode(this)">Копировать</button></pre>`;
+        } else {
+            result += processText(part.content);
+        }
+    }
     return result;
 }
 
@@ -516,6 +543,8 @@ function highlightCodeBlocks() {
     });
 }
 
+
+// ---------- Отправка сообщения ----------
 // ---------- Отправка сообщения ----------
 async function sendMessage() {
     const text = questionInput.value.trim();
@@ -525,7 +554,7 @@ async function sendMessage() {
     sendBtn.disabled = true;
     questionInput.focus();
 
-    // ===== РЕЖИМ АГЕНТА (интерактивный) =====
+    // ===== РЕЖИМ АГЕНТА =====
     if (interactiveMode && currentAgentQuestion) {
         const q = currentAgentQuestion;
         currentAgentQuestion = null;
@@ -550,12 +579,11 @@ async function sendMessage() {
     // ===== ОБЫЧНЫЙ РЕЖИМ =====
     addMessage(text, 'user', null, false, false);
 
-    // Индикатор печати
     const typingId = 'typing-' + Date.now();
     const typingDiv = document.createElement('div');
     typingDiv.className = 'message bot typing';
     typingDiv.id = typingId;
-    typingDiv.innerHTML = '<span class="dots">печатает</span>';
+    typingDiv.innerHTML = '<span class="dots">думает</span>';
     messagesEl.appendChild(typingDiv);
     requestAnimationFrame(() => {
         messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -566,50 +594,135 @@ async function sendMessage() {
     try {
         const temp = parseFloat(tempSlider.value);
         const allowClar = allowClarifying.checked;
-        const res = await fetch('/ask', {
+        const useSearch = searchEnabled;
+
+        const response = await fetch('/ask', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 question: text,
                 temperature: temp,
-                allow_clarifying: allowClar
+                allow_clarifying: allowClar,
+                use_search: useSearch
             })
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Ошибка');
+
+        if (!response.ok) {
+            const errData = await response.json();
+            throw new Error(errData.detail || 'Ошибка');
+        }
+
+        const data = await response.json();
+        const answer = data.answer || 'Нет ответа.';
+        const finalFacts = data.facts || [];
 
         const typingEl = document.getElementById(typingId);
         if (typingEl) typingEl.remove();
 
-        const answer = data.answer || 'Нет ответа.';
-        lastQuestion = text;
-        lastAnswer = stripHtml(answer);
-        lastFacts = data.facts || [];
+        const div = document.createElement('div');
+        div.className = 'message bot';
+        messagesEl.appendChild(div);
+        requestAnimationFrame(() => {
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        });
 
-        addMessage(answer, 'bot', lastFacts, false, true);
-        renderFacts(lastFacts);
-        loadStats();
+        const parsed = parseReasoningAnswer(answer);
 
+        // ---- БЛОК РАССУЖДЕНИЙ ----
+        if (parsed.thinking) {
+            const details = document.createElement('details');
+            const summary = document.createElement('summary');
+            summary.textContent = '🧠 Рассуждения';
+            details.appendChild(summary);
+            const thinkingDiv = document.createElement('div');
+            thinkingDiv.className = 'thinking-text';
+            thinkingDiv.textContent = parsed.thinking;
+            details.appendChild(thinkingDiv);
+            div.appendChild(details);
+        }
+
+        // ---- КОНТЕЙНЕР ДЛЯ ФИНАЛЬНОГО ОТВЕТА ----
+        const answerContainer = document.createElement('div');
+        answerContainer.className = 'answer-text';
+        div.appendChild(answerContainer);
+
+        const plainTextDiv = document.createElement('div');
+        answerContainer.appendChild(plainTextDiv);
+
+        const fullAnswerText = parsed.answer;
+        let idx = 0;
+        let displayedText = '';
+
+        // ---- ПОСИМВОЛЬНАЯ ПЕЧАТЬ ----
+        function typeNextChar() {
+            if (idx < fullAnswerText.length) {
+                displayedText += fullAnswerText[idx++];
+                plainTextDiv.textContent = displayedText;
+                requestAnimationFrame(() => {
+                    messagesEl.scrollTop = messagesEl.scrollHeight;
+                });
+                setTimeout(typeNextChar, 20);
+            } else {
+                // ---- ПЕЧАТЬ ЗАВЕРШЕНА: заменяем на форматированный HTML ----
+                const formattedHtml = formatMessage(fullAnswerText);
+                answerContainer.style.transition = 'opacity 0.3s ease';
+                answerContainer.style.opacity = 0;
+
+                // Функция финализации — выполняется после затухания
+                const finalizeMessage = () => {
+                    // Удаляем plain-текст и вставляем форматированный HTML
+                    plainTextDiv.remove();
+                    const formattedDiv = document.createElement('div');
+                    formattedDiv.innerHTML = formattedHtml;
+                    answerContainer.appendChild(formattedDiv);
+                    highlightCodeBlocks();
+
+                    // Плавное появление
+                    answerContainer.style.opacity = 1;
+
+                    // ---- ДОБАВЛЯЕМ ФАКТЫ И ВРЕМЯ (через appendChild, не innerHTML +=) ----
+                    if (finalFacts && finalFacts.length) {
+                        const factsDiv = document.createElement('div');
+                        factsDiv.className = 'facts-indicator';
+                        factsDiv.textContent = '📚 использовано фактов: ' + finalFacts.length;
+                        div.appendChild(factsDiv);
+                    }
+                    const timeDiv = document.createElement('div');
+                    timeDiv.className = 'time';
+                    timeDiv.textContent = new Date().toLocaleTimeString();
+                    div.appendChild(timeDiv);
+
+                    // Сохраняем сообщение в историю чата (теперь с полным содержимым)
+                    saveMessageToChat(div.innerHTML, 'bot', finalFacts, false);
+
+                    // ---- ОБНОВЛЯЕМ ИНТЕРФЕЙС ----
+                    lastQuestion = text;
+                    lastAnswer = stripHtml(parsed.answer);
+                    lastFacts = finalFacts;
+                    updateButtons();
+                    renderFacts(lastFacts);
+                    loadStats();
+                };
+
+                // Даём время на затухание, затем финализируем
+                setTimeout(finalizeMessage, 50);
+            }
+        }
+
+        typeNextChar();
+
+        // ---- УТОЧНЯЮЩИЙ ВОПРОС (если есть) ----
         if (data.clarifying_question && allowClar) {
             const delay = parseFloat(clarifyingDelay.value) * 1000;
-            const typingDivClar = document.createElement('div');
-            typingDivClar.className = 'message bot typing';
-            typingDivClar.id = 'typing-' + Date.now();
-            typingDivClar.innerHTML = '<span class="dots">печатает</span>';
-            messagesEl.appendChild(typingDivClar);
-            requestAnimationFrame(() => {
-                messagesEl.scrollTop = messagesEl.scrollHeight;
-            });
             setTimeout(() => {
-                const el = document.getElementById(typingDivClar.id);
-                if (el) el.remove();
                 addMessage('🤔 ' + data.clarifying_question, 'bot', null, true, false);
             }, delay);
         }
 
-        learnPosBtn.style.display = 'inline-flex';
-        learnNegBtn.style.display = 'inline-flex';
-    } catch(e) {
+        searchEnabled = false;
+        searchToggleBtn.classList.remove('active');
+
+    } catch (e) {
         const typingEl = document.getElementById(typingId);
         if (typingEl) typingEl.remove();
         addMessage('❌ Ошибка: ' + e.message, 'bot', null, false, false);
@@ -690,8 +803,11 @@ async function loadStats() {
 }
 
 function renderFacts(facts) {
+    const el = document.getElementById('factsList');
+    if (!el) return; // если элемента нет – просто выходим
+
     if (!facts || !facts.length) {
-        factsList.innerHTML = '<p class="empty-hint">Факты появятся после ответа.</p>';
+        el.innerHTML = '<p class="empty-hint">Факты появятся после ответа.</p>';
         return;
     }
     let html = '';
@@ -699,7 +815,14 @@ function renderFacts(facts) {
         const scoreText = f.score ? f.score.toFixed(2) : '?';
         html += `<div class="fact-item"><div class="q">${escapeHtml(f.q)}</div><div class="a">${escapeHtml(f.a)}</div><div class="score">score: ${scoreText}</div></div>`;
     });
-    factsList.innerHTML = html;
+    el.innerHTML = html;
+}
+
+function updateButtons() {
+    const hasPair = !!(lastQuestion && lastAnswer);
+    learnPosBtn.style.display = hasPair ? 'inline-flex' : 'none';
+    learnNegBtn.style.display = hasPair ? 'inline-flex' : 'none';
+    searchToggleBtn.style.display = hasPair ? 'inline-flex' : 'none';
 }
 
 // ---------- Тогглы панелей ----------
@@ -707,6 +830,82 @@ function updateOverlay() {
     if (!overlayEl) return;
     const anyOpen = !chatListCollapsed || settingsOpen;
     overlayEl.classList.toggle('visible', anyOpen);
+}
+
+function parseReasoningAnswer(text) {
+    const thinkingMatch = text.match(/<thinking>([\s\S]*?)<\/thinking>/);
+    const answerMatch = text.match(/<answer>([\s\S]*?)<\/answer>/);
+    if (thinkingMatch && answerMatch) {
+        return {
+            thinking: thinkingMatch[1].trim(),
+            answer: answerMatch[1].trim()
+        };
+    }
+    return { thinking: null, answer: text };
+}
+
+function addMessageWithReasoning(parsed, sender, facts, isAgentOrClarifying, animate = false) {
+    const div = document.createElement('div');
+    div.className = 'message ' + sender;
+    if (isAgentOrClarifying) div.classList.add('agent-question');
+
+    if (parsed.thinking) {
+        const details = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = '🧠 Рассуждения';
+        details.appendChild(summary);
+        const thinkingDiv = document.createElement('div');
+        thinkingDiv.className = 'thinking-text';
+        thinkingDiv.textContent = parsed.thinking;
+        details.appendChild(thinkingDiv);
+        div.appendChild(details);
+    }
+
+    const answerDiv = document.createElement('div');
+    answerDiv.className = 'answer-text';
+    div.appendChild(answerDiv);
+
+    const factsHtml = (facts && facts.length) ? '<div class="facts-indicator">📚 использовано фактов: ' + facts.length + '</div>' : '';
+    const timeHtml = '<div class="time">' + new Date().toLocaleTimeString() + '</div>';
+
+    if (!animate) {
+        answerDiv.innerHTML = formatMessage(parsed.answer);
+        div.innerHTML += factsHtml + timeHtml;
+        messagesEl.appendChild(div);
+        requestAnimationFrame(() => {
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        });
+        highlightCodeBlocks();
+        saveMessageToChat(div.innerHTML, sender, facts, isAgentOrClarifying);
+    } else {
+        messagesEl.appendChild(div);
+        requestAnimationFrame(() => {
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        });
+
+        const words = parsed.answer.split(/(\s+)/);
+        let fullText = '', idx = 0;
+        function typeNext() {
+            if (!div.parentNode) return;
+            if (idx < words.length) {
+                fullText += words[idx++];
+                answerDiv.textContent = fullText;
+                requestAnimationFrame(() => {
+                    messagesEl.scrollTop = messagesEl.scrollHeight;
+                });
+                setTimeout(typeNext, 10 + Math.random() * 20);
+            } else {
+                answerDiv.innerHTML = formatMessage(fullText);
+                div.innerHTML += factsHtml + timeHtml;
+                requestAnimationFrame(() => {
+                    messagesEl.scrollTop = messagesEl.scrollHeight;
+                });
+                highlightCodeBlocks();
+                saveMessageToChat(div.innerHTML, sender, facts, isAgentOrClarifying);
+            }
+        }
+        typeNext();
+    }
 }
 
 function closeMobilePanels() {
