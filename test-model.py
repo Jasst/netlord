@@ -18,14 +18,13 @@ class Config:
     """Гиперпараметры сети."""
     decay_rate: float = 0.999
     hebb_lr: float = 0.1
-    identity_size: int = 20           # начальный размер проекции
+    identity_size: int = 20
     max_history: int = 5
     steps: int = 5
     threshold_default: float = 0.5
     leak_default: float = 0.9
     min_weight: float = 1e-5
     activation_threshold: float = 0.4
-    # Параметры слоёв
     layer_params: Dict[str, Dict] = field(default_factory=lambda: {
         'input':   {'threshold': 0.3, 'leak': 0.8, 'hebb_lr': 0.15},
         'hidden':  {'threshold': 0.5, 'leak': 0.9, 'hebb_lr': 0.1},
@@ -34,9 +33,8 @@ class Config:
         'output':  {'threshold': 0.4, 'leak': 0.85, 'hebb_lr': 0.1},
         'default': {'threshold': 0.5, 'leak': 0.9, 'hebb_lr': 0.1}
     })
-    # Нормализация весов
     weight_normalization: bool = True
-    norm_axis: int = 0   # 0 - строки, 1 - столбцы
+    norm_axis: int = 0
     max_weight: float = 5.0
 
 # ------------------------ Класс нейрона ------------------------
@@ -51,23 +49,18 @@ class Neuron:
         self.activation = 0.0
         self.bias = 0.0
         self.id = idx
-        self.last_active = 0   # номер шага, когда был активен
+        self.last_active = 0
 
     def reset(self) -> None:
         self.activation = 0.0
 
-# ------------------------ Адаптивная идентичность (масштабируемая) ------------------------
+# ------------------------ Адаптивная идентичность (без изменений) ------------------------
 class AdaptiveIdentity:
-    """
-    Слой идентичности, использующий разреженное случайное проецирование.
-    Размер проекции адаптивно растёт при добавлении новых нейронов.
-    Вектор идентичности обновляется через Хебб-подобное правило на основе награды.
-    """
     def __init__(self, base_size: int = 20, sparsity: float = 0.1):
         self.base_size = base_size
         self.sparsity = sparsity
         self.size = base_size
-        self.projection = None          # матрица проекции (sparse csr)
+        self.projection = None
         self.vector = np.random.rand(base_size) * 0.1
         self.target = np.ones(base_size) * 0.5
         self.history: List[np.ndarray] = []
@@ -75,18 +68,15 @@ class AdaptiveIdentity:
         self._num_neurons = 0
 
     def _ensure_projection(self, num_neurons: int) -> None:
-        """Создаёт или расширяет проекционную матрицу при добавлении нейронов."""
         if self.projection is None or self.projection.shape[1] < num_neurons:
             old_cols = self.projection.shape[1] if self.projection is not None else 0
             new_cols = num_neurons
-            # Создаём разреженную матрицу (случайные веса с заданной разреженностью)
             n_nonzero = int(new_cols * self.size * self.sparsity)
             rows = np.random.randint(0, self.size, n_nonzero)
             cols = np.random.randint(0, new_cols, n_nonzero)
             data = np.random.randn(n_nonzero) * 0.1
             new_proj = sp.csr_matrix((data, (rows, cols)), shape=(self.size, new_cols))
             if self.projection is not None:
-                # Дополняем старую проекцию нулями
                 old_proj = self.projection
                 combined = sp.hstack([old_proj, new_proj[:, old_cols:new_cols]], format='csr')
                 self.projection = combined
@@ -99,49 +89,34 @@ class AdaptiveIdentity:
         if num_neurons == 0:
             return
         self._ensure_projection(num_neurons)
-        # Собираем активации всех нейронов (кроме входных, но можно и всех)
         activations = np.array([n.activation for n in network_neurons], dtype=float)
-        # Проецируем в пространство идентичности
-        compressed = self.projection.dot(activations)  # размер (self.size,)
-        # Нормализуем (сигмоида для стабильности)
+        compressed = self.projection.dot(activations)
         compressed = 1.0 / (1.0 + np.exp(-compressed))
-
-        # Внутренняя награда: близость к цели и разнообразие
         proximity = 1.0 - np.linalg.norm(compressed - self.target) / np.sqrt(self.size)
         diversity = np.std(compressed)
         internal_reward = 0.7 * proximity + 0.3 * diversity
         total_reward = internal_reward if external_reward is None else 0.6 * internal_reward + 0.4 * external_reward
         self.reward = total_reward
 
-        # Обновляем вектор идентичности (целевой) через Хебб-подобное правило
         lr = 0.1
         if total_reward > 0.6:
             self.vector = (1 - lr) * self.vector + lr * compressed
-            # Также обновляем целевую точку
             self.target = 0.9 * self.target + 0.1 * compressed
         elif total_reward > 0.3:
             self.vector = 0.9 * self.vector + 0.1 * compressed
         else:
-            # При низкой награде – добавляем шум, чтобы исследовать
             noise = np.random.normal(0, 0.2, self.size)
             self.vector = np.clip(self.vector + noise, 0, 1)
             self.target = 0.9 * self.target + 0.1 * compressed
 
-        # Обновляем проекционную матрицу по правилу Хебба (связь между входами и проекцией)
-        # Упрощённо: delta = lr * (compressed[:,None] * activations[None,:])
-        # Но для разреженной матрицы делаем только для ненулевых элементов
-        if total_reward > 0.3:  # учим только при хорошей награде
+        if total_reward > 0.3:
             proj_lr = 0.01
-            # Получаем индексы ненулевых элементов проекции
             rows, cols = self.projection.nonzero()
-            # Вычисляем обновление: delta = proj_lr * (compressed[rows] * activations[cols] - projection[rows, cols])
-            # Можно использовать стохастическое обновление только для части элементов
             for i in range(len(rows)):
                 r = rows[i]; c = cols[i]
                 old = self.projection[r, c]
                 delta = proj_lr * (compressed[r] * activations[c] - old)
                 self.projection[r, c] = old + delta
-            # Ограничиваем веса проекции
             self.projection.data = np.clip(self.projection.data, -1.0, 1.0)
 
         self.history.append(self.vector.copy())
@@ -177,36 +152,60 @@ class AdaptiveNetwork:
         self.identity = AdaptiveIdentity(base_size=self.config.identity_size)
         self.name_to_neuron: Dict[str, Neuron] = {}
         self.neurons: List[Neuron] = []
-        # Веса хранятся в CSR для быстрых умножений, обновления через LIL
         self.weights_csr = sp.csr_matrix((0, 0), dtype=float)
         self.weights_lil = sp.lil_matrix((0, 0), dtype=float)
         self.history: List[str] = []
         self.step_count = 0
-        # Для асинхронных LLM-запросов
         self.llm_queue = queue.Queue()
         self.llm_results = {}
+        self.llm_lock = threading.Lock()
+        self.stop_event = threading.Event()
         self._start_llm_worker()
 
+        # VECTORIZED: массивы параметров для быстрого доступа в feed_forward
+        self._leaks = np.array([], dtype=float)
+        self._thresholds = np.array([], dtype=float)
+        self._biases = np.array([], dtype=float)
+
     def _start_llm_worker(self):
-        """Запускает фоновый поток для обработки LLM-запросов."""
         def worker():
-            while True:
-                word, future = self.llm_queue.get()
+            while not self.stop_event.is_set():
+                try:
+                    word, _ = self.llm_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
                 if word is None:
                     break
                 data = self.teacher.generate_learning_data(word) if self.teacher else None
-                self.llm_results[word] = data
+                with self.llm_lock:
+                    self.llm_results[word] = data
                 self.llm_queue.task_done()
         self.llm_thread = threading.Thread(target=worker, daemon=True)
         self.llm_thread.start()
 
-    # ---------- Управление нейронами ----------
+    def shutdown(self):
+        self.stop_event.set()
+        self.llm_queue.put((None, None))
+        if hasattr(self, 'llm_thread') and self.llm_thread.is_alive():
+            self.llm_thread.join(timeout=1.0)
+
+    # VECTORIZED: синхронизация массивов параметров при добавлении нейрона
+    def _sync_arrays(self):
+        """Обновляет внутренние массивы параметров после изменения списка нейронов."""
+        if self.neurons:
+            self._leaks = np.array([n.leak for n in self.neurons], dtype=float)
+            self._thresholds = np.array([n.threshold for n in self.neurons], dtype=float)
+            self._biases = np.array([n.bias for n in self.neurons], dtype=float)
+        else:
+            self._leaks = np.array([], dtype=float)
+            self._thresholds = np.array([], dtype=float)
+            self._biases = np.array([], dtype=float)
+
     def add_neuron(self, name: str, layer: str = "default",
                    threshold: Optional[float] = None,
                    leak: Optional[float] = None) -> Neuron:
         if name in self.name_to_neuron:
             return self.name_to_neuron[name]
-        # Получаем параметры слоя из конфига
         layer_cfg = self.config.layer_params.get(layer, self.config.layer_params['default'])
         threshold = threshold or layer_cfg.get('threshold', self.config.threshold_default)
         leak = leak or layer_cfg.get('leak', self.config.leak_default)
@@ -214,17 +213,17 @@ class AdaptiveNetwork:
         neuron = Neuron(name, layer, threshold, leak, idx)
         self.neurons.append(neuron)
         self.name_to_neuron[name] = neuron
-        # Расширяем матрицу весов
         new_size = idx + 1
         self.weights_lil.resize((new_size, new_size))
-        self.weights_csr = self.weights_lil.tocsr()  # обновляем CSR
+        self.weights_csr = self.weights_lil.tocsr()
+        # VECTORIZED: обновляем массивы параметров
+        self._sync_arrays()
         return neuron
 
     def get_or_create_id(self, name: str, layer: str = "input") -> int:
         neuron = self.add_neuron(name, layer=layer)
         return neuron.id
 
-    # ---------- Работа с весами (оптимизировано) ----------
     def get_weight(self, from_id: int, to_id: int) -> float:
         return self.weights_lil[from_id, to_id]
 
@@ -232,45 +231,33 @@ class AdaptiveNetwork:
         if abs(value) < self.config.min_weight:
             value = 0.0
         self.weights_lil[from_id, to_id] = value
-        # Обновляем CSR при изменении (можно делать реже, но для простоты обновляем сразу)
         self.weights_csr = self.weights_lil.tocsr()
 
     def add_synapse(self, from_neuron: Neuron, to_neuron: Neuron, weight: float = 0.5) -> None:
         self.set_weight(from_neuron.id, to_neuron.id, weight)
 
-    # ---------- Забывание с удалением мёртвых нейронов ----------
     def decay_weights(self) -> None:
-        """Применяет затухание и удаляет слишком малые веса и мёртвые нейроны."""
         if self.weights_lil.nnz == 0:
             return
-        # Умножаем все веса на decay_rate
         self.weights_lil = self.weights_lil * self.config.decay_rate
-        # Обнуляем малые веса
         self.weights_lil.data = [np.array([v if abs(v) >= self.config.min_weight else 0.0 for v in row])
                                  for row in self.weights_lil.data]
         self.weights_lil.eliminate_zeros()
-        # Обновляем CSR
         self.weights_csr = self.weights_lil.tocsr()
 
-        # Нормализация весов (по столбцам)
         if self.config.weight_normalization:
             col_sums = np.array(self.weights_csr.sum(axis=0)).flatten()
             col_sums[col_sums == 0] = 1.0
-            # Делим каждый столбец на его сумму (норма L1)
             self.weights_csr = self.weights_csr @ sp.diags(1.0 / col_sums, format='csr')
             self.weights_lil = self.weights_csr.tolil()
-            # Ограничиваем максимальное значение
             self.weights_csr.data = np.clip(self.weights_csr.data, -self.config.max_weight, self.config.max_weight)
             self.weights_lil = self.weights_csr.tolil()
 
-        # Удаляем нейроны, которые давно не активировались (если больше 100 шагов)
         threshold_steps = 100
         dead = [n for n in self.neurons if n.layer != 'input' and self.step_count - n.last_active > threshold_steps]
         if dead:
-            # Удаляем их из матрицы и списков (сложная операция, для простоты пропускаем)
-            pass  # В реальной реализации нужно перестроить индексы
+            pass
 
-    # ---------- Токенизация ----------
     @staticmethod
     def tokenize(text: str) -> List[str]:
         stopwords = {'и', 'в', 'на', 'с', 'по', 'к', 'у', 'а', 'но', 'за', 'о', 'об',
@@ -281,7 +268,7 @@ class AdaptiveNetwork:
         words = re.findall(r'\b[a-zа-яё]+\b', text.lower())
         return [w for w in words if w not in stopwords and len(w) > 1]
 
-    # ---------- Прямой проход (векторизованный) ----------
+    # ---------- VECTORIZED: прямой проход (полностью векторизован) ----------
     def feed_forward(self, input_names: List[str], steps: int = None) -> List[Neuron]:
         if steps is None:
             steps = self.config.steps
@@ -289,44 +276,55 @@ class AdaptiveNetwork:
         for n in self.neurons:
             if n.layer != "input":
                 n.activation = 0.0
-        # Получаем id входных нейронов (создаём при необходимости)
+
         input_ids = [self.get_or_create_id(name, layer="input") for name in input_names]
-        # Устанавливаем активацию входных нейронов в 1.0
         for idx in input_ids:
             self.neurons[idx].activation = 1.0
             self.neurons[idx].last_active = self.step_count
 
-        # Инициализируем вектор активаций для всех нейронов
+        # Все активации – вектор
         activations = np.array([n.activation for n in self.neurons], dtype=float)
-        # Маска для входных нейронов, чтобы они не обновлялись
         input_mask = np.zeros(len(self.neurons), dtype=bool)
         input_mask[input_ids] = True
 
+        # VECTORIZED: извлекаем массивы параметров (уже синхронизированы)
+        leaks = self._leaks
+        biases = self._biases
+        thresholds = self._thresholds
+        weights = self.weights_csr
+
+        # Векторизованный цикл по шагам
         for _ in range(steps):
-            # Вычисляем входной сигнал: W * activations (разреженное умножение)
-            new_input = self.weights_csr.dot(activations)  # (num_neurons,)
-            # Добавляем смещение (если есть) – можно игнорировать
-            # Обновляем активации по правилу утечки
-            # Для всех нейронов, кроме входных
-            for idx in range(len(self.neurons)):
-                if not input_mask[idx]:
-                    n = self.neurons[idx]
-                    total = n.bias + new_input[idx]
-                    new_act = 1.0 / (1.0 + np.exp(-total))
-                    n.activation = n.leak * n.activation + (1 - n.leak) * new_act
-                    if n.activation > n.threshold:
-                        n.last_active = self.step_count
-            # Обновляем вектор активаций
-            activations = np.array([n.activation for n in self.neurons], dtype=float)
-            # Можно также принудительно установить входные в 1.0, чтобы они не затухали
+            # Входной сигнал (разреженное умножение)
+            new_input = weights.dot(activations)   # вектор размера num_neurons
+            total = biases + new_input
+            new_act = 1.0 / (1.0 + np.exp(-total))   # сигмоида
+            # Обновление активаций с утечкой (для всех нейронов)
+            activations = leaks * activations + (1.0 - leaks) * new_act
+            # Входные нейроны остаются равными 1.0
             activations[input_mask] = 1.0
+
+            # Обновляем last_active для нейронов, у которых активация > порога
+            # (это единственное место, где мы всё ещё используем цикл по нейронам,
+            #  но он выполняется после каждого шага и не влияет на основные вычисления)
+            active_mask = activations > thresholds
+            # Обновляем атрибут last_active у соответствующих объектов
+            # Это можно сделать через цикл, но он будет проходить только по активным нейронам,
+            # что всё равно быстрее, чем полный перебор, но для простоты оставим полный проход,
+            # но это не влияет на производительность основных вычислений.
+            for idx, active in enumerate(active_mask):
+                if active and not input_mask[idx]:
+                    self.neurons[idx].last_active = self.step_count
+
+        # Сохраняем активации обратно в объекты (для остальных частей кода, которые их используют)
+        for idx, act in enumerate(activations):
+            self.neurons[idx].activation = act
 
         # Возвращаем активированные нейроны (кроме входных)
         activated = [self.neurons[idx] for idx in range(len(self.neurons))
                      if not input_mask[idx] and self.neurons[idx].activation > self.neurons[idx].threshold]
         return activated
 
-    # ---------- Обучение (Хебб) ----------
     def hebbian_learning(self, input_names: List[str], activated: List[Neuron]) -> None:
         active_ids = set()
         for name in input_names:
@@ -337,7 +335,6 @@ class AdaptiveNetwork:
             return
         ids = list(active_ids)
         acts = np.array([self.neurons[idx].activation for idx in ids])
-        # Скорость обучения для каждого слоя
         lr_matrix = np.zeros((len(ids), len(ids)))
         for i, from_id in enumerate(ids):
             from_neuron = self.neurons[from_id]
@@ -345,19 +342,16 @@ class AdaptiveNetwork:
                 if i == j:
                     continue
                 to_neuron = self.neurons[to_id]
-                # Выбираем скорость в зависимости от слоя получателя
                 layer_lr = self.config.layer_params.get(to_neuron.layer, self.config.layer_params['default']).get('hebb_lr', self.config.hebb_lr)
                 lr_matrix[i, j] = layer_lr
         delta = lr_matrix * np.outer(acts, acts)
-        # Применяем обновления только для положительных дельт
         for i, from_id in enumerate(ids):
             for j, to_id in enumerate(ids):
                 if i != j and delta[i, j] > 0.01:
                     new_weight = self.get_weight(from_id, to_id) + delta[i, j]
                     self.set_weight(from_id, to_id, new_weight)
-        self.decay_weights()   # применяем забывание после обновления
+        self.decay_weights()
 
-    # ---------- Комбинаторные нейроны ----------
     def create_combination_neuron(self, input_names: List[str]) -> Optional[Neuron]:
         if len(input_names) < 2:
             return None
@@ -371,9 +365,10 @@ class AdaptiveNetwork:
             if n:
                 self.add_synapse(n, combo, weight=0.5)
         combo.bias = -0.5 * len(sorted_names) + 0.1
+        # VECTORIZED: обновляем biases массив после изменения bias
+        self._sync_arrays()
         return combo
 
-    # ---------- Обработка входа ----------
     def process_input(self, input_text: str, learn: bool = True,
                       external_reward: Optional[float] = None) -> Tuple[List[Neuron], List[Neuron]]:
         tokens = self.tokenize(input_text)
@@ -391,18 +386,15 @@ class AdaptiveNetwork:
                 combo = self.create_combination_neuron(tokens)
                 if combo:
                     new_neurons.append(combo)
-                    # Активируем комбинаторный нейрон
                     total = combo.bias + sum(self.get_weight(n.id, combo.id) * n.activation
                                              for n in [self.name_to_neuron[t] for t in tokens if t in self.name_to_neuron])
                     combo.activation = 1.0 / (1.0 + np.exp(-total))
                     if combo.activation > combo.threshold and combo not in activated:
                         activated.append(combo)
-        # Обновляем идентичность
         self.identity.update(self.neurons, external_reward=external_reward)
         self.step_count += 1
         return activated, new_neurons
 
-    # ---------- Генерация ответа (улучшенная) ----------
     def generate_response(self, input_text: str, deterministic: bool = False,
                           external_reward: Optional[float] = None,
                           activation_threshold: Optional[float] = None,
@@ -418,21 +410,18 @@ class AdaptiveNetwork:
         tokens = self.tokenize(input_text)
         forbidden = {self.name_to_neuron[t] for t in tokens if t in self.name_to_neuron}
 
-        # Кандидаты с учётом слоёв
         candidates = [n for n in activated if n not in forbidden and n.activation > activation_threshold]
         if not candidates:
             candidates = [n for n in self.neurons if n.layer != "input" and n not in forbidden and n.activation > 0.2]
         if not candidates:
             return "Я не знаю, как ответить."
 
-        # Сортируем по активации и по приоритету слоя (output > combination > association > hidden)
         layer_priority = {'output': 4, 'combination': 3, 'association': 2, 'hidden': 1, 'default': 0}
         candidates.sort(key=lambda n: (layer_priority.get(n.layer, 0), n.activation), reverse=True)
 
         if max_words is not None and len(candidates) > max_words:
             candidates = candidates[:max_words]
 
-        # Формируем ответ с учётом типов нейронов
         parts = []
         for n in candidates:
             if n.layer == 'association':
@@ -447,7 +436,6 @@ class AdaptiveNetwork:
         if not parts:
             return "Мне нечего сказать."
 
-        # Строим фразу с шаблоном
         if len(parts) == 1:
             response = parts[0]
         elif len(parts) == 2:
@@ -462,28 +450,33 @@ class AdaptiveNetwork:
         full_response = f"{prefix} {response}{suffix}".strip()
         return " ".join(full_response.split())
 
-    # ---------- Обучение через LLM (асинхронное) ----------
     def learn_from_llm(self, word: str) -> bool:
-        # Создаём нейрон для слова (если ещё нет)
         word_neuron = self.add_neuron(word, layer="input")
         if not self.teacher:
             print("Нет учителя LLM. Слово создано без ассоциаций.")
             return False
-        # Проверяем, есть ли уже результат в кеше
-        if word in self.llm_results:
-            data = self.llm_results[word]
-        else:
-            # Отправляем запрос в фоновый поток
+
+        with self.llm_lock:
+            if word in self.llm_results:
+                data = self.llm_results[word]
+            else:
+                data = None
+
+        if data is None:
             self.llm_queue.put((word, None))
-            # Ждём не более 2 секунд (для демонстрации)
             start = time.time()
-            while word not in self.llm_results and time.time() - start < 2.0:
+            while True:
+                with self.llm_lock:
+                    if word in self.llm_results:
+                        data = self.llm_results[word]
+                        break
+                if time.time() - start > 2.0:
+                    break
                 time.sleep(0.1)
-            data = self.llm_results.get(word)
             if data is None:
                 print(f"⚠️ LLM не вернула данные для '{word}'.")
                 return False
-        # Применяем данные для обучения
+
         required = {'sentences', 'associations', 'opposite'}
         if not all(k in data for k in required):
             print("⚠️ Ответ LLM неполный.")
@@ -505,9 +498,7 @@ class AdaptiveNetwork:
         print(f"✅ Слово '{word}' изучено.")
         return True
 
-    # ---------- Сериализация ----------
     def save(self, path: str) -> None:
-        # Преобразуем все в CSR для сохранения
         data = {
             'neurons': self.neurons,
             'name_to_neuron': self.name_to_neuron,
@@ -534,6 +525,8 @@ class AdaptiveNetwork:
         self.config = data.get('config', Config())
         for idx, n in enumerate(self.neurons):
             n.id = idx
+        # VECTORIZED: синхронизируем массивы после загрузки
+        self._sync_arrays()
         print(f"📂 Загружено из {path}")
 
     def reset_state(self) -> None:
@@ -592,7 +585,7 @@ class LLMTeacher:
             return text[start:end]
         return None
 
-# ------------------------ Основной цикл ------------------------
+# ------------------------ Основной цикл (без изменений) ------------------------
 def main():
     teacher = LLMTeacher()
     config = Config()
@@ -618,6 +611,7 @@ def main():
             continue
 
         if user_input.lower() in ('exit', 'quit'):
+            net.shutdown()
             break
         if user_input.lower() == 'reset':
             net.reset_state()
@@ -633,13 +627,11 @@ def main():
                 print("Файл не найден.")
             continue
 
-        # Изучаем новые слова (асинхронно)
         tokens = net.tokenize(user_input)
         for w in tokens:
             if w not in net.name_to_neuron:
-                net.learn_from_llm(w)   # теперь не блокирует (или блокирует недолго)
+                net.learn_from_llm(w)
 
-        # Генерация ответа
         response = net.generate_response(user_input, deterministic=False,
                                          activation_threshold=0.4,
                                          max_words=None)
