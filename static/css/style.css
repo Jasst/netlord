@@ -160,17 +160,17 @@ body {
     flex-direction: column;
     flex: 1;
     min-width: 0;
-    min-height: 0;         /* ← обязательно, чтобы дочерние элементы могли сжиматься */
+    min-height: 0;
     overflow: hidden;
     background: #0d0d0d;
 }
 
 .messages {
-    flex: 1 1 0;                 /* занимает всё доступное пространство */
-    min-height: 0;               /* критично для работы overflow */
+    flex: 1 1 0;
+    min-height: 0;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 12px 24px 24px 24px; /* увеличен нижний отступ */
+    padding: 12px 24px 24px 24px;
     scroll-padding-bottom: 24px;
     display: flex;
     flex-direction: column;
@@ -178,7 +178,7 @@ body {
 }
 
 .input-wrapper {
-    flex-shrink: 0;              /* не сжимается */
+    flex-shrink: 0;
     padding: 8px 20px 14px 20px;
 }
 
@@ -758,8 +758,8 @@ body {
 #app {
     display: flex;
     flex-direction: column;
-    height: 100%;          /* или 100vh, но 100% проще */
-    overflow: hidden;      /* чтобы ничего не вылезало */
+    height: 100%;
+    overflow: hidden;
 }
 
 #toast {
@@ -868,7 +868,78 @@ body {
         width: 54px;
     }
 }
+.learn-buttons button.search-toggle {
+    background: rgba(26, 42, 58, 0.7);
+    border-color: #2a4a5a;
+}
+.learn-buttons button.search-toggle.active {
+    background: rgba(26, 80, 120, 0.9);
+    border-color: #4a8aaa;
+    box-shadow: 0 0 12px rgba(74, 138, 170, 0.5);
+}
+/* Стиль для текста рассуждений (серый, с отступом) */
+.thinking-text {
+    color: #888;
+    font-size: 14px;
+    line-height: 1.5;
+    padding: 6px 10px;
+    background: #1a1a1a;
+    border-radius: 4px;
+    border-left: 2px solid #4a6a8a;
+    margin: 4px 0;
+    white-space: pre-wrap;
+    font-family: inherit;
+}
 
+/* Стиль для блока <details> (сворачиваемый спойлер) */
+.message details {
+    margin-bottom: 8px;
+    background: #111;
+    border-radius: 6px;
+    border: 1px solid #2a2a2a;
+    padding: 4px 10px;
+}
+
+.message details summary {
+    cursor: pointer;
+    color: #aaa;
+    font-weight: 500;
+    padding: 4px 0;
+    user-select: none;
+    transition: color 0.2s;
+}
+
+.message details summary:hover {
+    color: #ddd;
+}
+
+.message details[open] summary {
+    color: #eee;
+}
+
+.message details div {
+    padding-top: 4px;
+    border-top: 1px solid #2a2a2a;
+    margin-top: 4px;
+}
+
+
+.answer-text {
+    transition: opacity 0.3s ease;
+}
+.answer-text .fade-in {
+    animation: fadeIn 0.3s ease;
+}
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.message p {
+    margin: 0 0 0.5em 0;
+}
+.message p:last-child {
+    margin-bottom: 0;
+}
 @media (max-width: 420px) {
     .header-left h1 span {
         display: none;
