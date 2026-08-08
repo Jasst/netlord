@@ -9,3 +9,8 @@
 *.pyc
 *.pyc
 /brain/__pycache__
+brain/__pycache__/brain.cpython-313.pyc
+brain/__pycache__/config.cpython-313.pyc
+brain/__pycache__/graph.cpython-313.pyc
+brain/__pycache__/memory.cpython-313.pyc
+brain/__pycache__/search.cpython-313.pyc
