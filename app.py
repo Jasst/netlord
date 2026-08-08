@@ -13,8 +13,11 @@ from typing import Optional, List
 import atexit
 import signal
 import sys
+from openai import OpenAI
 
 from brain import CognitiveBrain, BrainConfig
+from brain.teacher import Teacher
+from agent import BrainAgent
 
 torch.set_default_dtype(torch.float32)
 
@@ -28,21 +31,31 @@ brain = CognitiveBrain(config)
 brain.load()
 brain.load_dialog_history()
 
+_llm_client = OpenAI(base_url=LM_STUDIO_BASE_URL, api_key="not-needed")
+_teacher = Teacher(llm_client=_llm_client)
+agent = BrainAgent(
+    brain=brain,
+    teacher=_teacher,
+    llm_client=_llm_client,
+    interactive_mode=False,
+    enabled=False,   # ИЗМЕНЕНО: агент выключен при старте
+)
+# ИЗМЕНЕНО: agent.start() УДАЛЁН – запускаем только по команде
+
 app = FastAPI(title="Smart Brain v10")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
+# ---------- МОДЕЛИ PYDANTIC ----------
 class AskRequest(BaseModel):
     question: str
     temperature: float = 0.7
     use_search: bool = False
     allow_clarifying: bool = True
 
-
 class LearnRequest(BaseModel):
     question: str
     answer: str
-
 
 class TrainTopicRequest(BaseModel):
     topic: str
@@ -50,11 +63,26 @@ class TrainTopicRequest(BaseModel):
     negative_ratio: float = 0.2
     epochs: int = 1
 
+class AgentToggleRequest(BaseModel):
+    enabled: bool
 
+class AgentConfigRequest(BaseModel):
+    topics: Optional[List[str]] = None
+    interval: Optional[int] = None
+    questions_per_cycle: Optional[int] = None
+    interactive_mode: Optional[bool] = None
+    user_question_timeout: Optional[int] = None
+
+class TrainPairRequest(BaseModel):
+    question: str
+    answer: str
+    epochs: int = 3
+
+
+# ---------- ЭНДПОИНТЫ ----------
 @app.post("/ask")
 async def ask(req: AskRequest):
     try:
-        # ИСПРАВЛЕНО: req.temperature раньше нигде не использовался — step() теперь его принимает.
         result = await asyncio.to_thread(
             brain.step, req.question, use_search=req.use_search, temperature=req.temperature
         )
@@ -94,6 +122,26 @@ async def learn(req: LearnRequest):
         return {"status": "learned"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/learn_neg")
+async def learn_neg(req: LearnRequest):
+    try:
+        await asyncio.to_thread(brain.learn_negative_pair, req.question, req.answer)
+        await asyncio.to_thread(brain.save)
+        return {"status": "learned_negative"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/train_pair")
+async def train_pair(req: TrainPairRequest):
+    try:
+        await asyncio.to_thread(brain.learn_pair, req.question, req.answer, epochs=req.epochs)
+        await asyncio.to_thread(brain.save)
+        return {"status": "ok", "epochs": req.epochs}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 @app.post("/train_topic")
@@ -143,14 +191,81 @@ async def get_messages(limit: int = 50):
     return {"messages": brain.dialog_memory[-limit:]}
 
 
+# ---------- УПРАВЛЕНИЕ АГЕНТОМ ----------
+@app.get("/agent/status")
+async def agent_status():
+    return {
+        "enabled": agent.enabled,
+        "topic_confidence": agent.topic_confidence,
+        "interactive_mode": agent.interactive_mode,
+    }
+
+
+@app.post("/agent/toggle")
+async def agent_toggle(req: AgentToggleRequest):
+    agent.enabled = req.enabled
+    return {"enabled": agent.enabled}
+
+
+@app.post("/agent/start")
+async def agent_start():
+    agent.enabled = True
+    agent.start()   # ИЗМЕНЕНО: реальный запуск потока
+    return {"status": "started"}
+
+
+@app.post("/agent/stop")
+async def agent_stop():
+    agent.enabled = False
+    agent.stop()    # ИЗМЕНЕНО: реальная остановка потока
+    return {"status": "stopped"}
+
+
+@app.get("/agent/next_question")
+async def agent_next_question():
+    q = agent.get_next_question()
+    if q:
+        return {"question": q}
+    return {"question": None}
+
+
+@app.post("/agent/submit_answer")
+async def agent_submit_answer(req: dict):
+    question = req.get("question")
+    answer = req.get("answer")
+    if not question or not answer:
+        raise HTTPException(400, "Missing question or answer")
+    agent.submit_answer(question, answer)
+    return {"status": "accepted"}
+
+
+@app.post("/agent/config")
+async def agent_config(req: AgentConfigRequest):
+    if req.topics is not None:
+        agent.topics = req.topics
+        agent.topic_confidence = {t: 0.5 for t in req.topics}
+        agent.asked_questions = {t: [] for t in req.topics}
+    if req.interval is not None:
+        agent.interval = req.interval
+    if req.questions_per_cycle is not None:
+        agent.questions_per_cycle = req.questions_per_cycle
+    if req.interactive_mode is not None:
+        agent.interactive_mode = req.interactive_mode
+    if req.user_question_timeout is not None:
+        agent.user_question_timeout = req.user_question_timeout
+    return {"status": "updated", "topics": agent.topics}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     with open("templates/index.html", "r", encoding="utf-8") as f:
         return f.read()
 
 
+# ---------- ЗАВЕРШЕНИЕ ----------
 def save_brain():
     print("\n💾 Сохраняем модель...")
+    agent.stop()
     brain.save()
     brain.save_dialog_history()
 

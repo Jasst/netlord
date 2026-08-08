@@ -7,6 +7,7 @@ import json
 import os
 import time
 import re
+import random
 import threading
 import pickle
 import requests
@@ -99,7 +100,12 @@ class EWC:
                 self.anchor[name] = param.data.clone()
 
     def penalty(self) -> torch.Tensor:
-        loss = torch.tensor(0.0)
+        # ИСПРАВЛЕНО: torch.tensor(0.0) раньше всегда создавался на CPU. Если модель
+        # на CUDA (self.device в CognitiveBrain), сложение с fisher/param (cuda-тензоры)
+        # кидало RuntimeError: device mismatch — EWC гарантированно ронял обучение на GPU.
+        params = list(self.model.parameters())
+        device = params[0].device if params else torch.device("cpu")
+        loss = torch.zeros((), device=device)
         for name, param in self.model.named_parameters():
             if not param.requires_grad or name not in self.fisher or name not in self.anchor:
                 continue
@@ -135,11 +141,17 @@ class CognitiveBrain(nn.Module):
         self.embedder = EmbeddingProvider(dim=self.dim, model_name=config.embedding_model)
 
         if config.use_hierarchical_graph:
+            # ПЕРЕАНАЛИЗИРОВАНО: конструктор HierarchicalGraph больше не принимает
+            # attn_heads (глобальный self-attention по всем узлам удалён — см. graph.py).
+            # Вместо этого передаём параметры реальной иерархии (кластеризация +
+            # top-down модуляция), которые раньше нигде не были нужны, т.к. верхние
+            # уровни были мёртвым кодом.
             self.graph = HierarchicalGraph(
                 dims=config.graph_levels,
                 num_heads=config.gnn_num_heads,
                 num_layers=config.gnn_num_layers,
-                attn_heads=config.attention_heads
+                cluster_threshold=config.hierarchy_cluster_threshold,
+                min_cluster_size=config.hierarchy_min_cluster_size,
             ).to(self.device)
         else:
             self.graph = DifferentiableNeuralGraph(
@@ -217,10 +229,14 @@ class CognitiveBrain(nn.Module):
         q_vec = self.text_to_embedding(q, is_query=True)
         a_vec = self.text_to_embedding(a, is_query=False)
 
+        # ИЗМЕНЕНО: порог дедупликации берётся из config (было захардкожено 0.6 —
+        # для e5-large-v2 слишком низко, разные факты схлопывались в один узел).
+        merge_threshold = self.config.node_merge_threshold
+
         if hasattr(self.graph, 'levels'):
-            q_nid = self.graph.find_most_similar(q_vec, level_idx=0, threshold=0.6)
+            q_nid = self.graph.find_most_similar(q_vec, level_idx=0, threshold=merge_threshold)
         else:
-            q_nid = self.graph.find_most_similar(q_vec, threshold=0.6)
+            q_nid = self.graph.find_most_similar(q_vec, threshold=merge_threshold)
 
         if q_nid is None:
             q_nid = self.graph.add_node(q_vec, label=q[:30], cluster="concept", layer=0,
@@ -228,9 +244,9 @@ class CognitiveBrain(nn.Module):
             self.concept_index[self._normalize(q)] = q_nid
 
         if hasattr(self.graph, 'levels'):
-            a_nid = self.graph.find_most_similar(a_vec, level_idx=0, threshold=0.6)
+            a_nid = self.graph.find_most_similar(a_vec, level_idx=0, threshold=merge_threshold)
         else:
-            a_nid = self.graph.find_most_similar(a_vec, threshold=0.6)
+            a_nid = self.graph.find_most_similar(a_vec, threshold=merge_threshold)
 
         if a_nid is None:
             a_nid = self.graph.add_node(a_vec, label=a[:30], cluster="concept", layer=0,
@@ -253,18 +269,39 @@ class CognitiveBrain(nn.Module):
             self.memory.add_semantic_triple(q, "has_answer", a, confidence=reward)
 
     def _contrastive_loss(self, q_nid: int, a_nid: int) -> torch.Tensor:
-        # ИЗМЕНЕНО: раньше loss считался по СЫРЫМ node_emb — GATv2Conv/LayerNorm/attention
-        # не получали ни одного градиента за всё время работы системы (мёртвый код).
-        # Теперь loss считается по h = graph.forward() — контекстуализированному эмбеддингу
-        # (с учётом соседей по графу), поэтому слои message passing реально обучаются
-        # различать, какие связи усиливают смысл, а какие — шум.
+        """
+        ПЕРЕАНАЛИЗИРОВАНО: раньше loss тянул ТОЛЬКО пару (q, a) друг к другу
+        (-log(sigmoid(sim*10))) и не имел ни одного отталкивающего сигнала. При
+        общих для всех узлов весах GAT это со временем схлопывало ВСЕ эмбеддинги
+        графа друг в друга (representation collapse) — отсюда "векторы/нейроны
+        не работают как задумано": обучение технически "успешно" минимизировало
+        loss, просто выродившись в тривиальное решение.
+
+        Теперь это InfoNCE: положительная пара (q, a) плюс num_negatives случайных
+        других узлов графа как негативы — модель обучается не просто "сближать",
+        а РАЗЛИЧАТЬ, что и требуется для осмысленной ассоциативной сети.
+        """
         h = self.graph.forward()
-        emb_q = h[q_nid - 1]
-        emb_a = h[a_nid - 1]
-        emb_q = F.normalize(emb_q.unsqueeze(0), p=2, dim=1)
-        emb_a = F.normalize(emb_a.unsqueeze(0), p=2, dim=1)
-        sim = F.cosine_similarity(emb_q, emb_a, dim=1)
-        loss = -torch.log(torch.sigmoid(sim * 10.0)).mean()
+        n = h.shape[0]
+        emb_q = F.normalize(h[q_nid - 1].unsqueeze(0), p=2, dim=1)
+        emb_a = F.normalize(h[a_nid - 1].unsqueeze(0), p=2, dim=1)
+        pos_sim = (emb_q * emb_a).sum(dim=1) * 10.0  # temperature
+
+        num_negatives = self.config.contrastive_num_negatives
+        candidates = [i for i in range(n) if i not in (q_nid - 1, a_nid - 1)]
+        k = min(num_negatives, len(candidates))
+        if k > 0:
+            neg_idx = torch.tensor(random.sample(candidates, k), device=h.device)
+            emb_neg = F.normalize(h[neg_idx], p=2, dim=1)
+            neg_sim = (emb_q @ emb_neg.T).squeeze(0) * 10.0
+            logits = torch.cat([pos_sim, neg_sim]).unsqueeze(0)
+            labels = torch.zeros(1, dtype=torch.long, device=h.device)
+            loss = F.cross_entropy(logits, labels)
+        else:
+            # Недостаточно узлов для негативов (самое начало жизни графа) —
+            # откатываемся на старую формулу, чтобы не падать.
+            loss = -torch.log(torch.sigmoid(pos_sim)).mean()
+
         if hasattr(self.graph, 'get_edge_weights'):
             edge_w = self.graph.get_edge_weights()
             if edge_w.numel() > 0:
@@ -335,7 +372,7 @@ class CognitiveBrain(nn.Module):
 
         # ИЗМЕНЕНО: точку входа в граф ищем по КОНТЕКСТУАЛИЗИРОВАННОМУ эмбеддингу
         # (find_most_similar_contextual), а не по сырому — так на выбор узла уже влияют
-        # его связи в графе, а не только буквальный текст.
+        # его связи в графе (и теперь ещё top-down модуляция от верхних уровней иерархии).
         if hasattr(self.graph, 'levels'):
             start_nid = self.graph.find_most_similar_contextual(query_vec, level_idx=0, threshold=0.5)
         else:
@@ -502,6 +539,12 @@ class CognitiveBrain(nn.Module):
         with self.lock:
             print("💤 Сон... (консолидация памяти)")
             self.memory.consolidate(threshold=0.05)
+            # НОВОЕ: здесь, а не на каждом шаге, перестраивается иерархия графа —
+            # кластеризация узлов уровня i в абстракции уровня i+1 (см. graph.py).
+            # Это дорогая (O(n^2) по числу узлов уровня) и не градиентная операция,
+            # поэтому её место — в периодической консолидации "во сне", а не в step().
+            if hasattr(self.graph, "rebuild_hierarchy"):
+                self.graph.rebuild_hierarchy(optimizer=self.optimizer)
             if self.ewc is not None:
                 self.ewc.set_anchor()  # периодически фиксируем "опорные" веса для EWC
             print("😴 Сон завершён")

@@ -26,8 +26,15 @@ class DifferentiableNeuralGraph(nn.Module):
         super().__init__()
         self.dim = dim
         self.max_nodes = max_nodes
-        self.node_emb = nn.Parameter(torch.randn(1, dim) * 0.01)
-        self.node_mask = torch.ones(1, dtype=torch.bool)
+
+        # ИСПРАВЛЕНО: раньше здесь создавался "нейрон-призрак" —
+        # nn.Parameter(torch.randn(1, dim) * 0.01) — случайный, без label/type,
+        # ни с чем не связанный синапсами. Он не участвовал в message passing
+        # (нет рёбер), но раньше (в HierarchicalGraph) участвовал в глобальном
+        # self-attention по ВСЕМ узлам и постоянно подмешивал случайный шум в
+        # контекст остальных нейронов. Граф теперь стартует пустым — первый
+        # add_node создаёт узел с id=1, а не "въезжает" во второй слот после мусора.
+        self.node_emb = nn.Parameter(torch.zeros(0, dim))
 
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -112,6 +119,8 @@ class DifferentiableNeuralGraph(nn.Module):
         """
         if x is None:
             x = self.node_emb
+        if x.shape[0] == 0:
+            return x
         if self._edge_index is None or self._edge_index.size(1) == 0:
             return x
 
@@ -180,7 +189,7 @@ class DifferentiableNeuralGraph(nn.Module):
         weights = [w for w in self._edge_weights]
         return torch.cat([w.view(1) for w in weights])
 
-    def find_most_similar(self, query: torch.Tensor, threshold: float = 0.8) -> Optional[int]:
+    def find_most_similar(self, query: torch.Tensor, threshold: float = 0.87) -> Optional[int]:
         """Строгое сравнение по СЫРОМУ содержимому узла — используется при обучении,
         чтобы не плодить дублирующие узлы для почти идентичного текста."""
         if self.node_emb.shape[0] == 0:
@@ -194,10 +203,10 @@ class DifferentiableNeuralGraph(nn.Module):
     def find_most_similar_contextual(self, query: torch.Tensor, threshold: float = 0.6) -> Optional[int]:
         """
         Сравнение по КОНТЕКСТУАЛИЗИРОВАННОМУ (после message passing) эмбеддингу узла —
-        используется при поиске точки входа для "мышления"/ответа. Значение узла здесь
-        формируется не только его исходным текстом, но и тем, с чем он связан в графе —
-        то есть граф уже привносит "понимание", а не просто хранит вектора.
+        используется при поиске точки входа для "мышления"/ответа.
         """
+        if self.node_emb.shape[0] == 0:
+            return None
         with torch.no_grad():
             h = self.forward()
         if h.shape[0] == 0:
@@ -210,14 +219,35 @@ class DifferentiableNeuralGraph(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# Иерархический граф с несколькими уровнями и self-attention
+# Иерархический граф с несколькими уровнями.
+#
+# ПЕРЕАНАЛИЗИРОВАНО: раньше forward() честно считал все уровни, но возвращал
+# только outputs[0] — уровни 1/2 не влияли ни на loss, ни на ответ (мёртвый
+# код), а "иерархическая" связь между уровнями была подменена ГЛОБАЛЬНЫМ
+# nn.MultiheadAttention по ВСЕМ узлам сразу — это игнорировало синапсы
+# полностью (O(N^2), без учёта топологии) и было прямой причиной
+# нестабильности обучения (см. чат).
+#
+# Идея сохранена и достроена: уровень 0 — граф фактов, обучаемый через
+# синапсы (GAT). Уровни выше — это НЕ отдельные независимые графы, а
+# АБСТРАКЦИИ уровня 0: узел уровня i+1 = центроид кластера близких по смыслу
+# узлов уровня i (см. rebuild_hierarchy — вызывается из sleep(), не на
+# каждом шаге, т.к. кластеризация — это дорого и не обучаемый градиентом
+# процесс, а периодическая консолидация, как и должно быть в модели памяти).
+# Верхний уровень затем влияет на нижний TOP-DOWN модуляцией его
+# контекстуализированного эмбеддинга — это и есть настоящая иерархия.
 # ----------------------------------------------------------------------
 class HierarchicalGraph(nn.Module):
-    def __init__(self, dims: List[int], num_heads: int = 4, num_layers: int = 2, attn_heads: int = 8):
+    def __init__(self, dims: List[int], num_heads: int = 4, num_layers: int = 2,
+                 cluster_threshold: float = 0.75, min_cluster_size: int = 2):
         super().__init__()
+        self.dims = dims
         self.levels = nn.ModuleList()
-        self.cross_attn = nn.ModuleList()
-        self.attentions = nn.ModuleList()
+        self.level_projections = nn.ModuleList()  # уровень i -> размерность уровня i+1 (вниз, для кластеризации)
+        self.up_projections = nn.ModuleList()      # уровень i+1 -> размерность уровня i (наверх->вниз, модуляция)
+
+        self.cluster_threshold = cluster_threshold
+        self.min_cluster_size = min_cluster_size
 
         for i, d in enumerate(dims):
             level_graph = DifferentiableNeuralGraph(
@@ -228,9 +258,12 @@ class HierarchicalGraph(nn.Module):
                 num_layers=num_layers
             )
             self.levels.append(level_graph)
-            self.attentions.append(nn.MultiheadAttention(d, attn_heads, batch_first=True))
             if i < len(dims) - 1:
-                self.cross_attn.append(nn.Linear(d, dims[i + 1]))
+                self.level_projections.append(nn.Linear(d, dims[i + 1]))
+                self.up_projections.append(nn.Linear(dims[i + 1], d))
+
+        # cluster_of[i][node_idx_0based_на_уровне_i] = node_id_1based_на_уровне_i+1
+        self.cluster_of: List[Dict[int, int]] = [dict() for _ in range(len(dims) - 1)]
 
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden",
                  layer: int = 0, node_type: NodeType = NodeType.CONCEPT,
@@ -242,30 +275,109 @@ class HierarchicalGraph(nn.Module):
                      level_idx: int = 0, optimizer=None) -> int:
         return self.levels[level_idx].add_synapse(from_id, to_id, weight, optimizer=optimizer)
 
-    def find_most_similar(self, query: torch.Tensor, level_idx: int = 0, threshold: float = 0.8) -> Optional[int]:
+    def find_most_similar(self, query: torch.Tensor, level_idx: int = 0, threshold: float = 0.87) -> Optional[int]:
         return self.levels[level_idx].find_most_similar(query, threshold)
 
     def find_most_similar_contextual(self, query: torch.Tensor, level_idx: int = 0,
                                       threshold: float = 0.6) -> Optional[int]:
-        return self.levels[level_idx].find_most_similar_contextual(query, threshold)
+        """
+        ИЗМЕНЕНО: для level_idx=0 точка входа теперь ищется по ПОЛНОМУ иерархическому
+        forward() (с top-down модуляцией верхних уровней), а не по локальному GAT
+        уровня 0 в изоляции — верхние уровни (темы/абстракции) реально участвуют
+        в том, какой нейрон граф сочтёт "похожим" на вопрос.
+        """
+        if level_idx != 0:
+            return self.levels[level_idx].find_most_similar_contextual(query, threshold)
+        with torch.no_grad():
+            h = self.forward()
+        if h.shape[0] == 0:
+            return None
+        sim = F.cosine_similarity(query.unsqueeze(0), h, dim=1)
+        best_idx = torch.argmax(sim).item()
+        if sim[best_idx] >= threshold:
+            return best_idx + 1
+        return None
 
     def spreading_activation(self, start_id: int, level_idx: int = 0, **kwargs) -> List[Tuple[int, float]]:
         return self.levels[level_idx].spreading_activation(start_id, **kwargs)
 
+    # ------------------------------------------------------------------
     def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
-        outputs = []
-        h = x
-        for i, (g, attn) in enumerate(zip(self.levels, self.attentions)):
-            level_input = h if h is not None else None
-            h_level = g(level_input)
-            h_level, _ = attn(h_level.unsqueeze(0), h_level.unsqueeze(0), h_level.unsqueeze(0))
-            h_level = h_level.squeeze(0)
-            outputs.append(h_level)
-            if i < len(self.levels) - 1:
-                h = self.cross_attn[i](h_level)
-            else:
-                h = h_level
-        return outputs[0]
+        """
+        Снизу вверх: каждый уровень контекстуализируется своим собственным GAT
+        по своим синапсам (никакого глобального attention по чужим узлам).
+        Сверху вниз: если для узлов уровня i есть кластеризация на уровень i+1
+        (построена в rebuild_hierarchy), их эмбеддинг модулируется спроецированным
+        вниз эмбеддингом их кластера-абстракции.
+        """
+        hs = [self.levels[0].forward(x)]
+        for i in range(1, len(self.levels)):
+            hs.append(self.levels[i].forward())
+
+        for i in range(len(self.levels) - 2, -1, -1):
+            if i >= len(self.cluster_of) or not self.cluster_of[i]:
+                continue
+            if hs[i].shape[0] == 0 or hs[i + 1].shape[0] == 0:
+                continue
+            up = self.up_projections[i](hs[i + 1])
+            modulation = torch.zeros_like(hs[i])
+            for node_idx, cluster_id in self.cluster_of[i].items():
+                if node_idx < hs[i].shape[0] and (cluster_id - 1) < up.shape[0]:
+                    modulation[node_idx] = up[cluster_id - 1]
+            hs[i] = hs[i] + 0.2 * modulation
+        return hs[0]
+
+    def rebuild_hierarchy(self, optimizer=None):
+        """
+        Периодическая (не end-to-end дифференцируемая) переагрегация иерархии.
+        Вызывать из sleep(), а не на каждом шаге — кластеризация стоит O(n^2)
+        по числу узлов уровня и не должна идти в backward-графе.
+
+        Для каждого уровня i (кроме последнего): берём контекстуализированные
+        (после GAT) эмбеддинги узлов, проецируем в размерность уровня i+1,
+        жадно группируем по порогу косинусной близости (cluster_threshold).
+        Каждый кластер размера >= min_cluster_size поднимается как один узел
+        уровня i+1 (центроид), и запоминается сопоставление cluster_of[i].
+        Кластеры из одного узла не поднимаются — единичный факт не абстракция.
+        """
+        for i in range(len(self.levels) - 1):
+            lower = self.levels[i]
+            n = lower.node_emb.shape[0]
+            if n == 0:
+                continue
+            with torch.no_grad():
+                h = lower.forward()
+                proj = self.level_projections[i](h)
+                proj = F.normalize(proj, p=2, dim=1)
+
+            assigned = [False] * n
+            clusters: List[List[int]] = []
+            for a in range(n):
+                if assigned[a]:
+                    continue
+                cluster = [a]
+                assigned[a] = True
+                for b in range(a + 1, n):
+                    if assigned[b]:
+                        continue
+                    sim = float(F.cosine_similarity(proj[a].unsqueeze(0), proj[b].unsqueeze(0)))
+                    if sim >= self.cluster_threshold:
+                        cluster.append(b)
+                        assigned[b] = True
+                clusters.append(cluster)
+
+            upper = self.levels[i + 1]
+            new_assignment: Dict[int, int] = {}
+            for cluster in clusters:
+                if len(cluster) < self.min_cluster_size:
+                    continue
+                centroid = F.normalize(proj[cluster].mean(dim=0), p=2, dim=0)
+                label = f"cluster_of_{len(cluster)}"
+                cid = upper.add_node(centroid.detach(), label=label, cluster="abstraction",
+                                      layer=i + 1, node_type=NodeType.CONCEPT, optimizer=optimizer)
+                for member in cluster:
+                    new_assignment[member] = cid
+            self.cluster_of[i] = new_assignment
 
     def get_level_embeddings(self, level_idx: int) -> torch.Tensor:
         return self.levels[level_idx].node_emb

@@ -200,3 +200,51 @@ class BrainAgent:
             self.brain.dialog_memory.append({"user": question, "assistant": answer, "time": time.time()})
         else:
             print(f"[Agent] Ответ на неактивный вопрос: {question} (активный: {self.active_question})")
+
+
+# ----------------------------------------------------------------------
+# НОВОЕ: точка входа для автономного запуска БЕЗ app.py — например, для
+# теста агента отдельно от API. В обычной работе предпочтительнее
+# интеграция в app.py (см. изменения там) — там агент и API делят один
+# и тот же экземпляр CognitiveBrain, что важно: если запустить agent.py
+# и app.py как два ОТДЕЛЬНЫХ процесса на одном model_dir, они будут
+# независимо друг друга перезаписывать при save() — гонка данных.
+# Используйте этот блок только когда app.py не запущен параллельно.
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    import signal
+    import sys
+    from brain import BrainConfig
+
+    config = BrainConfig()
+    brain = CognitiveBrain(config)
+    brain.load()
+    brain.load_dialog_history()
+
+    llm_client = OpenAI(base_url=config.llm_base_url, api_key="not-needed")
+    teacher = Teacher(llm_client=llm_client)
+
+    agent = BrainAgent(
+        brain=brain,
+        teacher=teacher,
+        llm_client=llm_client,
+        interactive_mode=False,  # True — если хотите, чтобы агент периодически спрашивал ВАС
+    )
+
+    def _shutdown():
+        print("\n[Agent] Остановка и сохранение...")
+        agent.stop()
+        brain.save()
+        brain.save_dialog_history()
+
+    signal.signal(signal.SIGINT, lambda s, f: (_shutdown(), sys.exit(0)))
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, lambda s, f: (_shutdown(), sys.exit(0)))
+
+    agent.start()
+    print("[Agent] Работает в фоне. Ctrl+C для остановки.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        _shutdown()

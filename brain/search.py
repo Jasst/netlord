@@ -1,9 +1,9 @@
 # brain/search.py
 from typing import List, Dict, Optional
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 class WebSearcher:
-    def __init__(self, max_results: int = 3, timeout: int = 10):
+    def __init__(self, max_results: int = 6, timeout: int = 15):
         self.max_results = max_results
         self.timeout = timeout
 
