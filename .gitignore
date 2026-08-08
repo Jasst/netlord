@@ -7,3 +7,4 @@
 *.jsonl
 /brain/__pycache__
 *.pyc
+*.pyc
