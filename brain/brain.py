@@ -23,66 +23,44 @@ from brain.search import WebSearcher
 
 
 # ----------------------------------------------------------------------
-# Вспомогательные модули
+# Вспомогательные модули (без изменений)
 # ----------------------------------------------------------------------
 class CuriosityModule:
     def __init__(self, lr: float = 0.01):
         self.lr = lr
-
     def compute_reward(self, query_vec: torch.Tensor, predicted_vec: torch.Tensor, actual_vec: torch.Tensor) -> float:
         error = F.mse_loss(predicted_vec, actual_vec)
         return error.item()
 
-
 class Planner:
     def __init__(self, llm: LLMInterface):
         self.llm = llm
-
     def plan(self, question: str, context: str) -> List[str]:
         prompt = f"Составь план действий для ответа на вопрос: {question}\nКонтекст: {context}\nПлан (каждый пункт с новой строки):"
         plan_text = self.llm.generate(prompt, max_tokens=60, temperature=0.5)
         lines = [line.strip() for line in plan_text.split('\n') if line.strip()]
         return lines if lines else ["answer_directly"]
 
-
 class Reflector:
     def __init__(self, llm: LLMInterface):
         self.llm = llm
-
     def should_reflect(self, answer: str) -> bool:
         if len(answer.split()) < 3 or "не знаю" in answer.lower():
             return True
         return False
-
     def reflect(self, question: str, answer: str) -> str:
         prompt = f"Исправь и улучши ответ на вопрос '{question}'. Текущий ответ: '{answer}'. Улучшенный ответ:"
         improved = self.llm.generate(prompt, max_tokens=150, temperature=0.3)
         return improved if improved.strip() else answer
 
-
 class EWC:
-    """
-    ИСПРАВЛЕНО: раньше EWC был полностью инертным — compute_fisher() требовал
-    dataset_loader, который нигде в коде не создаётся и не вызывается, поэтому
-    self.fisher оставался пустым словарём навсегда, penalty() всегда возвращал 0,
-    и защиты от catastrophic forgetting фактически не было, несмотря на
-    config.enable_ewc=True.
-
-    Теперь это "online EWC-lite": Fisher-информация оценивается как скользящее
-    среднее квадрата градиента прямо в процессе обучения (accumulate() вызывается
-    после каждого backward()), а якорные веса (anchor) обновляются периодически
-    (set_anchor(), вызывается из sleep()). При изменении формы параметра
-    (граф вырос) старая Fisher/anchor для него просто пропускаются — без падений.
-    """
     def __init__(self, model: nn.Module, lambda_: float = 0.1, decay: float = 0.99):
         self.model = model
         self.lambda_ = lambda_
         self.decay = decay
         self.fisher: Dict[str, torch.Tensor] = {}
         self.anchor: Dict[str, torch.Tensor] = {}
-
     def accumulate(self):
-        """Вызывать после loss.backward(), до optimizer.zero_grad()."""
         for name, param in self.model.named_parameters():
             if not (param.requires_grad and param.grad is not None):
                 continue
@@ -92,17 +70,11 @@ class EWC:
                 self.anchor[name] = param.data.clone()
             else:
                 self.fisher[name].mul_(self.decay).add_(g2, alpha=1 - self.decay)
-
     def set_anchor(self):
-        """Зафиксировать текущие веса как опорные (периодически, напр. в sleep())."""
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.anchor[name] = param.data.clone()
-
     def penalty(self) -> torch.Tensor:
-        # ИСПРАВЛЕНО: torch.tensor(0.0) раньше всегда создавался на CPU. Если модель
-        # на CUDA (self.device в CognitiveBrain), сложение с fisher/param (cuda-тензоры)
-        # кидало RuntimeError: device mismatch — EWC гарантированно ронял обучение на GPU.
         params = list(self.model.parameters())
         device = params[0].device if params else torch.device("cpu")
         loss = torch.zeros((), device=device)
@@ -110,7 +82,7 @@ class EWC:
             if not param.requires_grad or name not in self.fisher or name not in self.anchor:
                 continue
             if self.fisher[name].shape != param.shape:
-                continue  # параметр вырос/изменился с момента последней оценки
+                continue
             loss = loss + (self.fisher[name] * (param - self.anchor[name]) ** 2).sum()
         return self.lambda_ * loss
 
@@ -119,9 +91,6 @@ class EWC:
 # Основной класс CognitiveBrain
 # ----------------------------------------------------------------------
 class CognitiveBrain(nn.Module):
-    # ИЗМЕНЕНО: LLM здесь — не источник знаний, а язык выражения графа.
-    # Она не должна "думать за себя" — думает граф (spreading activation),
-    # LLM только облекает уже активированные графом ассоциации в связный текст.
     SYSTEM_PROMPT = (
         "Ты — речевой аппарат когнитивного графа Smart Brain, а не самостоятельный источник знаний. "
         "Ниже дан 'поток ассоциаций' — концепты и факты, которые граф активировал в ответ на вопрос "
@@ -141,11 +110,6 @@ class CognitiveBrain(nn.Module):
         self.embedder = EmbeddingProvider(dim=self.dim, model_name=config.embedding_model)
 
         if config.use_hierarchical_graph:
-            # ПЕРЕАНАЛИЗИРОВАНО: конструктор HierarchicalGraph больше не принимает
-            # attn_heads (глобальный self-attention по всем узлам удалён — см. graph.py).
-            # Вместо этого передаём параметры реальной иерархии (кластеризация +
-            # top-down модуляция), которые раньше нигде не были нужны, т.к. верхние
-            # уровни были мёртвым кодом.
             self.graph = HierarchicalGraph(
                 dims=config.graph_levels,
                 num_heads=config.gnn_num_heads,
@@ -177,9 +141,6 @@ class CognitiveBrain(nn.Module):
 
         self.searcher = WebSearcher(max_results=5)
 
-        # Оптимизатор создаётся один раз — рост графа (add_node/add_synapse) теперь
-        # САМ синхронизирует новые параметры с этим оптимизатором (см. graph.py),
-        # поэтому дополнительной пересборки здесь не требуется.
         self.optimizer = optim.Adam(self.graph.parameters(), lr=config.learning_rate)
 
         self.step_counter = 0
@@ -208,14 +169,9 @@ class CognitiveBrain(nn.Module):
         return self.graph(input_vec)
 
     def text_to_embedding(self, text: str, is_query: bool = True) -> torch.Tensor:
-        """
-        is_query=True  — для вопросов/поисковых запросов пользователя.
-        is_query=False — для сохраняемого контента (ответы, факты, "пассажи").
-        Раньше везде стоял режим query, что портило качество ретрива e5-моделью.
-        """
         return self.embedder.get_embedding(text, is_query=is_query).to(self.device)
 
-    # ---------- Обучение ----------
+    # ---------- Обучение (без изменений) ----------
     def learn_pair(self, input_text: str, output_text: str, reward: float = 1.0, epochs: int = 1):
         with self.lock:
             for _ in range(epochs):
@@ -228,16 +184,12 @@ class CognitiveBrain(nn.Module):
     def _learn_from_pair(self, q: str, a: str, reward: float):
         q_vec = self.text_to_embedding(q, is_query=True)
         a_vec = self.text_to_embedding(a, is_query=False)
-
-        # ИЗМЕНЕНО: порог дедупликации берётся из config (было захардкожено 0.6 —
-        # для e5-large-v2 слишком низко, разные факты схлопывались в один узел).
         merge_threshold = self.config.node_merge_threshold
 
         if hasattr(self.graph, 'levels'):
             q_nid = self.graph.find_most_similar(q_vec, level_idx=0, threshold=merge_threshold)
         else:
             q_nid = self.graph.find_most_similar(q_vec, threshold=merge_threshold)
-
         if q_nid is None:
             q_nid = self.graph.add_node(q_vec, label=q[:30], cluster="concept", layer=0,
                                          node_type=NodeType.CONCEPT, optimizer=self.optimizer)
@@ -247,7 +199,6 @@ class CognitiveBrain(nn.Module):
             a_nid = self.graph.find_most_similar(a_vec, level_idx=0, threshold=merge_threshold)
         else:
             a_nid = self.graph.find_most_similar(a_vec, threshold=merge_threshold)
-
         if a_nid is None:
             a_nid = self.graph.add_node(a_vec, label=a[:30], cluster="concept", layer=0,
                                          node_type=NodeType.CONCEPT, optimizer=self.optimizer)
@@ -269,24 +220,11 @@ class CognitiveBrain(nn.Module):
             self.memory.add_semantic_triple(q, "has_answer", a, confidence=reward)
 
     def _contrastive_loss(self, q_nid: int, a_nid: int) -> torch.Tensor:
-        """
-        ПЕРЕАНАЛИЗИРОВАНО: раньше loss тянул ТОЛЬКО пару (q, a) друг к другу
-        (-log(sigmoid(sim*10))) и не имел ни одного отталкивающего сигнала. При
-        общих для всех узлов весах GAT это со временем схлопывало ВСЕ эмбеддинги
-        графа друг в друга (representation collapse) — отсюда "векторы/нейроны
-        не работают как задумано": обучение технически "успешно" минимизировало
-        loss, просто выродившись в тривиальное решение.
-
-        Теперь это InfoNCE: положительная пара (q, a) плюс num_negatives случайных
-        других узлов графа как негативы — модель обучается не просто "сближать",
-        а РАЗЛИЧАТЬ, что и требуется для осмысленной ассоциативной сети.
-        """
         h = self.graph.forward()
         n = h.shape[0]
         emb_q = F.normalize(h[q_nid - 1].unsqueeze(0), p=2, dim=1)
         emb_a = F.normalize(h[a_nid - 1].unsqueeze(0), p=2, dim=1)
-        pos_sim = (emb_q * emb_a).sum(dim=1) * 10.0  # temperature
-
+        pos_sim = (emb_q * emb_a).sum(dim=1) * 10.0
         num_negatives = self.config.contrastive_num_negatives
         candidates = [i for i in range(n) if i not in (q_nid - 1, a_nid - 1)]
         k = min(num_negatives, len(candidates))
@@ -298,10 +236,7 @@ class CognitiveBrain(nn.Module):
             labels = torch.zeros(1, dtype=torch.long, device=h.device)
             loss = F.cross_entropy(logits, labels)
         else:
-            # Недостаточно узлов для негативов (самое начало жизни графа) —
-            # откатываемся на старую формулу, чтобы не падать.
             loss = -torch.log(torch.sigmoid(pos_sim)).mean()
-
         if hasattr(self.graph, 'get_edge_weights'):
             edge_w = self.graph.get_edge_weights()
             if edge_w.numel() > 0:
@@ -312,36 +247,35 @@ class CognitiveBrain(nn.Module):
         with self.lock:
             q_vec = self.text_to_embedding(input_text, is_query=True)
             a_vec = self.text_to_embedding(output_text, is_query=False)
-
             if hasattr(self.graph, 'levels'):
                 q_nid = self.graph.find_most_similar(q_vec, level_idx=0, threshold=0.0)
                 a_nid = self.graph.find_most_similar(a_vec, level_idx=0, threshold=0.0)
             else:
                 q_nid = self.graph.find_most_similar(q_vec, threshold=0.0)
                 a_nid = self.graph.find_most_similar(a_vec, threshold=0.0)
-
             if q_nid is None:
                 q_nid = self.graph.add_node(q_vec, label=input_text[:30], cluster="output", layer=0,
                                              node_type=NodeType.CONCEPT, optimizer=self.optimizer)
             if a_nid is None:
                 a_nid = self.graph.add_node(a_vec, label=output_text[:30], cluster="output", layer=0,
                                              node_type=NodeType.CONCEPT, optimizer=self.optimizer)
-
             self.graph.add_synapse(q_nid, a_nid, weight=-penalty, optimizer=self.optimizer)
             self._learn_counter += 1
             if self._learn_counter % self.config.checkpoint_every == 0:
                 self.save()
 
-    # ---------- Основной шаг ----------
+    # ---------- Основной шаг (ИЗМЕНЁН) ----------
     def step(self, input_text: str, use_search: bool = False, temperature: Optional[float] = None) -> Dict[str, Any]:
         self.step_counter += 1
 
+        # Планирование
         if self.planner is not None:
             context = self._build_context(input_text, [], None)
             plan = self.planner.plan(input_text, context)
             if "search" in plan or "поиск" in plan:
                 use_search = True
 
+        # Обработка крипто (без изменений)
         lower = input_text.lower()
         if any(kw in lower for kw in ["биткоин", "btc", "курс биткоина"]):
             price = self._get_crypto_price("bitcoin", "usd")
@@ -350,12 +284,13 @@ class CognitiveBrain(nn.Module):
                 self._update_after_step(input_text, answer)
                 return {"input": input_text, "answer": answer, "activated_neurons": [], "memory_results": []}
 
+        # Поиск в интернете
         if use_search:
             enhanced = self._enhance_search_query(input_text)
             results = self.searcher.search(enhanced)
             if results:
                 context = self._build_search_context(input_text, enhanced, results)
-                answer = self.llm.generate(
+                full_answer = self.llm.generate(
                     context,
                     system=self.SYSTEM_PROMPT,
                     history=self._recent_history(),
@@ -363,16 +298,25 @@ class CognitiveBrain(nn.Module):
                     temperature=temperature if temperature is not None else 0.3,
                 )
             else:
-                answer = "Не удалось найти информацию."
-            self._update_after_step(input_text, answer)
-            return {"input": input_text, "answer": answer, "activated_neurons": [], "memory_results": []}
+                full_answer = "Не удалось найти информацию."
+            self._update_after_step(input_text, full_answer)
+            # Для поиска тоже генерируем краткий ответ, если включено
+            if self.config.two_level_answer:
+                summary = self._summarize_answer(full_answer)
+            else:
+                summary = full_answer
+            return {
+                "input": input_text,
+                "answer": summary,
+                "thoughts": full_answer,
+                "activated_neurons": [],
+                "memory_results": []
+            }
 
+        # Основной путь: граф + LLM
         query_vec = self.text_to_embedding(input_text, is_query=True)
         memory_results = self.memory.retrieve(query_vec, k=5)
 
-        # ИЗМЕНЕНО: точку входа в граф ищем по КОНТЕКСТУАЛИЗИРОВАННОМУ эмбеддингу
-        # (find_most_similar_contextual), а не по сырому — так на выбор узла уже влияют
-        # его связи в графе (и теперь ещё top-down модуляция от верхних уровней иерархии).
         if hasattr(self.graph, 'levels'):
             start_nid = self.graph.find_most_similar_contextual(query_vec, level_idx=0, threshold=0.5)
         else:
@@ -382,14 +326,10 @@ class CognitiveBrain(nn.Module):
             start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0,
                                              node_type=NodeType.SENSORY, optimizer=self.optimizer)
 
-        # ГЛАВНОЕ ИЗМЕНЕНИЕ: "мышление" — активация растекается по синапсам от start_nid,
-        # выявляя, какие концепты граф реально ассоциирует с вопросом (не просто похожие
-        # по тексту, а связанные через цепочку обучения). Это и есть работа нейросети,
-        # а не просто lookup по векторам.
         thought_stream = self.graph.spreading_activation(start_nid, steps=3, decay=0.6, top_k=6)
 
         context = self._build_context(input_text, memory_results, start_nid, thought_stream)
-        answer = self.llm.generate(
+        full_answer = self.llm.generate(
             context,
             system=self.SYSTEM_PROMPT,
             history=self._recent_history(),
@@ -397,32 +337,103 @@ class CognitiveBrain(nn.Module):
             temperature=temperature if temperature is not None else 0.7,
         )
 
-        if self.reflector is not None and self.reflector.should_reflect(answer):
-            improved = self.reflector.reflect(input_text, answer)
-            if improved != answer:
-                answer = improved
-                self.learn_pair(input_text, answer, reward=0.9)
+        # --- Рефлексия и любопытство (на полном ответе) ---
+        if self.reflector is not None and self.reflector.should_reflect(full_answer):
+            improved = self.reflector.reflect(input_text, full_answer)
+            if improved != full_answer:
+                full_answer = improved
+                self.learn_pair(input_text, full_answer, reward=0.9)
 
         if self.curiosity is not None:
             predicted_vec = query_vec
-            actual_vec = self.text_to_embedding(answer, is_query=False)
+            actual_vec = self.text_to_embedding(full_answer, is_query=False)
             reward = self.curiosity.compute_reward(query_vec, predicted_vec, actual_vec)
             if reward > 0.1:
-                self.learn_pair(input_text, answer, reward=min(reward, 1.0))
+                self.learn_pair(input_text, full_answer, reward=min(reward, 1.0))
 
-        self.memory.add_working(query_vec, {"text": input_text, "answer": answer})
-        self._update_after_step(input_text, answer)
+        self.memory.add_working(query_vec, {"text": input_text, "answer": full_answer})
+        self._update_after_step(input_text, full_answer)
+
+        # --- Генерация краткого ответа (если включено) ---
+        if self.config.two_level_answer:
+            summary = self._summarize_answer(full_answer)
+        else:
+            summary = full_answer
 
         return {
             "input": input_text,
-            "answer": answer,
+            "answer": summary,                # краткий ответ для пользователя
+            "thoughts": full_answer,          # полные "мысли"
             "activated_neurons": [start_nid] + [nid for nid, _ in thought_stream] if start_nid else [],
-            "thought_stream": thought_stream,  # видимая "мысль" графа — полезно для отладки/UI
+            "thought_stream": thought_stream,
             "memory_results": memory_results
         }
 
+    def _summarize_answer(self, full_answer: str) -> str:
+        """Сокращает полный ответ до 2–3 предложений для пользователя."""
+        if not self.config.two_level_answer:
+            return full_answer
+        prompt = (
+            "Сократи следующий текст до 2–3 предложений, обращаясь прямо к пользователю. "
+            "Сохрани суть, убери воду. Текст:\n" + full_answer
+        )
+        summary = self.llm.generate(
+            prompt,
+            max_tokens=self.config.summary_max_tokens,
+            temperature=self.config.summary_temperature
+        )
+        return summary if summary.strip() else full_answer
+
+    # ---------- ПРОАКТИВНЫЙ РЕЖИМ (НОВЫЙ МЕТОД) ----------
+    def proactive_thought(self):
+        """
+        Внутренняя инициация: случайный узел → распространение → генерация мысли → самообучение.
+        Вызывается периодически из фонового потока или во время сна.
+        """
+        if not self.config.proactive_enabled:
+            return
+        with self.lock:
+            n_nodes = self.graph.node_emb.shape[0] if hasattr(self.graph, 'node_emb') else 0
+            if n_nodes < 2:
+                return
+            # Выбираем случайный узел (исключая начальные?)
+            start_id = random.randint(1, n_nodes)
+            # Распространение активации
+            stream = self.graph.spreading_activation(
+                start_id,
+                steps=self.config.proactive_steps,
+                decay=0.6,
+                top_k=self.config.proactive_top_k,
+                min_activation=0.05
+            )
+            if not stream:
+                return
+            # Собираем метки узлов
+            node_labels = getattr(self.graph, 'node_labels', {})
+            associations = "\n".join(
+                f"- {node_labels.get(nid, f'нейрон_{nid}')} (сила: {strength:.2f})"
+                for nid, strength in stream
+            )
+            # Формируем мысль через LLM
+            prompt = (
+                "Ты – внутренний голос когнитивного графа. Ниже поток ассоциаций (концепты с силой активации). "
+                "Сформулируй одну связную мысль, которая естественно вытекает из этих ассоциаций.\n"
+                f"Поток ассоциаций:\n{associations}"
+            )
+            thought = self.llm.generate(prompt, max_tokens=100, temperature=0.8)
+            if thought and len(thought.strip()) > 10:
+                # Обучаем как новое знание (внутренняя мысль)
+                self.learn_pair("внутренняя мысль", thought, reward=self.config.proactive_reward)
+                # Также можно добавить в диалоговую память (опционально)
+                self.dialog_memory.append({
+                    "user": "[внутренняя мысль]",
+                    "assistant": thought,
+                    "time": time.time()
+                })
+                print(f"[Proactive] Сгенерирована мысль: {thought[:80]}...")
+
+    # ---------- Вспомогательные методы (без изменений) ----------
     def _recent_history(self, n_pairs: int = 4) -> List[Dict[str, str]]:
-        """Последние N реплик диалога в формате messages — раньше LLM их вообще не видела."""
         msgs = []
         for turn in self.dialog_memory[-n_pairs:]:
             if turn.get("user"):
@@ -438,11 +449,11 @@ class CognitiveBrain(nn.Module):
 
     def step_stream(self, input_text: str, use_search: bool = False):
         result = self.step(input_text, use_search)
+        # Возвращаем краткий ответ
         answer = result["answer"]
         for token in answer.split():
             yield token + " "
 
-    # ---------- Вспомогательные ----------
     def _normalize(self, text: str) -> str:
         return re.sub(r'\s+', ' ', text.strip().lower())
 
@@ -464,12 +475,6 @@ class CognitiveBrain(nn.Module):
     def _build_context(self, query: str, memory_results: List[Dict], start_nid: int,
                         thought_stream: Optional[List[Tuple[int, float]]] = None) -> str:
         context = f"Вопрос: {query}\n"
-
-        # ГЛАВНОЕ: поток ассоциаций графа — то, что реально "подумал" граф через
-        # spreading activation. Раньше здесь была одна строка "Ассоциация: <label>"
-        # от узла, найденного простым cosine-поиском; теперь — цепочка связанных
-        # концептов с силой активации, ранжированная тем, как узлы реально связаны
-        # в обученном графе.
         node_labels = getattr(self.graph, 'node_labels', {})
         start_label = node_labels.get(start_nid, "")
         if start_label:
@@ -480,7 +485,6 @@ class CognitiveBrain(nn.Module):
                 label = node_labels.get(nid, "")
                 if label:
                     context += f"- {label} (активация: {strength:.2f})\n"
-
         if memory_results:
             context += "Из эпизодической памяти:\n"
             for res in memory_results[:3]:
@@ -489,7 +493,6 @@ class CognitiveBrain(nn.Module):
         kb_facts = self._search_knowledge_base(query, top_k=3)
         if kb_facts:
             context += "Из базы знаний:\n" + "\n".join(kb_facts) + "\n"
-
         context += "Сформулируй ответ на основе потока ассоциаций и данных выше. Если ничего релевантного не активировано, скажи: 'Я не знаю'."
         return context
 
@@ -511,7 +514,6 @@ class CognitiveBrain(nn.Module):
             emb = item.get("emb")
             if emb is None:
                 continue
-            # Если emb оказался списком (при загрузке из JSON), преобразуем в тензор
             if isinstance(emb, list):
                 emb = torch.tensor(emb, dtype=torch.float32)
             sim = cosine_similarity(q_vec, emb)
@@ -535,21 +537,22 @@ class CognitiveBrain(nn.Module):
     def _enhance_search_query(self, query: str) -> str:
         return query + " " + time.strftime("%d.%m.%Y")
 
+    # ---------- Сон и консолидация (добавляем proactive_thought) ----------
     def sleep(self, duration_steps: int = 10):
         with self.lock:
             print("💤 Сон... (консолидация памяти)")
             self.memory.consolidate(threshold=0.05)
-            # НОВОЕ: здесь, а не на каждом шаге, перестраивается иерархия графа —
-            # кластеризация узлов уровня i в абстракции уровня i+1 (см. graph.py).
-            # Это дорогая (O(n^2) по числу узлов уровня) и не градиентная операция,
-            # поэтому её место — в периодической консолидации "во сне", а не в step().
             if hasattr(self.graph, "rebuild_hierarchy"):
                 self.graph.rebuild_hierarchy(optimizer=self.optimizer)
             if self.ewc is not None:
-                self.ewc.set_anchor()  # периодически фиксируем "опорные" веса для EWC
+                self.ewc.set_anchor()
+            # Во время сна также генерируем несколько проактивных мыслей
+            for _ in range(3):
+                self.proactive_thought()
+                time.sleep(0.5)
             print("😴 Сон завершён")
 
-    # ---------- Сохранение / загрузка ----------
+    # ---------- Сохранение / загрузка (без изменений) ----------
     def save(self, model_dir: str = None):
         path = model_dir or self.config.model_dir
         os.makedirs(path, exist_ok=True)
@@ -570,36 +573,27 @@ class CognitiveBrain(nn.Module):
         self.save_dialog_history(os.path.join(path, "dialog_history.json"))
         print(f"[Brain] Модель сохранена в {path}")
 
-    # ---------- НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ АДАПТАЦИИ РАЗМЕРОВ ----------
     def _resize_parameter(self, param: nn.Parameter, new_shape: tuple) -> nn.Parameter:
-        """Изменяет размер параметра, копируя старые данные (если они помещаются)."""
         if param.shape == new_shape:
             return param
         with torch.no_grad():
             new_data = torch.randn(new_shape, dtype=param.dtype, device=param.device) * 0.01
-            # Копируем существующие данные, если они есть
             if param.dim() >= 2:
                 min_rows = min(param.shape[0], new_shape[0])
                 new_data[:min_rows] = param.data[:min_rows]
             else:
-                # Для одномерных (bias и т.п.)
                 min_len = min(param.numel(), new_shape[0])
                 new_data[:min_len] = param.data[:min_len]
         return nn.Parameter(new_data)
 
-    # ---------- ИСПРАВЛЕННЫЙ МЕТОД load() ----------
     def load(self, model_dir: str = None):
         path = model_dir or self.config.model_dir
         if not os.path.exists(path):
             print(f"[Brain] Папка модели {path} не найдена, начинаем с нуля.")
             return
-
         graph_path = f"{path}/graph.pth"
         if os.path.exists(graph_path):
             state_dict = torch.load(graph_path, map_location=self.device)
-
-            # ---- АДАПТАЦИЯ РАЗМЕРОВ ПАРАМЕТРОВ ----
-            # Рекурсивно обходим все параметры графа и изменяем их размер под state_dict
             def adapt_params(module, prefix=""):
                 for name, param in list(module.named_parameters(recurse=False)):
                     full_name = prefix + name if prefix else name
@@ -609,21 +603,14 @@ class CognitiveBrain(nn.Module):
                             print(f"[Brain] Адаптация {full_name}: {param.shape} -> {saved_shape}")
                             new_param = self._resize_parameter(param, saved_shape)
                             setattr(module, name, new_param)
-                # Рекурсивно для дочерних модулей
                 for child_name, child in module.named_children():
                     adapt_params(child, prefix + child_name + ".")
-
             adapt_params(self.graph)
-
-            # Теперь загружаем state_dict (размеры совпадают)
             self.graph.load_state_dict(state_dict, strict=False)
-
-        # ---- ЗАГРУЗКА РЁБЕР (исправлено для иерархического графа) ----
         edges_path = f"{path}/edges.pkl"
         if os.path.exists(edges_path):
             with open(edges_path, "rb") as f:
                 edges, weights = pickle.load(f)
-            # Если граф иерархический, работаем с уровнем 0
             if hasattr(self.graph, 'levels'):
                 level0 = self.graph.levels[0]
                 level0._edges = edges
@@ -633,8 +620,6 @@ class CognitiveBrain(nn.Module):
                 self.graph._edges = edges
                 self.graph._edge_weights = nn.ParameterList([nn.Parameter(torch.tensor(w)) for w in weights])
                 self.graph._rebuild_edges()
-
-        # Загрузка метаданных
         meta_path = f"{path}/meta.json"
         if os.path.exists(meta_path):
             with open(meta_path, "r") as f:
@@ -643,20 +628,10 @@ class CognitiveBrain(nn.Module):
             self._learn_counter = meta.get("learn_counter", 0)
             self.concept_index = meta.get("concept_index", {})
             self.knowledge_base = meta.get("knowledge_base", [])
-
-            # ---- ПРЕОБРАЗОВАНИЕ EMBEDDINGS ИЗ СПИСКОВ В ТЕНЗОРЫ ----
             for item in self.knowledge_base:
                 if "emb" in item and isinstance(item["emb"], list):
                     item["emb"] = torch.tensor(item["emb"], dtype=torch.float32)
-
         self.load_dialog_history(os.path.join(path, "dialog_history.json"))
-
-        # ВАЖНО: после load() state_dict графа заменяется целиком (torch.load),
-        # поэтому старый self.optimizer, созданный в __init__ на "пустом" графе,
-        # снова рассинхронизирован с параметрами. Пересобираем его с нуля —
-        # это единственный момент, когда полная пересборка безопасна и нужна,
-        # так как Adam-статистика для только что загруженной модели всё равно
-        # не сохранялась/не восстанавливалась.
         self.optimizer = optim.Adam(self.graph.parameters(), lr=self.config.learning_rate)
         print(f"[Brain] Модель загружена из {path}")
 

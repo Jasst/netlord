@@ -38,9 +38,8 @@ agent = BrainAgent(
     teacher=_teacher,
     llm_client=_llm_client,
     interactive_mode=False,
-    enabled=False,   # ИЗМЕНЕНО: агент выключен при старте
+    enabled=False,
 )
-# ИЗМЕНЕНО: agent.start() УДАЛЁН – запускаем только по команде
 
 app = FastAPI(title="Smart Brain v10")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -87,10 +86,12 @@ async def ask(req: AskRequest):
             brain.step, req.question, use_search=req.use_search, temperature=req.temperature
         )
         answer = result["answer"]
+        thoughts = result.get("thoughts", answer)  # если не включен two_level_answer, будет равно answer
         await asyncio.to_thread(brain.save_dialog_history)
         return {
             "question": req.question,
             "answer": answer,
+            "thoughts": thoughts,
             "facts": result.get("memory_results", []),
             "known": True
         }
@@ -101,14 +102,24 @@ async def ask(req: AskRequest):
 @app.post("/ask_stream")
 async def ask_stream(req: AskRequest):
     try:
-        gen = await asyncio.to_thread(brain.step_stream, req.question, req.use_search)
+        # Чтобы получить и мысли, и ответ, делаем обычный step, но стримим только краткий ответ.
+        # Можно сделать два вызова, но проще сначала получить всё, а потом стримить краткий.
+        result = await asyncio.to_thread(
+            brain.step, req.question, use_search=req.use_search, temperature=req.temperature
+        )
+        answer = result["answer"]
+        thoughts = result.get("thoughts", answer)
+
+        # Стримим краткий ответ
         async def generate():
             full = ""
-            for token in gen:
+            for token in answer.split():
                 full += token
-                yield f"data: {json.dumps({'token': token})}\n\n"
-            yield f"data: {json.dumps({'done': True, 'full_answer': full})}\n\n"
+                yield f"data: {json.dumps({'token': token + ' '})}\n\n"
+            # В конце отправляем полные мысли (для отображения в интерфейсе)
+            yield f"data: {json.dumps({'done': True, 'full_answer': answer, 'thoughts': thoughts})}\n\n"
             await asyncio.to_thread(brain.save_dialog_history)
+
         return StreamingResponse(generate(), media_type="text/event-stream")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -210,14 +221,14 @@ async def agent_toggle(req: AgentToggleRequest):
 @app.post("/agent/start")
 async def agent_start():
     agent.enabled = True
-    agent.start()   # ИЗМЕНЕНО: реальный запуск потока
+    agent.start()
     return {"status": "started"}
 
 
 @app.post("/agent/stop")
 async def agent_stop():
     agent.enabled = False
-    agent.stop()    # ИЗМЕНЕНО: реальная остановка потока
+    agent.stop()
     return {"status": "stopped"}
 
 

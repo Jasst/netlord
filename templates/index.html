@@ -4,16 +4,51 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#0d0d0d" />
-    <title>Smart Brain v7</title>
+    <title>Smart Brain v10</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css" />
     <link rel="stylesheet" href="/static/css/style.css" />
+    <!-- Дополнительные стили для мыслей (можно объединить с style.css) -->
+    <style>
+        .thoughts-details {
+            background: #1e1e2e;
+            border-left: 4px solid #5a7a9a;
+            padding: 6px 12px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            transition: background 0.2s;
+        }
+        .thoughts-details:hover {
+            background: #2a2a3e;
+        }
+        .thoughts-details summary {
+            font-weight: 500;
+            color: #b0b0c0;
+            outline: none;
+            cursor: pointer;
+            user-select: none;
+        }
+        .thinking-text {
+            margin-top: 6px;
+            padding: 8px 12px;
+            background: #14141e;
+            border-radius: 6px;
+            color: #a0a0b0;
+            font-size: 0.9em;
+            white-space: pre-wrap;
+            word-break: break-word;
+            border-left: 2px solid #4a6a8a;
+        }
+        .answer-text {
+            margin-top: 4px;
+        }
+    </style>
 </head>
 <body>
     <div id="app">
         <header class="header">
             <div class="header-left">
                 <button class="icon-btn" id="toggleChatList" title="Свернуть/развернуть чаты" aria-label="Чаты">☰</button>
-                <h1>🧠<span>v7</span></h1>
+                <h1>🧠<span>v10</span></h1>
             </div>
             <div class="header-right">
                 <div class="control-group">

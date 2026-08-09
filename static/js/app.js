@@ -1,5 +1,5 @@
 // ============================================================
-// app.js – полная клиентская логика для Smart Brain v6
+// app.js – полная клиентская логика Smart Brain v10
 // ============================================================
 
 // ---------- Состояние ----------
@@ -456,6 +456,80 @@ function addMessage(text, sender, facts, isAgentOrClarifying, animate = false) {
     }
 }
 
+// ---------- НОВАЯ ФУНКЦИЯ: сообщение с мыслями и кратким ответом ----------
+function addMessageWithThoughts(shortAnswer, thoughts, facts, sender = 'bot', isAgentOrClarifying = false, animate = false) {
+    const div = document.createElement('div');
+    div.className = 'message ' + sender;
+    if (isAgentOrClarifying) div.classList.add('agent-question');
+
+    // Блок мыслей (если есть и отличается от краткого ответа)
+    if (thoughts && thoughts.trim() && thoughts.trim() !== shortAnswer.trim()) {
+        const details = document.createElement('details');
+        details.className = 'thoughts-details';
+        const summary = document.createElement('summary');
+        summary.textContent = '🧠 Мысли (нажмите, чтобы развернуть)';
+        details.appendChild(summary);
+
+        const thoughtsDiv = document.createElement('div');
+        thoughtsDiv.className = 'thinking-text';
+        thoughtsDiv.textContent = thoughts;
+        details.appendChild(thoughtsDiv);
+
+        div.appendChild(details);
+    }
+
+    // Контейнер для краткого ответа
+    const answerContainer = document.createElement('div');
+    answerContainer.className = 'answer-text';
+    div.appendChild(answerContainer);
+
+    const factsHtml = (facts && facts.length) ? `<div class="facts-indicator">📚 использовано фактов: ${facts.length}</div>` : '';
+    const timeHtml = `<div class="time">${new Date().toLocaleTimeString()}</div>`;
+
+    if (!animate) {
+        answerContainer.innerHTML = formatMessage(shortAnswer);
+        div.innerHTML += factsHtml + timeHtml;
+        messagesEl.appendChild(div);
+        requestAnimationFrame(() => {
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        });
+        highlightCodeBlocks();
+        saveMessageToChat(div.innerHTML, sender, facts, isAgentOrClarifying);
+    } else {
+        messagesEl.appendChild(div);
+        requestAnimationFrame(() => {
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        });
+
+        const words = shortAnswer.split(/(\s+)/);
+        let fullText = '', idx = 0;
+        function typeNext() {
+            if (!div.parentNode) return;
+            if (idx < words.length) {
+                fullText += words[idx++];
+                answerContainer.textContent = fullText;
+                requestAnimationFrame(() => {
+                    messagesEl.scrollTop = messagesEl.scrollHeight;
+                });
+                setTimeout(typeNext, 10 + Math.random() * 20);
+            } else {
+                answerContainer.innerHTML = formatMessage(fullText);
+                // Добавляем факты и время
+                const extra = document.createElement('div');
+                extra.innerHTML = factsHtml + timeHtml;
+                div.appendChild(extra);
+                requestAnimationFrame(() => {
+                    messagesEl.scrollTop = messagesEl.scrollHeight;
+                });
+                highlightCodeBlocks();
+                saveMessageToChat(div.innerHTML, sender, facts, isAgentOrClarifying);
+            }
+        }
+        typeNext();
+    }
+}
+
+// ---------- Сохранение сообщения в чат ----------
 function saveMessageToChat(html, sender, facts, isAgentOrClarifying) {
     const chat = getCurrentChat();
     if (!chat) return;
@@ -475,8 +549,8 @@ function saveMessageToChat(html, sender, facts, isAgentOrClarifying) {
     saveChats();
 }
 
+// ---------- Форматирование сообщений (маркдаун, код) ----------
 function formatMessage(text) {
-    // Сначала обрабатываем блоки кода — они не должны подвергаться маркдауну и абзацам
     const codeBlockRegex = /```(\w*)\n([\s\S]*?)```/g;
     let parts = [];
     let lastIndex = 0;
@@ -493,14 +567,10 @@ function formatMessage(text) {
         parts.push({ type: 'text', content: text.substring(lastIndex) });
     }
 
-    // Функция для обработки текста (маркдаун + абзацы)
     function processText(content) {
-        // Экранируем HTML
         let escaped = escapeHtml(content);
-        // Простой маркдаун: **жирный** и *курсив*
         escaped = escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
         escaped = escaped.replace(/\*(.+?)\*/g, '<em>$1</em>');
-        // Разбиваем на абзацы по двойному переносу строки (или больше)
         const paragraphs = escaped.split(/\n\s*\n/);
         return paragraphs.map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join('');
     }
@@ -508,7 +578,6 @@ function formatMessage(text) {
     let result = '';
     for (const part of parts) {
         if (part.type === 'code') {
-            // Блок кода: не трогаем, просто вставляем как pre/code с кнопкой копирования
             result += `<pre><code class="language-${part.lang}">${escapeHtml(part.code)}</code><button class="copy-btn" onclick="window.copyCode(this)">Копировать</button></pre>`;
         } else {
             result += processText(part.content);
@@ -543,9 +612,7 @@ function highlightCodeBlocks() {
     });
 }
 
-
-// ---------- Отправка сообщения ----------
-// ---------- Отправка сообщения ----------
+// ---------- Отправка сообщения (ОСНОВНАЯ ФУНКЦИЯ) ----------
 async function sendMessage() {
     const text = questionInput.value.trim();
     if (!text) return;
@@ -613,111 +680,33 @@ async function sendMessage() {
         }
 
         const data = await response.json();
-        const answer = data.answer || 'Нет ответа.';
+
+        // ---- Извлекаем краткий ответ и полные мысли ----
+        const shortAnswer = data.answer || 'Нет ответа.';
+        const thoughts = data.thoughts || shortAnswer;  // если thoughts нет, используем shortAnswer
         const finalFacts = data.facts || [];
 
         const typingEl = document.getElementById(typingId);
         if (typingEl) typingEl.remove();
 
-        const div = document.createElement('div');
-        div.className = 'message bot';
-        messagesEl.appendChild(div);
-        requestAnimationFrame(() => {
-            messagesEl.scrollTop = messagesEl.scrollHeight;
-        });
+        // ---- Добавляем сообщение с мыслями и кратким ответом ----
+        addMessageWithThoughts(shortAnswer, thoughts, finalFacts, 'bot', false, true);
 
-        const parsed = parseReasoningAnswer(answer);
-
-        // ---- БЛОК РАССУЖДЕНИЙ ----
-        if (parsed.thinking) {
-            const details = document.createElement('details');
-            const summary = document.createElement('summary');
-            summary.textContent = '🧠 Рассуждения';
-            details.appendChild(summary);
-            const thinkingDiv = document.createElement('div');
-            thinkingDiv.className = 'thinking-text';
-            thinkingDiv.textContent = parsed.thinking;
-            details.appendChild(thinkingDiv);
-            div.appendChild(details);
-        }
-
-        // ---- КОНТЕЙНЕР ДЛЯ ФИНАЛЬНОГО ОТВЕТА ----
-        const answerContainer = document.createElement('div');
-        answerContainer.className = 'answer-text';
-        div.appendChild(answerContainer);
-
-        const plainTextDiv = document.createElement('div');
-        answerContainer.appendChild(plainTextDiv);
-
-        const fullAnswerText = parsed.answer;
-        let idx = 0;
-        let displayedText = '';
-
-        // ---- ПОСИМВОЛЬНАЯ ПЕЧАТЬ ----
-        function typeNextChar() {
-            if (idx < fullAnswerText.length) {
-                displayedText += fullAnswerText[idx++];
-                plainTextDiv.textContent = displayedText;
-                requestAnimationFrame(() => {
-                    messagesEl.scrollTop = messagesEl.scrollHeight;
-                });
-                setTimeout(typeNextChar, 20);
-            } else {
-                // ---- ПЕЧАТЬ ЗАВЕРШЕНА: заменяем на форматированный HTML ----
-                const formattedHtml = formatMessage(fullAnswerText);
-                answerContainer.style.transition = 'opacity 0.3s ease';
-                answerContainer.style.opacity = 0;
-
-                // Функция финализации — выполняется после затухания
-                const finalizeMessage = () => {
-                    // Удаляем plain-текст и вставляем форматированный HTML
-                    plainTextDiv.remove();
-                    const formattedDiv = document.createElement('div');
-                    formattedDiv.innerHTML = formattedHtml;
-                    answerContainer.appendChild(formattedDiv);
-                    highlightCodeBlocks();
-
-                    // Плавное появление
-                    answerContainer.style.opacity = 1;
-
-                    // ---- ДОБАВЛЯЕМ ФАКТЫ И ВРЕМЯ (через appendChild, не innerHTML +=) ----
-                    if (finalFacts && finalFacts.length) {
-                        const factsDiv = document.createElement('div');
-                        factsDiv.className = 'facts-indicator';
-                        factsDiv.textContent = '📚 использовано фактов: ' + finalFacts.length;
-                        div.appendChild(factsDiv);
-                    }
-                    const timeDiv = document.createElement('div');
-                    timeDiv.className = 'time';
-                    timeDiv.textContent = new Date().toLocaleTimeString();
-                    div.appendChild(timeDiv);
-
-                    // Сохраняем сообщение в историю чата (теперь с полным содержимым)
-                    saveMessageToChat(div.innerHTML, 'bot', finalFacts, false);
-
-                    // ---- ОБНОВЛЯЕМ ИНТЕРФЕЙС ----
-                    lastQuestion = text;
-                    lastAnswer = stripHtml(parsed.answer);
-                    lastFacts = finalFacts;
-                    updateButtons();
-                    renderFacts(lastFacts);
-                    loadStats();
-                };
-
-                // Даём время на затухание, затем финализируем
-                setTimeout(finalizeMessage, 50);
-            }
-        }
-
-        typeNextChar();
-
-        // ---- УТОЧНЯЮЩИЙ ВОПРОС (если есть) ----
+        // ---- Уточняющий вопрос (если есть) ----
         if (data.clarifying_question && allowClar) {
             const delay = parseFloat(clarifyingDelay.value) * 1000;
             setTimeout(() => {
                 addMessage('🤔 ' + data.clarifying_question, 'bot', null, true, false);
             }, delay);
         }
+
+        // ---- Обновляем состояние ----
+        lastQuestion = text;
+        lastAnswer = stripHtml(shortAnswer);
+        lastFacts = finalFacts;
+        updateButtons();
+        renderFacts(lastFacts);
+        loadStats();
 
         searchEnabled = false;
         searchToggleBtn.classList.remove('active');
@@ -804,8 +793,7 @@ async function loadStats() {
 
 function renderFacts(facts) {
     const el = document.getElementById('factsList');
-    if (!el) return; // если элемента нет – просто выходим
-
+    if (!el) return;
     if (!facts || !facts.length) {
         el.innerHTML = '<p class="empty-hint">Факты появятся после ответа.</p>';
         return;
@@ -830,82 +818,6 @@ function updateOverlay() {
     if (!overlayEl) return;
     const anyOpen = !chatListCollapsed || settingsOpen;
     overlayEl.classList.toggle('visible', anyOpen);
-}
-
-function parseReasoningAnswer(text) {
-    const thinkingMatch = text.match(/<thinking>([\s\S]*?)<\/thinking>/);
-    const answerMatch = text.match(/<answer>([\s\S]*?)<\/answer>/);
-    if (thinkingMatch && answerMatch) {
-        return {
-            thinking: thinkingMatch[1].trim(),
-            answer: answerMatch[1].trim()
-        };
-    }
-    return { thinking: null, answer: text };
-}
-
-function addMessageWithReasoning(parsed, sender, facts, isAgentOrClarifying, animate = false) {
-    const div = document.createElement('div');
-    div.className = 'message ' + sender;
-    if (isAgentOrClarifying) div.classList.add('agent-question');
-
-    if (parsed.thinking) {
-        const details = document.createElement('details');
-        const summary = document.createElement('summary');
-        summary.textContent = '🧠 Рассуждения';
-        details.appendChild(summary);
-        const thinkingDiv = document.createElement('div');
-        thinkingDiv.className = 'thinking-text';
-        thinkingDiv.textContent = parsed.thinking;
-        details.appendChild(thinkingDiv);
-        div.appendChild(details);
-    }
-
-    const answerDiv = document.createElement('div');
-    answerDiv.className = 'answer-text';
-    div.appendChild(answerDiv);
-
-    const factsHtml = (facts && facts.length) ? '<div class="facts-indicator">📚 использовано фактов: ' + facts.length + '</div>' : '';
-    const timeHtml = '<div class="time">' + new Date().toLocaleTimeString() + '</div>';
-
-    if (!animate) {
-        answerDiv.innerHTML = formatMessage(parsed.answer);
-        div.innerHTML += factsHtml + timeHtml;
-        messagesEl.appendChild(div);
-        requestAnimationFrame(() => {
-            messagesEl.scrollTop = messagesEl.scrollHeight;
-        });
-        highlightCodeBlocks();
-        saveMessageToChat(div.innerHTML, sender, facts, isAgentOrClarifying);
-    } else {
-        messagesEl.appendChild(div);
-        requestAnimationFrame(() => {
-            messagesEl.scrollTop = messagesEl.scrollHeight;
-        });
-
-        const words = parsed.answer.split(/(\s+)/);
-        let fullText = '', idx = 0;
-        function typeNext() {
-            if (!div.parentNode) return;
-            if (idx < words.length) {
-                fullText += words[idx++];
-                answerDiv.textContent = fullText;
-                requestAnimationFrame(() => {
-                    messagesEl.scrollTop = messagesEl.scrollHeight;
-                });
-                setTimeout(typeNext, 10 + Math.random() * 20);
-            } else {
-                answerDiv.innerHTML = formatMessage(fullText);
-                div.innerHTML += factsHtml + timeHtml;
-                requestAnimationFrame(() => {
-                    messagesEl.scrollTop = messagesEl.scrollHeight;
-                });
-                highlightCodeBlocks();
-                saveMessageToChat(div.innerHTML, sender, facts, isAgentOrClarifying);
-            }
-        }
-        typeNext();
-    }
 }
 
 function closeMobilePanels() {

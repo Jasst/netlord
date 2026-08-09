@@ -7,22 +7,15 @@ class BrainConfig:
     dim_embedding: int = 1024
     max_kb_size: int = 10000
 
-    gnn_hidden_dim: int = 1024          # изменено с 256 на 1024
+    gnn_hidden_dim: int = 1024
     gnn_num_layers: int = 3
     gnn_num_heads: int = 4
     max_neurons: int = 100000
     max_synapses: int = 500000
     use_hierarchical_graph: bool = True
     graph_levels: List[int] = field(default_factory=lambda: [1024, 512, 256])
-    attention_heads: int = 8  # ПРИМЕЧАНИЕ: больше не используется в graph.py — глобальный
-                               # self-attention по всем узлам убран как разрушающий структуру
-                               # синапсов (см. graph.py). Поле оставлено для совместимости.
+    attention_heads: int = 8
 
-    # НОВОЕ: параметры реальной иерархии (rebuild_hierarchy в graph.py).
-    # Узлы уровня i, чьи контекстуализированные эмбеддинги (после GAT) имеют
-    # косинусную близость >= hierarchy_cluster_threshold, объединяются в один
-    # узел-абстракцию на уровне i+1. Кластеры меньше hierarchy_min_cluster_size
-    # не поднимаются наверх (одиночный узел — не абстракция).
     hierarchy_cluster_threshold: float = 0.75
     hierarchy_min_cluster_size: int = 2
 
@@ -40,14 +33,7 @@ class BrainConfig:
     learning_rate: float = 1e-4
     contrastive_margin: float = 0.5
     meta_lr: float = 0.01
-
-    # НОВОЕ: используется в _contrastive_loss (brain.py) для негативного сэмплирования —
-    # без этого loss тянул все векторы друг к другу и представления схлопывались.
     contrastive_num_negatives: int = 8
-
-    # НОВОЕ: порог дедупликации узлов графа. Было 0.6 — для e5-large-v2 это слишком
-    # низко (у e5 базовый косинус между СЛУЧАЙНЫМИ разными текстами часто уже 0.5-0.7
-    # из-за анизотропии эмбеддингов), из-за чего разные факты схлопывались в один нейрон.
     node_merge_threshold: float = 0.87
 
     model_dir: str = "brain_model_v10"
@@ -64,3 +50,14 @@ class BrainConfig:
 
     self_play_rounds: int = 3
     exploration_temperature: float = 0.9
+
+    # ---------- НОВЫЕ ПАРАМЕТРЫ ----------
+    proactive_enabled: bool = True
+    proactive_interval_seconds: int = 60
+    proactive_steps: int = 3
+    proactive_top_k: int = 6
+    proactive_reward: float = 0.5
+
+    two_level_answer: bool = True
+    summary_max_tokens: int = 250
+    summary_temperature: float = 0.3
