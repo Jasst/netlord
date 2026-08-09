@@ -940,6 +940,51 @@ body {
 .message p:last-child {
     margin-bottom: 0;
 }
+/* ========== Стили для мыслей (дополнительно) ========== */
+.thoughts-details {
+    background: #1e1e2e;
+    border-left: 4px solid #5a7a9a;
+    padding: 6px 12px;
+    border-radius: 8px;
+    margin-bottom: 8px;
+    transition: background 0.2s;
+}
+.thoughts-details:hover {
+    background: #2a2a3e;
+}
+.thoughts-details summary {
+    font-weight: 500;
+    color: #b0b0c0;
+    outline: none;
+    cursor: pointer;
+    user-select: none;
+}
+.thinking-text {
+    margin-top: 6px;
+    padding: 8px 12px;
+    background: #14141e;
+    border-radius: 6px;
+    color: #a0a0b0;
+    font-size: 0.9em;
+    white-space: pre-wrap;
+    word-break: break-word;
+    border-left: 2px solid #4a6a8a;
+}
+.answer-text {
+    margin-top: 4px;
+}
+.message .facts-indicator {
+    font-size: 0.8em;
+    color: #8888aa;
+    margin-top: 6px;
+    opacity: 0.7;
+}
+.message .time {
+    font-size: 0.7em;
+    color: #666688;
+    margin-top: 4px;
+    text-align: right;
+}
 @media (max-width: 420px) {
     .header-left h1 span {
         display: none;

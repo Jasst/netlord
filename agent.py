@@ -10,12 +10,6 @@ from brain.teacher import Teacher
 
 
 class BrainAgent:
-    """
-    ИСПРАВЛЕНО: _generate_question_for_topic не хранил историю уже заданных вопросов —
-    в паре с min(topic_confidence) (агент упорно возвращается к самой "слабой" теме)
-    это регулярно давало один и тот же/почти тот же вопрос из цикла в цикл. Добавлена
-    память недавних вопросов по теме + явный запрет модели их повторять.
-    """
     def __init__(
         self,
         brain: CognitiveBrain,
@@ -56,6 +50,9 @@ class BrainAgent:
         self.topic_confidence = {t: 0.5 for t in self.topics}
         self.asked_questions: Dict[str, List[str]] = {t: [] for t in self.topics}
 
+        # Счётчик для проактивных мыслей
+        self._proactive_counter = 0
+
     def start(self):
         if self._thread and self._thread.is_alive():
             return
@@ -76,10 +73,21 @@ class BrainAgent:
             if self.enabled:
                 self._cycle()
                 cycle_counter += 1
+
+                # --- ПРОАКТИВНЫЕ МЫСЛИ (каждые N циклов) ---
+                if self.brain.config.proactive_enabled:
+                    self._proactive_counter += 1
+                    # Вызываем proactive_thought примерно каждые proactive_interval_seconds
+                    # Например, раз в 30 секунд (интервал цикла * 0.25)
+                    if self._proactive_counter % max(1, int(self.interval / 30)) == 0:
+                        self.brain.proactive_thought()
+                        self.brain.save()  # сохраняем после мыслей
+
                 if cycle_counter % 10 == 0:
                     self.brain.save()
                     self.brain.save_dialog_history()
                     print("[Agent] Автосохранение выполнено.")
+
             for _ in range(self.interval):
                 if self._stop_flag:
                     break
@@ -124,20 +132,22 @@ class BrainAgent:
             if not q:
                 break
             result = self.brain.step(q)
+            # result содержит "answer" (краткий) и "thoughts" (полный)
             answer = result["answer"]
-            score, improved, _ = self.teacher.evaluate(q, answer)
+            thoughts = result.get("thoughts", answer)  # для обучения используем полный ответ
+            score, improved, _ = self.teacher.evaluate(q, thoughts)
             if score >= 0.7:
-                self.brain.learn_pair(q, answer, reward=score)
+                self.brain.learn_pair(q, thoughts, reward=score)
                 self._update_topic_confidence(topic, score)
             else:
-                if improved != answer:
+                if improved != thoughts:
                     self.brain.learn_pair(q, improved, reward=0.8)
                     self._update_topic_confidence(topic, 0.8)
                 else:
-                    self.brain.learn_negative_pair(q, answer)
+                    self.brain.learn_negative_pair(q, thoughts)
                     search_result = self.brain.step(q, use_search=True)
                     if search_result["answer"] != "Не удалось найти информацию.":
-                        self.brain.learn_pair(q, search_result["answer"], reward=0.6)
+                        self.brain.learn_pair(q, search_result["thoughts"], reward=0.6)
             time.sleep(0.5)
         self.brain.sleep()
 
@@ -168,7 +178,7 @@ class BrainAgent:
                     )}
                 ],
                 max_tokens=40,
-                temperature=max(self.temperature, 0.9),  # чуть выше — меньше шаблонности
+                temperature=max(self.temperature, 0.9),
             )
             q = response.choices[0].message.content.strip()
             if q and "?" in q and q not in recent:
@@ -202,15 +212,6 @@ class BrainAgent:
             print(f"[Agent] Ответ на неактивный вопрос: {question} (активный: {self.active_question})")
 
 
-# ----------------------------------------------------------------------
-# НОВОЕ: точка входа для автономного запуска БЕЗ app.py — например, для
-# теста агента отдельно от API. В обычной работе предпочтительнее
-# интеграция в app.py (см. изменения там) — там агент и API делят один
-# и тот же экземпляр CognitiveBrain, что важно: если запустить agent.py
-# и app.py как два ОТДЕЛЬНЫХ процесса на одном model_dir, они будут
-# независимо друг друга перезаписывать при save() — гонка данных.
-# Используйте этот блок только когда app.py не запущен параллельно.
-# ----------------------------------------------------------------------
 if __name__ == "__main__":
     import signal
     import sys
@@ -228,7 +229,7 @@ if __name__ == "__main__":
         brain=brain,
         teacher=teacher,
         llm_client=llm_client,
-        interactive_mode=False,  # True — если хотите, чтобы агент периодически спрашивал ВАС
+        interactive_mode=False,
     )
 
     def _shutdown():
