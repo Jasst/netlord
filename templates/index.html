@@ -127,6 +127,12 @@
                     <div class="log" id="interactiveLog">Выключен.</div>
                 </div>
 
+                <!-- ===== ГРАФ ===== -->
+<div class="settings-section">
+    <h3>🌐 Граф знаний</h3>
+    <button id="openGraphEditorBtn" style="background:#533483; color:white; padding:8px 16px; border:none; border-radius:8px; cursor:pointer; width:100%;">Открыть редактор графа</button>
+    <div class="log" id="graphLog">Редактор позволяет просматривать и изменять связи между концептами.</div>
+</div>
                 <!-- ===== АВТООБУЧЕНИЕ ===== -->
                 <div class="settings-section">
                     <h3>🚀 Автообучение</h3>
@@ -189,5 +195,15 @@
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     <script src="/static/js/app.js"></script>
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const btn = document.getElementById('openGraphEditorBtn');
+        if (btn) {
+            btn.addEventListener('click', function() {
+                window.open('/graph-editor', '_blank');
+            });
+        }
+    });
+</script>
 </body>
 </html>

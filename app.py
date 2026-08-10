@@ -14,7 +14,9 @@ import atexit
 import signal
 import sys
 from openai import OpenAI
-
+# ---------- ГРАФ ДЛЯ ВИЗУАЛИЗАЦИИ (API) ----------
+import torch.nn as nn
+from brain.graph import NodeType
 from brain import CognitiveBrain, BrainConfig
 from brain.teacher import Teacher
 from agent import BrainAgent
@@ -124,6 +126,10 @@ async def ask_stream(req: AskRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/graph-editor", response_class=HTMLResponse)
+async def graph_editor():
+    with open("templates/graph_editor.html", "r", encoding="utf-8") as f:
+        return f.read()
 
 @app.post("/learn")
 async def learn(req: LearnRequest):
@@ -134,6 +140,10 @@ async def learn(req: LearnRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/brain/save")
+async def save_brain():
+    brain.save()
+    return {"status": "saved"}
 
 @app.post("/learn_neg")
 async def learn_neg(req: LearnRequest):
@@ -271,6 +281,250 @@ async def agent_config(req: AgentConfigRequest):
 async def index():
     with open("templates/index.html", "r", encoding="utf-8") as f:
         return f.read()
+
+@app.get("/brain/last_thought")
+async def last_thought():
+    if hasattr(brain, "proactive_thoughts") and brain.proactive_thoughts:
+        return {"thought": brain.proactive_thoughts[-1]["thought"]}
+    return {"thought": None}
+
+
+def _get_graph_data(limit: int = 500):
+    """Возвращает узлы и рёбра графа для визуализации."""
+    graph = brain.graph
+    if hasattr(graph, 'levels'):
+        g = graph.levels[0]
+    else:
+        g = graph
+
+    nodes = []
+    # ограничим число узлов для производительности
+    n_nodes = g.node_emb.shape[0]
+    if n_nodes == 0:
+        return {"nodes": [], "edges": []}
+
+    # Если узлов слишком много, берём топ по степени
+    if n_nodes > limit:
+        degree = {}
+        for f, t in g._edges:
+            if f <= n_nodes: degree[f] = degree.get(f, 0) + 1
+            if t <= n_nodes: degree[t] = degree.get(t, 0) + 1
+        top = sorted(degree.items(), key=lambda x: x[1], reverse=True)[:limit]
+        selected = set(nid for nid, _ in top)
+    else:
+        selected = set(range(1, n_nodes+1))
+
+    # формируем узлы
+    for nid in selected:
+        label = g.node_labels.get(nid, f"Нейрон {nid}")
+        # обрезаем длинные метки для отображения на самом графе (полную видно в панели)
+        short_label = label[:20] + ("..." if len(label) > 20 else "")
+        ntype = g.node_types.get(nid, NodeType.CONCEPT)
+        cluster = g.node_clusters.get(nid, "hidden")
+        color = {
+            NodeType.SENSORY: "#FF6B6B",
+            NodeType.CONCEPT: "#4ECDC4",
+            NodeType.MOTOR: "#45B7D1",
+            NodeType.EMOTIONAL: "#FFA07A",
+            NodeType.ATTENTION: "#DDA0DD",
+        }.get(ntype, "#AAAAAA")
+        nodes.append({
+            "id": nid,
+            "label": short_label,
+            "full_label": label,
+            "node_type": ntype.name,
+            "cluster": cluster,
+            "title": f"ID: {nid}\nТип: {ntype.name}\nМетка: {label}",
+            "color": color,
+            "shape": "dot" if ntype == NodeType.CONCEPT else "box"
+        })
+
+    # рёбра (только между выбранными)
+    edges = []
+    for (f, t), w in zip(g._edges, g._edge_weights):
+        if f in selected and t in selected:
+            w_val = w.item()  # извлекаем скаляр
+            width = max(1, abs(w_val) * 5)
+            color = "#00FF00" if w > 0 else "#FF4444"
+            edges.append({
+                "from": f,
+                "to": t,
+                "value": abs(w_val),
+                "weight": round(w_val, 4),
+                "title": f"вес: {w_val:.3f}",
+                "color": color,
+                "width": width
+            })
+
+    return {"nodes": nodes, "edges": edges}
+
+@app.get("/graph/data")
+async def graph_data(limit: int = 500):
+    return _get_graph_data(limit)
+
+@app.post("/graph/add_node")
+async def add_node(req: dict):
+    label = (req.get("label") or "").strip()
+    node_type_str = (req.get("node_type") or "CONCEPT").strip().upper()
+    if not label:
+        raise HTTPException(400, "Missing label")
+    try:
+        node_type = NodeType[node_type_str]
+    except KeyError:
+        node_type = NodeType.CONCEPT
+    with brain.lock:
+        # embedding для узла считаем как "passage" (сохраняемый контент), не "query"
+        emb = brain.text_to_embedding(label, is_query=False)
+        nid = brain.graph.add_node(
+            emb, label=label, cluster="manual", node_type=node_type,
+            optimizer=brain.optimizer
+        )
+        brain.save()
+    return {"status": "added", "id": nid}
+
+
+@app.post("/graph/delete_node")
+async def delete_node(req: dict):
+    node_id = req.get("id")
+    if not node_id:
+        raise HTTPException(400, "Missing id")
+    with brain.lock:
+        graph = brain.graph
+        if hasattr(graph, 'levels'):
+            g = graph.levels[0]
+        else:
+            g = graph
+        # удаляем все рёбра, связанные с этим узлом
+        new_edges = []
+        new_weights = []
+        for (f, t), w in zip(g._edges, g._edge_weights):
+            if f != node_id and t != node_id:
+                new_edges.append((f, t))
+                new_weights.append(w)
+        g._edges = new_edges
+        g._edge_weights = nn.ParameterList(new_weights)
+        g._rebuild_edges()
+        # удаляем сам узел (пересоздаём параметр)
+        old_emb = g.node_emb
+        mask = torch.ones(old_emb.shape[0], dtype=torch.bool)
+        mask[node_id-1] = False
+        new_emb = nn.Parameter(old_emb.data[mask])
+        g.node_emb = new_emb
+        # обновляем оптимизатор (заменяем параметр)
+        for group in brain.optimizer.param_groups:
+            for i, p in enumerate(group["params"]):
+                if p is old_emb:
+                    group["params"][i] = new_emb
+                    # переносим состояние Adam
+                    state = brain.optimizer.state.pop(old_emb, None)
+                    if state:
+                        brain.optimizer.state[new_emb] = state
+                    break
+        # чистим метаданные
+        g.node_labels.pop(node_id, None)
+        g.node_types.pop(node_id, None)
+        g.node_clusters.pop(node_id, None)
+        # сдвигаем индексы в _edges (уменьшаем id > node_id на 1)
+        new_edges2 = []
+        for f, t in g._edges:
+            f2 = f if f < node_id else f-1
+            t2 = t if t < node_id else t-1
+            new_edges2.append((f2, t2))
+        g._edges = new_edges2
+        g._rebuild_edges()
+        brain.save()
+    return {"status": "deleted"}
+
+@app.post("/graph/update_label")
+async def update_label(req: dict):
+    """
+    Обновляет узел: метку, тип, кластер.
+    ВАЖНО: смысл узла для графа — это не label (это просто человекочитаемый ярлык),
+    а его embedding (node_emb). Раньше update_label менял только ярлык, а сам
+    embedding оставался прежним — то есть узел выглядел переименованным, но по
+    факту "думал" (участвовал в similarity/message passing) всё ещё как старое
+    понятие. Теперь, если reembed=true (по умолчанию), embedding пересчитывается
+    из нового текста через тот же path, что и остальная память (passage-эмбеддинг).
+    """
+    node_id = req.get("id")
+    new_label = req.get("label")
+    node_type_str = req.get("node_type")
+    cluster = req.get("cluster")
+    reembed = req.get("reembed", True)
+    if not node_id:
+        raise HTTPException(400, "Missing id")
+    with brain.lock:
+        graph = brain.graph
+        if hasattr(graph, 'levels'):
+            g = graph.levels[0]
+        else:
+            g = graph
+
+        if new_label is not None and new_label.strip():
+            g.node_labels[node_id] = new_label.strip()
+            if reembed:
+                new_emb = brain.text_to_embedding(new_label.strip(), is_query=False)
+                with torch.no_grad():
+                    g.node_emb.data[node_id - 1] = new_emb.to(
+                        device=g.node_emb.data.device, dtype=g.node_emb.data.dtype
+                    )
+
+        if node_type_str:
+            try:
+                g.node_types[node_id] = NodeType[node_type_str.upper()]
+            except KeyError:
+                pass
+
+        if cluster is not None and cluster.strip():
+            g.node_clusters[node_id] = cluster.strip()
+
+        brain.save()
+    return {"status": "updated"}
+
+@app.post("/graph/add_edge")
+async def add_edge(req: dict):
+    from_id = req.get("from")
+    to_id = req.get("to")
+    weight = req.get("weight", 0.5)
+    if not from_id or not to_id:
+        raise HTTPException(400, "Missing from/to")
+    with brain.lock:
+        brain.graph.add_synapse(from_id, to_id, weight, optimizer=brain.optimizer)
+        brain.save()
+    return {"status": "added"}
+
+@app.post("/graph/delete_edge")
+async def delete_edge(req: dict):
+    from_id = req.get("from")
+    to_id = req.get("to")
+    if not from_id or not to_id:
+        raise HTTPException(400, "Missing from/to")
+    with brain.lock:
+        graph = brain.graph
+        if hasattr(graph, 'levels'):
+            g = graph.levels[0]
+        else:
+            g = graph
+        # находим и удаляем ребро
+        new_edges = []
+        new_weights = []
+        for (f, t), w in zip(g._edges, g._edge_weights):
+            if not (f == from_id and t == to_id):
+                new_edges.append((f, t))
+                new_weights.append(w)
+        g._edges = new_edges
+        g._edge_weights = nn.ParameterList(new_weights)
+        g._rebuild_edges()
+        brain.save()
+    return {"status": "deleted"}
+
+@app.get("/graph/refresh")
+async def refresh_graph():
+    # перезагружаем модель из файла
+    brain.load()
+    brain.load_dialog_history()
+    return {"status": "refreshed"}
+
 
 
 # ---------- ЗАВЕРШЕНИЕ ----------

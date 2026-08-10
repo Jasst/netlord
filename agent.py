@@ -79,9 +79,10 @@ class BrainAgent:
                     self._proactive_counter += 1
                     # Вызываем proactive_thought примерно каждые proactive_interval_seconds
                     # Например, раз в 30 секунд (интервал цикла * 0.25)
-                    if self._proactive_counter % max(1, int(self.interval / 30)) == 0:
+                    interval_seconds = self.brain.config.proactive_interval_seconds
+                    if self._proactive_counter % max(1, int(interval_seconds / 30)) == 0:
                         self.brain.proactive_thought()
-                        self.brain.save()  # сохраняем после мыслей
+                        self.brain.save()
 
                 if cycle_counter % 10 == 0:
                     self.brain.save()
