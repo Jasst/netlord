@@ -11,9 +11,10 @@ document.addEventListener('DOMContentLoaded', function () {
     let pendingEdgeSource = null;
     let dragSourceId = null;
 
-    // Переменные для эффекта отталкивания
+    // Переменные для отталкивания и подсветки цели
     let savedPositions = {};
     let draggingNodeId = null;
+    let hoverTargetId = null; // ID узла, на который навели при drag
     const repelThreshold = 120;
     const repelStrength = 0.35;
 
@@ -308,6 +309,38 @@ document.addEventListener('DOMContentLoaded', function () {
             }
         });
         if (edgeUpdates.length) edges.update(edgeUpdates);
+    }
+
+    // ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПОДСВЕТКИ ЦЕЛИ ----------
+    function highlightTarget(nodeId) {
+        // Подсветить узел как цель (золотая обводка)
+        if (nodeId === null) return;
+        const node = nodes.get(nodeId);
+        if (!node) return;
+        nodes.update({
+            id: nodeId,
+            color: {
+                background: node.originalColor,
+                border: '#FFD700'  // золотой
+            },
+            borderWidth: 4
+        });
+    }
+
+    function unhighlightTarget() {
+        if (hoverTargetId === null) return;
+        const node = nodes.get(hoverTargetId);
+        if (node) {
+            nodes.update({
+                id: hoverTargetId,
+                color: {
+                    background: node.originalColor,
+                    border: node.originalColor
+                },
+                borderWidth: 1.5
+            });
+        }
+        hoverTargetId = null;
     }
 
     // ---------- СОЗДАНИЕ РЕБРА ----------
@@ -611,7 +644,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
-    // ---------- НАСТРОЙКА СОБЫТИЙ ГРАФА (ВКЛЮЧАЯ ОТТАЛКИВАНИЕ) ----------
+    // ---------- НАСТРОЙКА СОБЫТИЙ ГРАФА (ВКЛЮЧАЯ ОТТАЛКИВАНИЕ И ПРЕДПРОСМОТР) ----------
     function setupEvents() {
         // Hover
         network.on('hoverNode', function (params) {
@@ -628,53 +661,77 @@ document.addEventListener('DOMContentLoaded', function () {
                 dragSourceId = params.nodes[0];
                 draggingNodeId = params.nodes[0];
                 savedPositions = network.getPositions();
+                // Сбросить подсветку цели
+                unhighlightTarget();
             }
         });
 
-        // Dragging – отталкивание соседей
+        // Dragging – отталкивание + подсветка целевого узла
         network.on('dragging', function (params) {
-            if (draggingNodeId === null) return;
-            const dragPos = network.getPosition(draggingNodeId);
-            if (!dragPos) return;
-            const allPositions = network.getPositions();
-            const updates = {};
-            for (let id in allPositions) {
-                if (id == draggingNodeId) continue;
-                const pos = allPositions[id];
-                const dx = pos.x - dragPos.x;
-                const dy = pos.y - dragPos.y;
-                const dist = Math.sqrt(dx * dx + dy * dy);
-                if (dist < repelThreshold && dist > 0.1) {
-                    const force = (repelThreshold - dist) / repelThreshold * repelStrength;
-                    const moveX = dx / dist * force;
-                    const moveY = dy / dist * force;
-                    updates[id] = { x: pos.x + moveX, y: pos.y + moveY };
+            // Отталкивание
+            if (draggingNodeId !== null) {
+                const dragPos = network.getPosition(draggingNodeId);
+                if (dragPos) {
+                    const allPositions = network.getPositions();
+                    const updates = [];
+                    for (let id in allPositions) {
+                        if (id == draggingNodeId) continue;
+                        const pos = allPositions[id];
+                        const dx = pos.x - dragPos.x;
+                        const dy = pos.y - dragPos.y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist < repelThreshold && dist > 0.1) {
+                            const force = (repelThreshold - dist) / repelThreshold * repelStrength;
+                            const moveX = dx / dist * force;
+                            const moveY = dy / dist * force;
+                            updates.push({ id: id, x: pos.x + moveX, y: pos.y + moveY });
+                        }
+                    }
+                    if (updates.length) nodes.update(updates);
                 }
             }
-            for (let id in updates) {
-                network.moveNode(id, updates[id].x, updates[id].y);
+
+            // Подсветка цели под курсором
+            if (draggingNodeId !== null) {
+                // Получаем узел под мышью
+                const target = network.getNodeAt({ x: params.pointer.DOM.x, y: params.pointer.DOM.y });
+                // Если есть целевой узел, не равный перетаскиваемому, и он не равен уже подсвеченному
+                if (target !== undefined && target !== null && target !== draggingNodeId) {
+                    if (hoverTargetId !== target) {
+                        unhighlightTarget(); // снять старую подсветку
+                        hoverTargetId = target;
+                        highlightTarget(target);
+                    }
+                } else {
+                    // Нет цели под мышью или это сам перетаскиваемый узел
+                    if (hoverTargetId !== null) {
+                        unhighlightTarget();
+                    }
+                }
             }
         });
 
-        // DragEnd – возврат позиций и создание ребра
+        // DragEnd – возврат позиций, создание ребра (если цель подсвечена)
         network.on('dragEnd', function (params) {
             // Возвращаем узлы на места (кроме перетаскиваемого)
             if (draggingNodeId !== null) {
+                const updates = [];
                 for (let id in savedPositions) {
                     if (id == draggingNodeId) continue;
                     const pos = savedPositions[id];
-                    network.moveNode(id, pos.x, pos.y);
+                    updates.push({ id: id, x: pos.x, y: pos.y });
                 }
+                if (updates.length) nodes.update(updates);
                 savedPositions = {};
                 draggingNodeId = null;
             }
 
-            // Создание ребра (старая логика)
-            if (dragSourceId === null) return;
-            const target = network.getNodeAt({ x: params.pointer.DOM.x, y: params.pointer.DOM.y });
-            if (target !== undefined && target !== null && target !== dragSourceId) {
-                createEdge(dragSourceId, target);
+            // Создание ребра, если есть подсвеченная цель
+            if (dragSourceId !== null && hoverTargetId !== null) {
+                createEdge(dragSourceId, hoverTargetId);
             }
+            // Сброс подсветки
+            unhighlightTarget();
             dragSourceId = null;
         });
 

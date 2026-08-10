@@ -27,13 +27,6 @@ class DifferentiableNeuralGraph(nn.Module):
         self.dim = dim
         self.max_nodes = max_nodes
 
-        # ИСПРАВЛЕНО: раньше здесь создавался "нейрон-призрак" —
-        # nn.Parameter(torch.randn(1, dim) * 0.01) — случайный, без label/type,
-        # ни с чем не связанный синапсами. Он не участвовал в message passing
-        # (нет рёбер), но раньше (в HierarchicalGraph) участвовал в глобальном
-        # self-attention по ВСЕМ узлам и постоянно подмешивал случайный шум в
-        # контекст остальных нейронов. Граф теперь стартует пустым — первый
-        # add_node создаёт узел с id=1, а не "въезжает" во второй слот после мусора.
         self.node_emb = nn.Parameter(torch.zeros(0, dim))
 
         self.layers = nn.ModuleList()
@@ -50,7 +43,6 @@ class DifferentiableNeuralGraph(nn.Module):
         self._edges: List[Tuple[int, int]] = []
         self._edge_weights = nn.ParameterList()
         self._edge_index = None
-        # Кэш смежности для spreading activation (не требует градиента — только для "мышления")
         self._adjacency: Dict[int, List[Tuple[int, float]]] = {}
 
         self.node_labels: Dict[int, str] = {}
@@ -58,7 +50,7 @@ class DifferentiableNeuralGraph(nn.Module):
         self.node_clusters: Dict[int, str] = {}
 
     # ------------------------------------------------------------------
-    # Рост графа (память / обучаемость)
+    # Рост графа
     # ------------------------------------------------------------------
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden",
                  layer: int = 0, node_type: NodeType = NodeType.CONCEPT,
@@ -78,45 +70,40 @@ class DifferentiableNeuralGraph(nn.Module):
             grow_parameter_in_optimizer(optimizer, old_param, self.node_emb, num_old_rows)
         return nid
 
-    def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1, optimizer=None) -> int:
-        self._edges.append((from_id, to_id))
-        new_w = nn.Parameter(torch.tensor(weight, dtype=torch.float))
-        self._edge_weights.append(new_w)
-        self._rebuild_edges()
-
-        if optimizer is not None and optimizer.param_groups:
-            optimizer.param_groups[0]["params"].append(new_w)
-        return len(self._edges) - 1
-
     def _rebuild_edges(self):
         if not self._edges:
             self._edge_index = torch.zeros((2, 0), dtype=torch.long)
             self._adjacency = {}
             return
-        u = [f - 1 for f, _ in self._edges]
-        v = [t - 1 for _, t in self._edges]
+        # Приводим ID к int
+        u = [int(f) - 1 for f, _ in self._edges]
+        v = [int(t) - 1 for _, t in self._edges]
         self._edge_index = torch.tensor([u, v], dtype=torch.long)
 
-        # Смежность для spreading activation — синапс трактуем как направленный,
-        # но с более слабой "обратной тягой", как в биологических сетях (обратный
-        # сигнал слабее прямого, но не нулевой — иначе граф был бы чисто иерархическим).
         adjacency: Dict[int, List[Tuple[int, float]]] = {}
         for (f, t), w_param in zip(self._edges, self._edge_weights):
+            f = int(f)
+            t = int(t)
             w = float(w_param.detach())
             adjacency.setdefault(f, []).append((t, w))
             adjacency.setdefault(t, []).append((f, w * 0.5))
         self._adjacency = adjacency
 
+    def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1, optimizer=None) -> int:
+        from_id = int(from_id)
+        to_id = int(to_id)
+        self._edges.append((from_id, to_id))
+        new_w = nn.Parameter(torch.tensor(weight, dtype=torch.float))
+        self._edge_weights.append(new_w)
+        self._rebuild_edges()
+        if optimizer is not None and optimizer.param_groups:
+            optimizer.param_groups[0]["params"].append(new_w)
+        return len(self._edges) - 1
+
     # ------------------------------------------------------------------
     # "Мышление" — message passing + spreading activation
     # ------------------------------------------------------------------
     def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Контекстуализирует эмбеддинг каждого узла его соседями через GATv2.
-        Это единственное место, где реально обучаются GAT/LayerNorm — их выход
-        теперь используется и для сравнения похожести, и в contrastive loss,
-        а не отбрасывается.
-        """
         if x is None:
             x = self.node_emb
         if x.shape[0] == 0:
@@ -143,14 +130,6 @@ class DifferentiableNeuralGraph(nn.Module):
 
     def spreading_activation(self, start_id: int, steps: int = 3, decay: float = 0.6,
                               top_k: int = 6, min_activation: float = 0.05) -> List[Tuple[int, float]]:
-        """
-        Это и есть "мышление" графа: активация запускается в узле start_id и растекается
-        по синапсам на steps шагов, ослабевая с decay на каждом хопе и по весу ребра.
-        Возвращает top_k наиболее "возбуждённых" узлов (кроме самого start_id) —
-        это ассоциативный поток мыслей графа, который дальше LLM просто озвучивает.
-
-        Не участвует в backward — это управляющая логика "что вспомнить", а не обучаемый вес.
-        """
         n = self.node_emb.shape[0]
         if n == 0 or start_id < 1 or start_id > n:
             return []
@@ -159,7 +138,7 @@ class DifferentiableNeuralGraph(nn.Module):
         activation[start_id - 1] = 1.0
 
         for _ in range(steps):
-            new_activation = activation.clone() * 0.25  # остаточное затухание (забывание)
+            new_activation = activation.clone() * 0.25
             nonzero = (activation > min_activation).nonzero(as_tuple=True)[0]
             for idx in nonzero.tolist():
                 nid = idx + 1
@@ -169,7 +148,7 @@ class DifferentiableNeuralGraph(nn.Module):
                         new_activation[neighbor - 1] += a * w * decay
             activation = torch.clamp(new_activation, max=5.0)
 
-        activation[start_id - 1] = 0.0  # сам триггер не возвращаем как "ассоциацию"
+        activation[start_id - 1] = 0.0
         k = min(top_k, n)
         if k == 0:
             return []
@@ -190,8 +169,6 @@ class DifferentiableNeuralGraph(nn.Module):
         return torch.cat([w.view(1) for w in weights])
 
     def find_most_similar(self, query: torch.Tensor, threshold: float = 0.87) -> Optional[int]:
-        """Строгое сравнение по СЫРОМУ содержимому узла — используется при обучении,
-        чтобы не плодить дублирующие узлы для почти идентичного текста."""
         if self.node_emb.shape[0] == 0:
             return None
         sim = F.cosine_similarity(query.unsqueeze(0), self.node_emb, dim=1)
@@ -201,10 +178,6 @@ class DifferentiableNeuralGraph(nn.Module):
         return None
 
     def find_most_similar_contextual(self, query: torch.Tensor, threshold: float = 0.6) -> Optional[int]:
-        """
-        Сравнение по КОНТЕКСТУАЛИЗИРОВАННОМУ (после message passing) эмбеддингу узла —
-        используется при поиске точки входа для "мышления"/ответа.
-        """
         if self.node_emb.shape[0] == 0:
             return None
         with torch.no_grad():
@@ -219,23 +192,7 @@ class DifferentiableNeuralGraph(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# Иерархический граф с несколькими уровнями.
-#
-# ПЕРЕАНАЛИЗИРОВАНО: раньше forward() честно считал все уровни, но возвращал
-# только outputs[0] — уровни 1/2 не влияли ни на loss, ни на ответ (мёртвый
-# код), а "иерархическая" связь между уровнями была подменена ГЛОБАЛЬНЫМ
-# nn.MultiheadAttention по ВСЕМ узлам сразу — это игнорировало синапсы
-# полностью (O(N^2), без учёта топологии) и было прямой причиной
-# нестабильности обучения (см. чат).
-#
-# Идея сохранена и достроена: уровень 0 — граф фактов, обучаемый через
-# синапсы (GAT). Уровни выше — это НЕ отдельные независимые графы, а
-# АБСТРАКЦИИ уровня 0: узел уровня i+1 = центроид кластера близких по смыслу
-# узлов уровня i (см. rebuild_hierarchy — вызывается из sleep(), не на
-# каждом шаге, т.к. кластеризация — это дорого и не обучаемый градиентом
-# процесс, а периодическая консолидация, как и должно быть в модели памяти).
-# Верхний уровень затем влияет на нижний TOP-DOWN модуляцией его
-# контекстуализированного эмбеддинга — это и есть настоящая иерархия.
+# Иерархический граф
 # ----------------------------------------------------------------------
 class HierarchicalGraph(nn.Module):
     def __init__(self, dims: List[int], num_heads: int = 4, num_layers: int = 2,
@@ -243,8 +200,8 @@ class HierarchicalGraph(nn.Module):
         super().__init__()
         self.dims = dims
         self.levels = nn.ModuleList()
-        self.level_projections = nn.ModuleList()  # уровень i -> размерность уровня i+1 (вниз, для кластеризации)
-        self.up_projections = nn.ModuleList()      # уровень i+1 -> размерность уровня i (наверх->вниз, модуляция)
+        self.level_projections = nn.ModuleList()
+        self.up_projections = nn.ModuleList()
 
         self.cluster_threshold = cluster_threshold
         self.min_cluster_size = min_cluster_size
@@ -262,7 +219,6 @@ class HierarchicalGraph(nn.Module):
                 self.level_projections.append(nn.Linear(d, dims[i + 1]))
                 self.up_projections.append(nn.Linear(dims[i + 1], d))
 
-        # cluster_of[i][node_idx_0based_на_уровне_i] = node_id_1based_на_уровне_i+1
         self.cluster_of: List[Dict[int, int]] = [dict() for _ in range(len(dims) - 1)]
 
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden",
@@ -271,8 +227,9 @@ class HierarchicalGraph(nn.Module):
         return self.levels[level_idx].add_node(embedding, label, cluster, layer, node_type,
                                                  optimizer=optimizer)
 
+    # ---------- ДОБАВЛЕННЫЙ МЕТОД (был пропущен) ----------
     def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1,
-                     level_idx: int = 0, optimizer=None) -> int:
+                    level_idx: int = 0, optimizer=None) -> int:
         return self.levels[level_idx].add_synapse(from_id, to_id, weight, optimizer=optimizer)
 
     def find_most_similar(self, query: torch.Tensor, level_idx: int = 0, threshold: float = 0.87) -> Optional[int]:
@@ -280,12 +237,6 @@ class HierarchicalGraph(nn.Module):
 
     def find_most_similar_contextual(self, query: torch.Tensor, level_idx: int = 0,
                                       threshold: float = 0.6) -> Optional[int]:
-        """
-        ИЗМЕНЕНО: для level_idx=0 точка входа теперь ищется по ПОЛНОМУ иерархическому
-        forward() (с top-down модуляцией верхних уровней), а не по локальному GAT
-        уровня 0 в изоляции — верхние уровни (темы/абстракции) реально участвуют
-        в том, какой нейрон граф сочтёт "похожим" на вопрос.
-        """
         if level_idx != 0:
             return self.levels[level_idx].find_most_similar_contextual(query, threshold)
         with torch.no_grad():
@@ -301,15 +252,7 @@ class HierarchicalGraph(nn.Module):
     def spreading_activation(self, start_id: int, level_idx: int = 0, **kwargs) -> List[Tuple[int, float]]:
         return self.levels[level_idx].spreading_activation(start_id, **kwargs)
 
-    # ------------------------------------------------------------------
     def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Снизу вверх: каждый уровень контекстуализируется своим собственным GAT
-        по своим синапсам (никакого глобального attention по чужим узлам).
-        Сверху вниз: если для узлов уровня i есть кластеризация на уровень i+1
-        (построена в rebuild_hierarchy), их эмбеддинг модулируется спроецированным
-        вниз эмбеддингом их кластера-абстракции.
-        """
         hs = [self.levels[0].forward(x)]
         for i in range(1, len(self.levels)):
             hs.append(self.levels[i].forward())
@@ -328,18 +271,6 @@ class HierarchicalGraph(nn.Module):
         return hs[0]
 
     def rebuild_hierarchy(self, optimizer=None):
-        """
-        Периодическая (не end-to-end дифференцируемая) переагрегация иерархии.
-        Вызывать из sleep(), а не на каждом шаге — кластеризация стоит O(n^2)
-        по числу узлов уровня и не должна идти в backward-графе.
-
-        Для каждого уровня i (кроме последнего): берём контекстуализированные
-        (после GAT) эмбеддинги узлов, проецируем в размерность уровня i+1,
-        жадно группируем по порогу косинусной близости (cluster_threshold).
-        Каждый кластер размера >= min_cluster_size поднимается как один узел
-        уровня i+1 (центроид), и запоминается сопоставление cluster_of[i].
-        Кластеры из одного узла не поднимаются — единичный факт не абстракция.
-        """
         for i in range(len(self.levels) - 1):
             lower = self.levels[i]
             n = lower.node_emb.shape[0]
