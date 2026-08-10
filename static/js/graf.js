@@ -9,7 +9,9 @@ document.addEventListener('DOMContentLoaded', function() {
     let edges = new vis.DataSet([]);
     let selectedNode = null;
     let selectedEdge = null;
-    let pendingEdgeSource = null; // для двухкликового создания ребра
+    let pendingEdgeSource = null;
+    let dragSourceId = null; // для drag‑and‑drop
+
     const container = document.getElementById('graph-container');
     const infoPanel = document.getElementById('info-panel');
     const infoContent = document.getElementById('infoContent');
@@ -26,9 +28,9 @@ document.addEventListener('DOMContentLoaded', function() {
     };
     const defaultColor = '#7A756C';
     const selectionColor = '#B9A87F';
-    const edgePositiveColor = '#44DD88';   // ярко-зелёный
-    const edgeNegativeColor = '#FF6666';   // ярко-красный
-    const edgeSelectedColor = '#FFD700';   // золотой для выделения
+    const edgePositiveColor = '#44DD88';
+    const edgeNegativeColor = '#FF6666';
+    const edgeSelectedColor = '#FFD700';
 
     function getGrayColor(type) {
         return typeColors[type] || defaultColor;
@@ -126,6 +128,137 @@ document.addEventListener('DOMContentLoaded', function() {
         network = new vis.Network(container, { nodes, edges }, options);
         network.startSimulation();
 
+        // ========== DRAG‑AND‑DROP ДЛЯ СОЗДАНИЯ РЁБЕР ==========
+        network.on('dragStart', function(params) {
+            if (params.nodes.length > 0) {
+                dragSourceId = params.nodes[0];
+                console.log('dragStart source:', dragSourceId);
+            }
+        });
+
+        network.on('dragEnd', function(params) {
+            if (dragSourceId === null) return;
+            const event = params.event;
+            const containerRect = container.getBoundingClientRect();
+            const x = event.clientX - containerRect.left;
+            const y = event.clientY - containerRect.top;
+            const targetNodeId = network.getNodeAt({ x, y });
+            if (targetNodeId !== undefined && targetNodeId !== null && targetNodeId !== dragSourceId) {
+                const weight = parseFloat(weightInput.value) || 0.5;
+                if (confirm(`Создать ребро от узла ${dragSourceId} к узлу ${targetNodeId} с весом ${weight}?`)) {
+                    fetch('/graph/add_edge', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ from: dragSourceId, to: targetNodeId, weight })
+                    })
+                    .then(resp => {
+                        if (resp.ok) {
+                            loadGraph();
+                        } else {
+                            alert('Ошибка создания ребра');
+                        }
+                    })
+                    .catch(e => alert('Ошибка сети: ' + e.message));
+                }
+            }
+            dragSourceId = null;
+        });
+
+        // ========== ОБРАБОТЧИК КЛИКА ==========
+        network.on('click', function(params) {
+            if (selectedNode !== null) {
+                const prev = nodes.get(selectedNode);
+                if (prev) {
+                    nodes.update({ id: selectedNode, color: prev.originalColor || defaultColor });
+                }
+            }
+
+            if (selectedEdge !== null) {
+                const prevEdge = edges.get(selectedEdge);
+                if (prevEdge) {
+                    edges.update({
+                        id: selectedEdge,
+                        color: prevEdge.originalColor || edgePositiveColor,
+                        width: prevEdge.originalWidth || 2
+                    });
+                }
+                selectedEdge = null;
+            }
+
+            if (params.nodes.length > 0) {
+                const nodeId = params.nodes[0];
+
+                if (pendingEdgeSource !== null && pendingEdgeSource !== nodeId) {
+                    const weight = parseFloat(weightInput.value) || 0.5;
+                    if (confirm(`Создать ребро от узла ${pendingEdgeSource} к узлу ${nodeId} с весом ${weight}?`)) {
+                        fetch('/graph/add_edge', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ from: pendingEdgeSource, to: nodeId, weight })
+                        })
+                        .then(resp => {
+                            if (resp.ok) {
+                                pendingEdgeSource = null;
+                                loadGraph();
+                            } else {
+                                alert('Ошибка создания ребра');
+                            }
+                        })
+                        .catch(e => alert('Ошибка сети: ' + e.message));
+                        return;
+                    } else {
+                        pendingEdgeSource = null;
+                        selectedNode = nodeId;
+                        nodes.update({ id: nodeId, color: selectionColor });
+                        network.selectNodes([nodeId]);
+                        network.selectEdges([]);
+                        showNodeInfo(nodeId);
+                        return;
+                    }
+                }
+
+                pendingEdgeSource = null;
+                selectedNode = nodeId;
+                network.selectNodes([nodeId]);
+                network.selectEdges([]);
+                const node = nodes.get(nodeId);
+                if (node) {
+                    nodes.update({ id: nodeId, color: selectionColor });
+                    showNodeInfo(nodeId);
+                }
+            } else if (params.edges.length > 0) {
+                const edgeId = params.edges[0];
+                selectedEdge = edgeId;
+                network.selectEdges([edgeId]);
+                network.selectNodes([]);
+                const edge = edges.get(edgeId);
+                if (edge) {
+                    edges.update({
+                        id: edgeId,
+                        color: edgeSelectedColor,
+                        width: Math.max(edge.originalWidth || 2, 4)
+                    });
+                    showEdgeInfo(edgeId);
+                }
+            } else {
+                selectedNode = null;
+                selectedEdge = null;
+                pendingEdgeSource = null;
+                network.selectNodes([]);
+                network.selectEdges([]);
+                infoPanel.classList.remove('show');
+                infoPanel.style.display = 'none';
+            }
+        });
+
+        network.on('hoverNode', function(params) {
+            // можно добавить всплывающую подсказку, если нужно
+        });
+
+        network.on('dragStart', function() {
+            pendingEdgeSource = null; // сброс при перетаскивании
+        });
+
         network.once('stabilizationIterationsDone', function() {
             network.fit();
             loadingIndicator.classList.remove('show');
@@ -135,210 +268,118 @@ document.addEventListener('DOMContentLoaded', function() {
             network.fit();
             loadingIndicator.classList.remove('show');
         }, 5000);
-
-        // ======= НОВЫЙ ОБРАБОТЧИК КЛИКА =======
-        network.on('click', function(params) {
-    console.log('Клик по графу', params); // отладка
-
-    if (selectedNode !== null) {
-        const prev = nodes.get(selectedNode);
-        if (prev) {
-            nodes.update({ id: selectedNode, color: prev.originalColor || defaultColor });
-        }
     }
 
-    if (selectedEdge !== null) {
-        const prevEdge = edges.get(selectedEdge);
-        if (prevEdge) {
-            edges.update({
-                id: selectedEdge,
-                color: prevEdge.originalColor || edgePositiveColor,
-                width: prevEdge.originalWidth || 2
-            });
-        }
-        selectedEdge = null;
-    }
-
-    if (params.nodes.length > 0) {
-        const nodeId = params.nodes[0];
-        console.log('Клик по узлу', nodeId);
-
-        if (pendingEdgeSource !== null && pendingEdgeSource !== nodeId) {
-            const weight = parseFloat(weightInput.value) || 0.5;
-            if (confirm(`Создать ребро от узла ${pendingEdgeSource} к узлу ${nodeId} с весом ${weight}?`)) {
-                fetch('/graph/add_edge', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ from: pendingEdgeSource, to: nodeId, weight: weight })
-                })
-                .then(resp => {
-                    if (resp.ok) {
-                        pendingEdgeSource = null;
-                        loadGraph();
-                    } else {
-                        alert('Ошибка создания ребра');
-                    }
-                })
-                .catch(e => alert('Ошибка сети: ' + e.message));
-                return;
-            } else {
-                pendingEdgeSource = null;
-                selectedNode = nodeId;
-                nodes.update({ id: nodeId, color: selectionColor });
-                network.selectNodes([nodeId]);
-                network.selectEdges([]);
-                showNodeInfo(nodeId);
-                return;
-            }
-        }
-
-        pendingEdgeSource = null;
-        selectedNode = nodeId;
-        network.selectNodes([nodeId]);
-        network.selectEdges([]);
-        const node = nodes.get(nodeId);
-        if (node) {
-            nodes.update({ id: nodeId, color: selectionColor });
-            showNodeInfo(nodeId);
-        }
-    } else if (params.edges.length > 0) {
-        const edgeId = params.edges[0];
-        console.log('Клик по ребру', edgeId);
-        // ... обработка ребра (оставьте как было)
-    } else {
-        console.log('Клик по пустому месту');
-        selectedNode = null;
-        selectedEdge = null;
-        pendingEdgeSource = null;
-        network.selectNodes([]);
-        network.selectEdges([]);
-        infoPanel.classList.remove('show');
-    }
-});
-
-        // Дополнительно: при наведении на узел можно показать всплывашку
-        network.on('hoverNode', function(params) {
-            // можно добавить эффект, если нужно
-        });
-
-        // Сброс ожидания при перетаскивании
-        network.on('dragStart', function() {
-            pendingEdgeSource = null;
-        });
-    }
-
-    // ---------- showNodeInfo (без изменений, но добавим кнопку "Создать ребро отсюда") ----------
+    // ========== ПОКАЗАТЬ ИНФОРМАЦИЮ О УЗЛЕ ==========
     function showNodeInfo(id) {
-    console.log('showNodeInfo вызван для', id);
-    if (!infoContent) return;
-    const node = nodes.get(id);
-    if (!node) return;
+        if (!infoContent) return;
+        const node = nodes.get(id);
+        if (!node) return;
 
-    const neighborEdges = edges.get().filter(e => e.from === id || e.to === id);
-    const neighborRows = neighborEdges
-        .slice()
-        .sort((a, b) => Math.abs(b.weight ?? b.value ?? 0) - Math.abs(a.weight ?? a.value ?? 0))
-        .slice(0, 15)
-        .map(e => {
-            const otherId = e.from === id ? e.to : e.from;
-            const other = nodes.get(otherId);
-            const arrow = e.from === id ? '→' : '←';
-            const label = other ? (other.full_label || other.label || `#${otherId}`) : `#${otherId}`;
-            const w = (e.weight !== undefined) ? e.weight.toFixed(3) : (e.value ?? '?');
-            const wClass = (e.weight ?? 0) < 0 ? 'w neg' : 'w';
-            return `<div class="neighbor-row" data-goto="${otherId}"><span class="arrow">${arrow}</span><span class="n-label">${label}</span><span class="${wClass}">${w}</span></div>`;
-        }).join('');
+        const neighborEdges = edges.get().filter(e => e.from === id || e.to === id);
+        const neighborRows = neighborEdges
+            .slice()
+            .sort((a, b) => Math.abs(b.weight ?? b.value ?? 0) - Math.abs(a.weight ?? a.value ?? 0))
+            .slice(0, 15)
+            .map(e => {
+                const otherId = e.from === id ? e.to : e.from;
+                const other = nodes.get(otherId);
+                const arrow = e.from === id ? '→' : '←';
+                const label = other ? (other.full_label || other.label || `#${otherId}`) : `#${otherId}`;
+                const w = (e.weight !== undefined) ? e.weight.toFixed(3) : (e.value ?? '?');
+                const wClass = (e.weight ?? 0) < 0 ? 'w neg' : 'w';
+                return `<div class="neighbor-row" data-goto="${otherId}"><span class="arrow">${arrow}</span><span class="n-label">${label}</span><span class="${wClass}">${w}</span></div>`;
+            }).join('');
 
-    infoContent.innerHTML = `
-        <div class="info-row"><span class="info-label">ID</span><span class="info-value">${node.id}</span></div>
-        <div class="info-row"><span class="info-label">Метка</span><span class="info-value">${node.full_label || node.label || '—'}</span></div>
-        <div class="info-row"><span class="info-label">Тип</span><span class="info-value">${node.type || '—'}</span></div>
-        <div class="info-row"><span class="info-label">Кластер</span><span class="info-value">${node.cluster || '—'}</span></div>
-        <div class="info-row"><span class="info-label">Связей</span><span class="info-value">${neighborEdges.length}</span></div>
-        ${neighborEdges.length ? `
-            <div class="neighbors-title">Связанные понятия</div>
-            <div class="neighbors">${neighborRows}</div>
-            ${neighborEdges.length > 15 ? `<div class="hint">… и ещё ${neighborEdges.length - 15}</div>` : ''}
-        ` : `<div class="hint">Узел пока ни с чем не связан.</div>`}
-        <div style="margin-top:12px; border-top:1px solid var(--border); padding-top:10px;">
-            <button id="startEdgeFromNode" style="background:var(--accent); color:#fff; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; width:100%;">
-                ➕ Создать ребро от этого узла
-            </button>
-        </div>
-    `;
+        infoContent.innerHTML = `
+            <div class="info-row"><span class="info-label">ID</span><span class="info-value">${node.id}</span></div>
+            <div class="info-row"><span class="info-label">Метка</span><span class="info-value">${node.full_label || node.label || '—'}</span></div>
+            <div class="info-row"><span class="info-label">Тип</span><span class="info-value">${node.type || '—'}</span></div>
+            <div class="info-row"><span class="info-label">Кластер</span><span class="info-value">${node.cluster || '—'}</span></div>
+            <div class="info-row"><span class="info-label">Связей</span><span class="info-value">${neighborEdges.length}</span></div>
+            ${neighborEdges.length ? `
+                <div class="neighbors-title">Связанные понятия</div>
+                <div class="neighbors">${neighborRows}</div>
+                ${neighborEdges.length > 15 ? `<div class="hint">… и ещё ${neighborEdges.length - 15}</div>` : ''}
+            ` : `<div class="hint">Узел пока ни с чем не связан.</div>`}
+            <div style="margin-top:12px; border-top:1px solid var(--border); padding-top:10px;">
+                <button id="startEdgeFromNode" style="background:var(--accent); color:#fff; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; width:100%;">
+                    ➕ Создать ребро от этого узла
+                </button>
+            </div>
+        `;
 
-    // ===== ПРИНУДИТЕЛЬНОЕ ОТОБРАЖЕНИЕ =====
-    infoPanel.classList.add('show');
-    infoPanel.style.display = 'block';   // <--- добавляем эту строку
-    // ======================================
+        infoPanel.classList.add('show');
+        infoPanel.style.display = 'block';
 
-    // Обработчик для создания ребра от текущего узла
-    const startEdgeBtn = document.getElementById('startEdgeFromNode');
-    if (startEdgeBtn) {
-        startEdgeBtn.onclick = function() {
-            if (!network) return;
-            pendingEdgeSource = id;
-            infoContent.innerHTML = `
-                <div style="text-align:center; padding:10px;">
-                    <p>🔗 Теперь кликните на <strong>целевой узел</strong>, чтобы создать ребро.</p>
-                    <p style="font-size:12px; color:var(--text-muted);">Вес: ${weightInput.value}</p>
-                    <button id="cancelEdgeCreation" style="background:var(--danger-soft); color:var(--danger); border:1px solid var(--danger); padding:6px 12px; border-radius:6px; cursor:pointer;">Отменить</button>
-                </div>
-            `;
-            document.getElementById('cancelEdgeCreation').onclick = function() {
-                pendingEdgeSource = null;
-                showNodeInfo(id);
+        // Обработчик "Создать ребро от этого узла"
+        const startEdgeBtn = document.getElementById('startEdgeFromNode');
+        if (startEdgeBtn) {
+            startEdgeBtn.onclick = function() {
+                if (!network) return;
+                pendingEdgeSource = id;
+                infoContent.innerHTML = `
+                    <div style="text-align:center; padding:10px;">
+                        <p>🔗 Теперь кликните на <strong>целевой узел</strong>, чтобы создать ребро.</p>
+                        <p style="font-size:12px; color:var(--text-muted);">Вес: ${weightInput.value}</p>
+                        <button id="cancelEdgeCreation" style="background:var(--danger-soft); color:var(--danger); border:1px solid var(--danger); padding:6px 12px; border-radius:6px; cursor:pointer;">Отменить</button>
+                    </div>
+                `;
+                document.getElementById('cancelEdgeCreation').onclick = function() {
+                    pendingEdgeSource = null;
+                    showNodeInfo(id);
+                };
+                network.selectNodes([]);
             };
-            network.selectNodes([]);
-        };
-    }
+        }
 
-    // Обработчики кликов по соседям
-    const neighborElements = infoContent.querySelectorAll('.neighbor-row');
-    neighborElements.forEach(row => {
-        row.addEventListener('click', function() {
-            const targetId = parseInt(row.getAttribute('data-goto'), 10);
-            if (!network || !nodes.get(targetId)) return;
-            network.selectNodes([targetId]);
-            network.focus(targetId, { scale: 1.3, animation: true });
-            if (selectedNode !== null && selectedNode !== targetId) {
-                const prev = nodes.get(selectedNode);
-                if (prev) nodes.update({ id: selectedNode, color: prev.originalColor || defaultColor });
-            }
-            nodes.update({ id: targetId, color: selectionColor });
-            selectedNode = targetId;
-            selectedEdge = null;
-            showNodeInfo(targetId);
+        // Клик по соседям
+        const neighborElements = infoContent.querySelectorAll('.neighbor-row');
+        neighborElements.forEach(row => {
+            row.addEventListener('click', function() {
+                const targetId = parseInt(row.getAttribute('data-goto'), 10);
+                if (!network || !nodes.get(targetId)) return;
+                network.selectNodes([targetId]);
+                network.focus(targetId, { scale: 1.3, animation: true });
+                if (selectedNode !== null && selectedNode !== targetId) {
+                    const prev = nodes.get(selectedNode);
+                    if (prev) nodes.update({ id: selectedNode, color: prev.originalColor || defaultColor });
+                }
+                nodes.update({ id: targetId, color: selectionColor });
+                selectedNode = targetId;
+                selectedEdge = null;
+                showNodeInfo(targetId);
+            });
         });
-    });
 
-    // Кнопка центрирования
-    if (focusNodeBtn) {
-        focusNodeBtn.onclick = function() {
-            if (network && selectedNode !== null) {
-                network.focus(selectedNode, { scale: 1.5, animation: true });
-            }
-        };
+        // Кнопка центрирования
+        if (focusNodeBtn) {
+            focusNodeBtn.onclick = function() {
+                if (network && selectedNode !== null) {
+                    network.focus(selectedNode, { scale: 1.5, animation: true });
+                }
+            };
+        }
     }
-}
 
+    // ========== ПОКАЗАТЬ ИНФОРМАЦИЮ О РЕБРЕ ==========
     function showEdgeInfo(id) {
-    if (!infoContent) return;
-    const edge = edges.get(id);
-    if (!edge) return;
-    const weight = edge.weight || edge.value || 0;
-    const sign = weight >= 0 ? 'положительная' : 'отрицательная';
-    infoContent.innerHTML = `
-        <div class="info-row"><span class="info-label">Ребро</span><span class="info-value">${edge.from} → ${edge.to}</span></div>
-        <div class="info-row"><span class="info-label">Вес</span><span class="info-value">${weight}</span></div>
-        <div class="info-row"><span class="info-label">Тип</span><span class="info-value">${sign}</span></div>
-        <div class="hint">Для удаления нажмите «🗑 Ребро»</div>
-    `;
-    infoPanel.classList.add('show');
-    infoPanel.style.display = 'block';   // <--- добавляем эту строку
-}
+        if (!infoContent) return;
+        const edge = edges.get(id);
+        if (!edge) return;
+        const weight = edge.weight || edge.value || 0;
+        const sign = weight >= 0 ? 'положительная' : 'отрицательная';
+        infoContent.innerHTML = `
+            <div class="info-row"><span class="info-label">Ребро</span><span class="info-value">${edge.from} → ${edge.to}</span></div>
+            <div class="info-row"><span class="info-label">Вес</span><span class="info-value">${weight}</span></div>
+            <div class="info-row"><span class="info-label">Тип</span><span class="info-value">${sign}</span></div>
+            <div class="hint">Для удаления нажмите «🗑 Ребро»</div>
+        `;
+        infoPanel.classList.add('show');
+        infoPanel.style.display = 'block';
+    }
 
-    // ---------- Загрузка данных и API ----------
+    // ========== ЗАГРУЗКА ГРАФА ==========
     async function loadGraph() {
         loadingIndicator.classList.add('show');
         try {
@@ -356,10 +397,10 @@ document.addEventListener('DOMContentLoaded', function() {
                 network = null;
             }
             initNetwork(data);
-            // Сброс состояния
             selectedNode = null;
             selectedEdge = null;
             pendingEdgeSource = null;
+            dragSourceId = null;
         } catch (e) {
             alert(`Ошибка загрузки графа: ${e.message}`);
             console.error(e);
@@ -374,6 +415,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
+    // ========== УДАЛЕНИЕ УЗЛА ==========
     async function deleteNode() {
         if (selectedNode === null) {
             alert('Сначала выберите узел (кликните на него)');
@@ -389,6 +431,7 @@ document.addEventListener('DOMContentLoaded', function() {
             if (resp.ok) {
                 selectedNode = null;
                 infoPanel.classList.remove('show');
+                infoPanel.style.display = 'none';
                 loadGraph();
             } else {
                 alert('Ошибка удаления');
@@ -399,6 +442,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
+    // ========== УДАЛЕНИЕ РЕБРА ==========
     async function deleteEdge() {
         if (selectedEdge === null) {
             alert('Сначала выберите ребро (кликните на него)');
@@ -416,6 +460,7 @@ document.addEventListener('DOMContentLoaded', function() {
             if (resp.ok) {
                 selectedEdge = null;
                 infoPanel.classList.remove('show');
+                infoPanel.style.display = 'none';
                 loadGraph();
             } else {
                 alert('Ошибка удаления');
@@ -426,6 +471,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
+    // ========== ОБНОВЛЕНИЕ МЕТКИ / ТИПА ==========
     async function updateLabel() {
         const input = document.getElementById('newLabelInput');
         const newLabel = input.value.trim();
@@ -461,6 +507,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
+    // ========== ДОБАВИТЬ РЕБРО (вручную) ==========
     async function addEdge() {
         if (selectedNode === null) {
             alert('Сначала выберите узел, от которого будет ребро (кликните на него)');
@@ -486,6 +533,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
+    // ========== ДОБАВИТЬ УЗЕЛ ==========
     async function addNode() {
         const input = document.getElementById('newNodeLabelInput');
         const label = input.value.trim();
@@ -513,6 +561,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
+    // ========== СОХРАНИТЬ МОДЕЛЬ ==========
     async function saveModel() {
         try {
             const resp = await fetch('/brain/save', { method: 'POST' });
@@ -524,7 +573,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
-    // Назначаем кнопки
+    // ========== НАЗНАЧЕНИЕ КНОПОК ==========
     document.getElementById('refreshBtn').onclick = loadGraph;
     document.getElementById('addNodeBtn').onclick = addNode;
     document.getElementById('deleteNodeBtn').onclick = deleteNode;
@@ -535,9 +584,10 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('resetPhysicsBtn').onclick = resetPhysics;
     document.getElementById('closeInfo').onclick = function() {
         infoPanel.classList.remove('show');
-        // Сброс ожидания, если было
+        infoPanel.style.display = 'none';
         pendingEdgeSource = null;
     };
 
+    // ========== СТАРТ ==========
     loadGraph();
 });
