@@ -6,6 +6,7 @@
 """
 
 import os
+import re
 import sys
 import json
 import argparse
@@ -17,6 +18,41 @@ from pyvis.network import Network
 
 from brain import CognitiveBrain, BrainConfig
 from brain.graph import NodeType
+
+
+def _norm_type(t):
+    """Приводит node_type к элементу enum NodeType, независимо от того,
+    хранится ли он как сам enum или как строка (например, после
+    сохранения/загрузки модели). Раньше вызов node_type.name падал с
+    AttributeError, если тип приходил строкой — из-за этого отчёт мог
+    вообще не генерироваться."""
+    if isinstance(t, NodeType):
+        return t
+    if isinstance(t, str):
+        key = t.split('.')[-1]
+        try:
+            return NodeType[key]
+        except KeyError:
+            pass
+    return NodeType.CONCEPT
+
+
+def _embed_pyvis_html(net):
+    """Возвращает (head_extra, body_inner) — pyvis Network.generate_html()
+    отдаёт ПОЛНЫЙ HTML-документ (со своими <html>/<head>/<body>), а не
+    фрагмент. Раньше этот документ целиком вставлялся внутрь другого
+    <body>, что даёт вложенные <html>/<head>/<body> — невалидный HTML,
+    из-за которого браузер мог обрезать или неверно рендерить граф и
+    всё, что идёт после него в отчёте. Здесь мы аккуратно достаём
+    содержимое <head> (там подключение vis-network.js и стили canvas) и
+    содержимое <body> (сам div с графом и inline-скрипт) и возвращаем их
+    отдельно, чтобы вставить каждое в нужное место один раз."""
+    full_html = net.generate_html(notebook=False)
+    head_match = re.search(r"<head>(.*?)</head>", full_html, re.DOTALL)
+    body_match = re.search(r"<body>(.*?)</body>", full_html, re.DOTALL)
+    head_extra = head_match.group(1) if head_match else ""
+    body_inner = body_match.group(1) if body_match else full_html
+    return head_extra, body_inner
 
 
 def main():
@@ -104,7 +140,7 @@ def main():
         # Обрезаем слишком длинные метки
         if len(label) > 30:
             label = label[:27] + "..."
-        node_type = node_types.get(nid, NodeType.CONCEPT)
+        node_type = _norm_type(node_types.get(nid, NodeType.CONCEPT))
         color = {
             NodeType.SENSORY: "#FF6B6B",
             NodeType.CONCEPT: "#4ECDC4",
@@ -126,10 +162,15 @@ def main():
     html_parts = []
 
     # Заголовок
+    graph_head_extra, graph_body_inner = _embed_pyvis_html(net)
+
     html_parts.append(f"""
     <!DOCTYPE html>
     <html>
-    <head><meta charset="utf-8"><title>Knowledge Report</title></head>
+    <head>
+    <meta charset="utf-8"><title>Knowledge Report</title>
+    {graph_head_extra}
+    </head>
     <body>
     <h1>Отчёт о знаниях CognitiveBrain</h1>
     <p>Всего нейронов: {num_nodes}, отображено: {len(top_nodes)}</p>
@@ -138,8 +179,8 @@ def main():
     <h2>Граф знаний (интерактивный)</h2>
     """)
 
-    # Вставляем граф
-    html_parts.append(net.generate_html())
+    # Вставляем содержимое <body> графа (без обёртки html/head/body)
+    html_parts.append(graph_body_inner)
 
     # --- Таблица базы знаний ---
     html_parts.append("<h2>База знаний (вопрос-ответ)</h2>")
