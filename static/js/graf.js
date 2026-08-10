@@ -10,12 +10,20 @@ document.addEventListener('DOMContentLoaded', function () {
     let selectedEdge = null;
     let pendingEdgeSource = null;
     let dragSourceId = null;
+
+    // Переменные для эффекта отталкивания
+    let savedPositions = {};
+    let draggingNodeId = null;
+    const repelThreshold = 120;
+    const repelStrength = 0.35;
+
     const container = document.getElementById('graph-container');
     const infoPanel = document.getElementById('info-panel');
     const infoContent = document.getElementById('infoContent');
     const loadingIndicator = document.getElementById('loading-indicator');
     const focusNodeBtn = document.getElementById('focusNodeBtn');
     const weightInput = document.getElementById('weightInput');
+
     const typeColors = {
         SENSORY: '#8F8178',
         CONCEPT: '#6F9587',
@@ -202,69 +210,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }, 5000);
     }
 
-    function setupEvents() {
-        network.on('hoverNode', function (params) {
-            if (selectedNode === null) {
-                highlightNode(params.node);
-            }
-        });
-        network.on('blurNode', function () {
-            if (selectedNode === null) {
-                restoreAppearance();
-            }
-        });
-        network.on('dragStart', function (params) {
-            network.setOptions({ physics: { enabled: false } });
-            if (params.nodes.length) {
-                dragSourceId = params.nodes[0];
-            }
-        });
-        network.on('dragEnd', function (params) {
-            if (dragSourceId === null) return;
-            const target = network.getNodeAt({ x: params.pointer.DOM.x, y: params.pointer.DOM.y });
-            if (target !== undefined && target !== null && target !== dragSourceId) {
-                createEdge(dragSourceId, target);
-            }
-            dragSourceId = null;
-        });
-        network.on('click', function (params) {
-            restoreAppearance();
-            if (params.nodes.length) {
-                const nodeId = params.nodes[0];
-                if (pendingEdgeSource !== null && pendingEdgeSource !== nodeId) {
-                    createEdge(pendingEdgeSource, nodeId);
-                    return;
-                }
-                pendingEdgeSource = null;
-                selectedNode = nodeId;
-                selectedEdge = null;
-                network.selectNodes([nodeId]);
-                network.selectEdges([]);
-                highlightNode(nodeId);
-                showNodeInfo(nodeId);
-                return;
-            }
-            if (params.edges.length) {
-                const edgeId = params.edges[0];
-                selectedEdge = edgeId;
-                selectedNode = null;
-                network.selectEdges([edgeId]);
-                network.selectNodes([]);
-                highlightEdge(edgeId);
-                showEdgeInfo(edgeId);
-                return;
-            }
-            selectedNode = null;
-            selectedEdge = null;
-            pendingEdgeSource = null;
-            network.selectNodes([]);
-            network.selectEdges([]);
-            infoPanel.classList.remove('show');
-            infoPanel.style.display = 'none';
-        });
-    }
-
-    // Оптимизированная подсветка узла – массовое обновление
+    // ---------- МАССОВЫЕ ОБНОВЛЕНИЯ ДЛЯ ПРОИЗВОДИТЕЛЬНОСТИ ----------
     function highlightNode(id) {
         const connected = new Set([id]);
         const connectedEdges = new Set();
@@ -318,7 +264,6 @@ document.addEventListener('DOMContentLoaded', function () {
         if (edgeUpdates.length) edges.update(edgeUpdates);
     }
 
-    // Массовое восстановление внешнего вида
     function restoreAppearance() {
         const nodeUpdates = [];
         const edgeUpdates = [];
@@ -345,7 +290,6 @@ document.addEventListener('DOMContentLoaded', function () {
         if (edgeUpdates.length) edges.update(edgeUpdates);
     }
 
-    // Подсветка ребра – массовое обновление
     function highlightEdge(id) {
         const edgeUpdates = [];
         edges.forEach(e => {
@@ -366,6 +310,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (edgeUpdates.length) edges.update(edgeUpdates);
     }
 
+    // ---------- СОЗДАНИЕ РЕБРА ----------
     function createEdge(from, to) {
         const weight = parseFloat(weightInput?.value) || 0.5;
         if (from === to) {
@@ -393,6 +338,7 @@ document.addEventListener('DOMContentLoaded', function () {
             });
     }
 
+    // ---------- ИНФОРМАЦИОННЫЕ ПАНЕЛИ ----------
     function showNodeInfo(id) {
         if (!infoContent) return;
         const node = nodes.get(id);
@@ -489,6 +435,7 @@ document.addEventListener('DOMContentLoaded', function () {
         infoPanel.style.display = 'block';
     }
 
+    // ---------- ЗАГРУЗКА ГРАФА ----------
     async function loadGraph() {
         loadingIndicator?.classList.add('show');
         try {
@@ -514,6 +461,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
+    // ---------- УПРАВЛЕНИЕ ФИЗИКОЙ ----------
     function resetPhysics() {
         if (!network) return;
         network.setOptions({ physics: { enabled: true } });
@@ -525,6 +473,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }, 1500);
     }
 
+    // ---------- УДАЛЕНИЕ ----------
     async function deleteNode() {
         if (selectedNode === null) {
             alert('Сначала выберите узел.');
@@ -571,6 +520,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
+    // ---------- ОБНОВЛЕНИЕ УЗЛА ----------
     async function updateLabel() {
         const input = document.getElementById('newLabelInput');
         const typeSelect = document.getElementById('editNodeTypeSelect');
@@ -604,6 +554,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
+    // ---------- РУЧНОЕ ДОБАВЛЕНИЕ РЕБРА ----------
     function addEdgeManually() {
         if (selectedNode === null) {
             alert('Сначала выберите узел-источник.');
@@ -619,6 +570,7 @@ document.addEventListener('DOMContentLoaded', function () {
         createEdge(selectedNode, to);
     }
 
+    // ---------- ДОБАВЛЕНИЕ УЗЛА ----------
     async function addNode() {
         const input = document.getElementById('newNodeLabelInput');
         const typeSelect = document.getElementById('newNodeTypeSelect');
@@ -645,6 +597,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
+    // ---------- СОХРАНЕНИЕ ----------
     async function saveModel() {
         try {
             const resp = await fetch('/brain/save', { method: 'POST' });
@@ -658,6 +611,112 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
+    // ---------- НАСТРОЙКА СОБЫТИЙ ГРАФА (ВКЛЮЧАЯ ОТТАЛКИВАНИЕ) ----------
+    function setupEvents() {
+        // Hover
+        network.on('hoverNode', function (params) {
+            if (selectedNode === null) highlightNode(params.node);
+        });
+        network.on('blurNode', function () {
+            if (selectedNode === null) restoreAppearance();
+        });
+
+        // DragStart – отключаем физику, запоминаем позиции
+        network.on('dragStart', function (params) {
+            network.setOptions({ physics: { enabled: false } });
+            if (params.nodes.length) {
+                dragSourceId = params.nodes[0];
+                draggingNodeId = params.nodes[0];
+                savedPositions = network.getPositions();
+            }
+        });
+
+        // Dragging – отталкивание соседей
+        network.on('dragging', function (params) {
+            if (draggingNodeId === null) return;
+            const dragPos = network.getPosition(draggingNodeId);
+            if (!dragPos) return;
+            const allPositions = network.getPositions();
+            const updates = {};
+            for (let id in allPositions) {
+                if (id == draggingNodeId) continue;
+                const pos = allPositions[id];
+                const dx = pos.x - dragPos.x;
+                const dy = pos.y - dragPos.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < repelThreshold && dist > 0.1) {
+                    const force = (repelThreshold - dist) / repelThreshold * repelStrength;
+                    const moveX = dx / dist * force;
+                    const moveY = dy / dist * force;
+                    updates[id] = { x: pos.x + moveX, y: pos.y + moveY };
+                }
+            }
+            for (let id in updates) {
+                network.moveNode(id, updates[id].x, updates[id].y);
+            }
+        });
+
+        // DragEnd – возврат позиций и создание ребра
+        network.on('dragEnd', function (params) {
+            // Возвращаем узлы на места (кроме перетаскиваемого)
+            if (draggingNodeId !== null) {
+                for (let id in savedPositions) {
+                    if (id == draggingNodeId) continue;
+                    const pos = savedPositions[id];
+                    network.moveNode(id, pos.x, pos.y);
+                }
+                savedPositions = {};
+                draggingNodeId = null;
+            }
+
+            // Создание ребра (старая логика)
+            if (dragSourceId === null) return;
+            const target = network.getNodeAt({ x: params.pointer.DOM.x, y: params.pointer.DOM.y });
+            if (target !== undefined && target !== null && target !== dragSourceId) {
+                createEdge(dragSourceId, target);
+            }
+            dragSourceId = null;
+        });
+
+        // Click – выбор узла/ребра
+        network.on('click', function (params) {
+            restoreAppearance();
+            if (params.nodes.length) {
+                const nodeId = params.nodes[0];
+                if (pendingEdgeSource !== null && pendingEdgeSource !== nodeId) {
+                    createEdge(pendingEdgeSource, nodeId);
+                    return;
+                }
+                pendingEdgeSource = null;
+                selectedNode = nodeId;
+                selectedEdge = null;
+                network.selectNodes([nodeId]);
+                network.selectEdges([]);
+                highlightNode(nodeId);
+                showNodeInfo(nodeId);
+                return;
+            }
+            if (params.edges.length) {
+                const edgeId = params.edges[0];
+                selectedEdge = edgeId;
+                selectedNode = null;
+                network.selectEdges([edgeId]);
+                network.selectNodes([]);
+                highlightEdge(edgeId);
+                showEdgeInfo(edgeId);
+                return;
+            }
+            selectedNode = null;
+            selectedEdge = null;
+            pendingEdgeSource = null;
+            network.selectNodes([]);
+            network.selectEdges([]);
+            infoPanel.classList.remove('show');
+            infoPanel.style.display = 'none';
+        });
+    }
+
+    // ---------- ПРИВЯЗКА КНОПОК И ЗАПУСК ----------
     document.getElementById('refreshBtn')?.addEventListener('click', loadGraph);
     document.getElementById('addNodeBtn')?.addEventListener('click', addNode);
     document.getElementById('deleteNodeBtn')?.addEventListener('click', deleteNode);
