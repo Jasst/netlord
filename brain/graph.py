@@ -9,6 +9,26 @@ from enum import Enum
 from brain.utils import grow_parameter_in_optimizer
 
 
+# ----------------------------------------------------------------------
+# Типы отношений между узлами.
+# ИСПРАВЛЕНО: раньше каждое ребро несло только один скаляр (сила связи,
+# edge_dim=1) — граф физически не мог отличить "A — ответ на Q" от
+# "A противоречит Q" иначе как по знаку веса. При этом brain.py уже
+# собирал предикат отношения (semantic_memory: (subj, "has_answer", obj)),
+# но эти данные никуда не попадали в сам GATv2-граф — две системы знаний
+# жили параллельно. Теперь тип отношения — часть edge-фичи: обучаемый
+# embedding конкатенируется со скаляром веса, GAT-attention может
+# по-разному взвешивать "ответ на" и "противоречит", а не сваливать всё
+# в одну кучу.
+#
+# ВАЖНО: добавление нового элемента в этот список меняет edge_dim, а
+# значит и форму внутренних весов GATv2Conv, отвечающих за проекцию
+# edge-фичи — это архитектурное изменение, а не косметика. См. комментарий
+# в CognitiveBrain.load() про миграцию существующих чекпоинтов.
+# ----------------------------------------------------------------------
+RELATION_TYPES: List[str] = ["has_answer", "contradicts"]
+
+
 class NodeType(Enum):
     SENSORY = 0
     CONCEPT = 1
@@ -22,19 +42,25 @@ class NodeType(Enum):
 # ----------------------------------------------------------------------
 class DifferentiableNeuralGraph(nn.Module):
     def __init__(self, dim: int, max_nodes: int = 5000, hidden_dim: int = 256,
-                 num_heads: int = 4, num_layers: int = 3):
+                 num_heads: int = 4, num_layers: int = 3,
+                 relation_types: Optional[List[str]] = None, relation_embed_dim: int = 4):
         super().__init__()
         self.dim = dim
         self.max_nodes = max_nodes
 
         self.node_emb = nn.Parameter(torch.zeros(0, dim))
 
+        self.relation_types = list(relation_types) if relation_types else list(RELATION_TYPES)
+        self.relation_to_idx = {r: i for i, r in enumerate(self.relation_types)}
+        self.relation_embedding = nn.Embedding(len(self.relation_types), relation_embed_dim)
+        edge_dim = 1 + relation_embed_dim  # скаляр веса + обучаемый вектор типа отношения
+
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         in_dim = dim
         for i in range(num_layers):
             out_dim = hidden_dim if i < num_layers - 1 else dim
-            self.layers.append(GATv2Conv(in_dim, out_dim, heads=num_heads, concat=False, edge_dim=1))
+            self.layers.append(GATv2Conv(in_dim, out_dim, heads=num_heads, concat=False, edge_dim=edge_dim))
             self.norms.append(LayerNorm(out_dim))
             in_dim = out_dim
 
@@ -42,6 +68,7 @@ class DifferentiableNeuralGraph(nn.Module):
 
         self._edges: List[Tuple[int, int]] = []
         self._edge_weights = nn.ParameterList()
+        self._edge_relations: List[int] = []  # индекс в self.relation_types, параллельно self._edges
         self._edge_index = None
         self._adjacency: Dict[int, List[Tuple[int, float]]] = {}
 
@@ -89,10 +116,20 @@ class DifferentiableNeuralGraph(nn.Module):
             adjacency.setdefault(t, []).append((f, w * 0.5))
         self._adjacency = adjacency
 
-    def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1, optimizer=None) -> int:
+    def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1,
+                     relation: str = "has_answer", optimizer=None) -> int:
         from_id = int(from_id)
         to_id = int(to_id)
+        rel_idx = self.relation_to_idx.get(relation)
+        if rel_idx is None:
+            # неизвестный тип отношения — не роняем обучение, откатываемся на
+            # первый определённый тип и явно предупреждаем, чтобы это не
+            # прошло незамеченным при добавлении нового предиката без
+            # обновления RELATION_TYPES
+            print(f"[Graph] Неизвестный тип отношения '{relation}', использую '{self.relation_types[0]}'")
+            rel_idx = 0
         self._edges.append((from_id, to_id))
+        self._edge_relations.append(rel_idx)
         new_w = nn.Parameter(torch.tensor(weight, dtype=torch.float))
         self._edge_weights.append(new_w)
         self._rebuild_edges()
@@ -112,10 +149,12 @@ class DifferentiableNeuralGraph(nn.Module):
             return x
 
         if len(self._edge_weights) > 0:
-            weights = [w for w in self._edge_weights]
-            edge_attr = torch.stack(weights).view(-1, 1)
+            weights = torch.stack([w for w in self._edge_weights]).view(-1, 1)
+            rel_idx = torch.tensor(self._edge_relations, dtype=torch.long, device=weights.device)
+            rel_emb = self.relation_embedding(rel_idx)
+            edge_attr = torch.cat([weights, rel_emb], dim=1)
         else:
-            edge_attr = torch.zeros((0, 1), device=x.device)
+            edge_attr = torch.zeros((0, 1 + self.relation_embedding.embedding_dim), device=x.device)
 
         h = x
         for layer, norm in zip(self.layers, self.norms):
@@ -229,8 +268,8 @@ class HierarchicalGraph(nn.Module):
 
     # ---------- ДОБАВЛЕННЫЙ МЕТОД (был пропущен) ----------
     def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1,
-                    level_idx: int = 0, optimizer=None) -> int:
-        return self.levels[level_idx].add_synapse(from_id, to_id, weight, optimizer=optimizer)
+                    relation: str = "has_answer", level_idx: int = 0, optimizer=None) -> int:
+        return self.levels[level_idx].add_synapse(from_id, to_id, weight, relation=relation, optimizer=optimizer)
 
     def find_most_similar(self, query: torch.Tensor, level_idx: int = 0, threshold: float = 0.87) -> Optional[int]:
         return self.levels[level_idx].find_most_similar(query, threshold)
@@ -270,7 +309,22 @@ class HierarchicalGraph(nn.Module):
             hs[i] = hs[i] + 0.2 * modulation
         return hs[0]
 
-    def rebuild_hierarchy(self, optimizer=None):
+    def rebuild_hierarchy(self, optimizer=None, chunk_size: int = 2048):
+        """
+        ИСПРАВЛЕНО: раньше кластеризация делала n*(n-1)/2 отдельных питоновских
+        вызовов F.cosine_similarity(proj[a], proj[b]) — накладные расходы на вызов
+        функции доминировали над самим вычислением, и уже на нескольких тысячах
+        узлов rebuild_hierarchy (вызывается из sleep(), т.е. из фонового цикла
+        агента) становился основным потребителем времени в цикле обучения.
+
+        Теперь сходство считается блочным матричным умножением (proj_block @ proj.T)
+        — та же O(n^2) асимптотика по сути кластеризации (это неизбежно для
+        полного попарного сравнения), но вычисления идут внутри torch/BLAS,
+        а не питоновским циклом с вызовом функции на каждую пару. chunk_size
+        ограничивает пиковую память: вместо полной матрицы (n x n), которая при
+        больших n (десятки тысяч узлов) может занимать гигабайты, за раз строится
+        только блок (chunk_size x n).
+        """
         for i in range(len(self.levels) - 1):
             lower = self.levels[i]
             n = lower.node_emb.shape[0]
@@ -281,21 +335,20 @@ class HierarchicalGraph(nn.Module):
                 proj = self.level_projections[i](h)
                 proj = F.normalize(proj, p=2, dim=1)
 
-            assigned = [False] * n
-            clusters: List[List[int]] = []
-            for a in range(n):
-                if assigned[a]:
-                    continue
-                cluster = [a]
-                assigned[a] = True
-                for b in range(a + 1, n):
-                    if assigned[b]:
-                        continue
-                    sim = float(F.cosine_similarity(proj[a].unsqueeze(0), proj[b].unsqueeze(0)))
-                    if sim >= self.cluster_threshold:
-                        cluster.append(b)
-                        assigned[b] = True
-                clusters.append(cluster)
+                assigned = torch.zeros(n, dtype=torch.bool, device=proj.device)
+                clusters: List[List[int]] = []
+                for start in range(0, n, chunk_size):
+                    end = min(start + chunk_size, n)
+                    sim_block = proj[start:end] @ proj.T  # (block, n)
+                    for local_a in range(end - start):
+                        a = start + local_a
+                        if assigned[a]:
+                            continue
+                        mask = (sim_block[local_a] >= self.cluster_threshold) & (~assigned)
+                        mask[a] = True
+                        members = mask.nonzero(as_tuple=True)[0].tolist()
+                        assigned[members] = True
+                        clusters.append(members)
 
             upper = self.levels[i + 1]
             new_assignment: Dict[int, int] = {}

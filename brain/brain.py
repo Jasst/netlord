@@ -205,14 +205,27 @@ class CognitiveBrain(nn.Module):
                                          node_type=NodeType.CONCEPT, optimizer=self.optimizer)
             self.concept_index[self._normalize(a)] = a_nid
 
-        self.graph.add_synapse(q_nid, a_nid, weight=0.2 * reward, optimizer=self.optimizer)
+        self.graph.add_synapse(q_nid, a_nid, weight=0.2 * reward, relation="has_answer", optimizer=self.optimizer)
 
         loss = self._contrastive_loss(q_nid, a_nid)
+
         if self.ewc is not None:
-            loss = loss + self.ewc.penalty()
-        loss.backward()
-        if self.ewc is not None:
+            # ИСПРАВЛЕНО: раньше accumulate() вызывался ПОСЛЕ backward() суммарного
+            # (task_loss + ewc.penalty()) лосса — Fisher-информация (оценка "важности"
+            # параметра) считалась по градиенту, уже включающему сам EWC-штраф, который
+            # тянет параметры к якорю. Это систематически занижало важность параметров,
+            # уже близких к якорю, и искажало то, что EWC должен защищать при continual
+            # learning. Теперь Fisher считается по градиенту ЧИСТОГО task loss (первый
+            # backward, retain_graph=True), а второй backward — уже с penalty — идёт
+            # в оптимизатор как обычно.
+            loss.backward(retain_graph=True)
             self.ewc.accumulate()
+            self.optimizer.zero_grad()
+            total_loss = loss + self.ewc.penalty()
+            total_loss.backward()
+        else:
+            loss.backward()
+
         self.optimizer.step()
         self.optimizer.zero_grad()
 
@@ -260,7 +273,7 @@ class CognitiveBrain(nn.Module):
             if a_nid is None:
                 a_nid = self.graph.add_node(a_vec, label=output_text[:30], cluster="output", layer=0,
                                              node_type=NodeType.CONCEPT, optimizer=self.optimizer)
-            self.graph.add_synapse(q_nid, a_nid, weight=-penalty, optimizer=self.optimizer)
+            self.graph.add_synapse(q_nid, a_nid, weight=-penalty, relation="contradicts", optimizer=self.optimizer)
             self._learn_counter += 1
             if self._learn_counter % self.config.checkpoint_every == 0:
                 self.save()
@@ -480,26 +493,71 @@ class CognitiveBrain(nn.Module):
             self.knowledge_base.pop(0)
 
     def _build_context(self, query: str, memory_results: List[Dict], start_nid: int,
-                        thought_stream: Optional[List[Tuple[int, float]]] = None) -> str:
+                        thought_stream: Optional[List[Tuple[int, float]]] = None,
+                        max_facts: int = 12) -> str:
+        """
+        ИСПРАВЛЕНО: раньше поток активации графа (top_k=6), эпизодическая память
+        (top 10) и база знаний (top 10) просто конкатенировались тремя независимыми
+        списками — до 26 строк без дедупликации и без единой шкалы релевантности.
+        Одна и та же информация часто встречается сразу в KB и в эпизодической
+        памяти (KB заполняется из тех же learn_pair, что попадают в эпизодическую
+        память), из-за чего LLM получала избыточный, "размытый" контекст — это
+        напрямую снижает качество ответа, т.к. модели сложнее выделить релевантное
+        среди повторов.
+
+        Теперь все источники нормализуются в единый список (текст, score, источник),
+        схожие по тексту факты дедуплицируются (оставляем более релевантный),
+        сортируются по score и обрезаются общим бюджетом max_facts — а не
+        независимо по каждому источнику.
+        """
         context = f"Вопрос: {query}\n"
         node_labels = getattr(self.graph, 'node_labels', {})
         start_label = node_labels.get(start_nid, "")
         if start_label:
             context += f"Отправная ассоциация графа: {start_label}\n"
+
+        candidates: List[Tuple[float, str, str]] = []  # (score, text, source_line)
+
         if thought_stream:
-            context += "Поток ассоциаций графа (концепт — сила активации):\n"
+            max_strength = max((s for _, s in thought_stream), default=1.0) or 1.0
             for nid, strength in thought_stream:
                 label = node_labels.get(nid, "")
                 if label:
-                    context += f"- {label} (активация: {strength:.2f})\n"
-        if memory_results:
-            context += "Из эпизодической памяти:\n"
-            for res in memory_results[:10]:
-                meta = res.get("metadata", {})
-                context += f"- {meta.get('text', '')}\n"
-        kb_facts = self._search_knowledge_base(query, top_k=10)
-        if kb_facts:
-            context += "Из базы знаний:\n" + "\n".join(kb_facts) + "\n"
+                    norm_score = strength / max_strength  # приводим к [0, 1], сопоставимо с cosine-based score
+                    candidates.append((
+                        norm_score, self._normalize(label),
+                        f"[ассоциация графа] {label} (активация: {strength:.2f})"
+                    ))
+
+        for res in memory_results:
+            meta = res.get("metadata", {})
+            text = meta.get("text", "")
+            if text:
+                candidates.append((float(res.get("distance", 0.0)), self._normalize(text),
+                                    f"[эпизодическая память] {text}"))
+
+        kb_facts = self._search_knowledge_base(query, top_k=max_facts, return_scored=True)
+        for score, q, a in kb_facts:
+            candidates.append((score, self._normalize(f"{q} {a}"), f"[база знаний] Q: {q} -> A: {a}"))
+
+        # Дедупликация: если новый факт по тексту почти совпадает с уже отобранным
+        # более релевантным — пропускаем (простое подстрочное совпадение достаточно
+        # для этого случая, т.к. дубли обычно приходят из одного и того же q/a).
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        selected: List[str] = []
+        seen_norms: List[str] = []
+        for score, norm_text, line in candidates:
+            if any(norm_text in seen or seen in norm_text for seen in seen_norms):
+                continue
+            seen_norms.append(norm_text)
+            selected.append(line)
+            if len(selected) >= max_facts:
+                break
+
+        if selected:
+            context += "Релевантные факты и ассоциации (по убыванию релевантности):\n"
+            context += "\n".join(f"- {line}" for line in selected) + "\n"
+
         context += "Сформулируй ответ на основе потока ассоциаций и данных выше. Если ничего релевантного не активировано, скажи: 'Я не знаю'."
         return context
 
@@ -511,10 +569,9 @@ class CognitiveBrain(nn.Module):
         context += "На основе этих данных дай точный ответ. Если данных недостаточно, скажи: 'Не удалось найти'."
         return context
 
-    def _search_knowledge_base(self, query: str, top_k: int = 3) -> List[str]:
-        results = []
+    def _search_knowledge_base(self, query: str, top_k: int = 3, return_scored: bool = False):
         if not self.knowledge_base:
-            return results
+            return []
         q_vec = self.text_to_embedding(query, is_query=True)
         scored = []
         for item in self.knowledge_base:
@@ -526,10 +583,10 @@ class CognitiveBrain(nn.Module):
             sim = cosine_similarity(q_vec, emb)
             scored.append((sim, item))
         scored.sort(key=lambda x: x[0], reverse=True)
-        for sim, item in scored[:top_k]:
-            if sim > 0.4:
-                results.append(f"Q: {item['q']} -> A: {item['a']}")
-        return results
+        top = [(sim, item) for sim, item in scored[:top_k] if sim > 0.4]
+        if return_scored:
+            return [(sim, item["q"], item["a"]) for sim, item in top]
+        return [f"Q: {item['q']} -> A: {item['a']}" for sim, item in top]
 
     def _get_crypto_price(self, crypto_id: str = "bitcoin", vs_currency: str = "usd") -> Optional[float]:
         url = f"https://api.coingecko.com/api/v3/simple/price?ids={crypto_id}&vs_currencies={vs_currency}"
@@ -569,7 +626,11 @@ class CognitiveBrain(nn.Module):
             if hasattr(self.graph, '_edges') and hasattr(self.graph, '_edge_weights'):
                 edges = self.graph._edges
                 weights = [w.detach().cpu().numpy() for w in self.graph._edge_weights]
-                pickle.dump((edges, weights), f)
+                # ИСПРАВЛЕНО: добавлен третий элемент — тип отношения каждого ребра
+                # (индекс в graph.relation_types). Раньше синапс нёс только скаляр
+                # веса. load() ниже умеет читать и старый двухэлементный формат.
+                relations = list(getattr(self.graph, '_edge_relations', [0] * len(edges)))
+                pickle.dump((edges, weights, relations), f)
 
         # 2. Сохраняем метаданные узлов (метки, типы, кластеры) — ЭТО НОВОЕ
         if hasattr(self.graph, 'levels'):
@@ -654,15 +715,27 @@ class CognitiveBrain(nn.Module):
         edges_path = f"{path}/edges.pkl"
         if os.path.exists(edges_path):
             with open(edges_path, "rb") as f:
-                edges, weights = pickle.load(f)
+                loaded = pickle.load(f)
+            if len(loaded) == 3:
+                edges, weights, relations = loaded
+            else:
+                # старый формат (до типизации рёбер) — все существующие синапсы
+                # были обучены как безымянная "положительная" связь, ближе всего
+                # семантически к has_answer (индекс 0 в RELATION_TYPES)
+                edges, weights = loaded
+                relations = [0] * len(edges)
+                print(f"[Brain] edges.pkl в старом формате (без типов отношений), "
+                      f"{len(edges)} рёбер помечены как '{self.graph.relation_types[0] if hasattr(self.graph, 'relation_types') else 'has_answer'}'.")
             if hasattr(self.graph, 'levels'):
                 level0 = self.graph.levels[0]
                 level0._edges = edges
                 level0._edge_weights = nn.ParameterList([nn.Parameter(torch.tensor(w)) for w in weights])
+                level0._edge_relations = list(relations)
                 level0._rebuild_edges()
             else:
                 self.graph._edges = edges
                 self.graph._edge_weights = nn.ParameterList([nn.Parameter(torch.tensor(w)) for w in weights])
+                self.graph._edge_relations = list(relations)
                 self.graph._rebuild_edges()
 
         # 3. Загружаем метаданные узлов (ЭТО НОВОЕ)
