@@ -27,13 +27,30 @@ from brain import CognitiveBrain, BrainConfig
 
 
 def load_pairs(path: str):
+    """
+    ИСПРАВЛЕНО: раньше json.loads(line) без try/except — одна битая строка
+    (например, из старого words.py без строгой валидации, или просто
+    повреждённая при переносе файла) обрывала загрузку всего корпуса на
+    середине, и всё, что шло после, просто не попадало в обучение молча
+    (падение с трейсбеком). Теперь битая строка логируется с номером и
+    пропускается, а загрузка остального файла продолжается.
+    """
+    skipped = 0
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for line_num, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            item = json.loads(line)
-            yield item["q"], item["a"]
+            try:
+                item = json.loads(line)
+                q, a = item["q"], item["a"]
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                skipped += 1
+                print(f"[bulk_train] Пропущена строка {line_num} ({e}): {line[:80]!r}")
+                continue
+            yield q, a
+    if skipped:
+        print(f"[bulk_train] Всего пропущено битых строк: {skipped}")
 
 
 def main():

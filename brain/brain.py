@@ -234,17 +234,55 @@ class CognitiveBrain(nn.Module):
             self.memory.add_semantic_triple(q, "has_answer", a, confidence=reward)
 
     def _contrastive_loss(self, q_nid: int, a_nid: int) -> torch.Tensor:
+        """
+        ИСПРАВЛЕНО: раньше негативы для контрастива брались случайно из ВСЕХ
+        узлов графа (random.sample(candidates, k)). Пока граф маленький,
+        случайный узел ещё туда-сюда информативен, но с ростом графа случайный
+        негатив почти гарантированно семантически далёк от вопроса — сходство
+        к нему околонулевое ещё до обучения, cross_entropy сразу маленький,
+        градиент через него почти нулевой. Лосс выглядит "хорошо", но перестаёт
+        чему-либо учить — классическая ловушка контрастивного обучения на
+        растущем графе.
+
+        Теперь негативы — top-K УЖЕ БЛИЗКИХ к вопросу узлов (кроме самого
+        правильного ответа), т.е. "похоже, но неверно" вместо "далеко и так
+        понятно, что неверно". Это заставляет граф учиться тонким различиям
+        между близкими по смыслу узлами, а не тривиальному отсеиванию мусора.
+        Используется уже посчитанный h — без лишнего forward и без похода в
+        отдельный индекс.
+        """
         h = self.graph.forward()
         n = h.shape[0]
-        emb_q = F.normalize(h[q_nid - 1].unsqueeze(0), p=2, dim=1)
-        emb_a = F.normalize(h[a_nid - 1].unsqueeze(0), p=2, dim=1)
+        h_norm = F.normalize(h, p=2, dim=1)
+        emb_q = h_norm[q_nid - 1].unsqueeze(0)
+        emb_a = h_norm[a_nid - 1].unsqueeze(0)
         pos_sim = (emb_q * emb_a).sum(dim=1) * 10.0
+
         num_negatives = self.config.contrastive_num_negatives
-        candidates = [i for i in range(n) if i not in (q_nid - 1, a_nid - 1)]
-        k = min(num_negatives, len(candidates))
-        if k > 0:
-            neg_idx = torch.tensor(random.sample(candidates, k), device=h.device)
-            emb_neg = F.normalize(h[neg_idx], p=2, dim=1)
+        hard_pool = min(getattr(self.config, "contrastive_hard_pool", num_negatives * 3), n)
+
+        mask = torch.ones(n, dtype=torch.bool, device=h.device)
+        mask[q_nid - 1] = False
+        mask[a_nid - 1] = False
+        num_candidates = int(mask.sum().item())
+
+        if num_candidates > 0:
+            sim_to_q = (emb_q @ h_norm.T).squeeze(0)
+            sim_to_q = sim_to_q.masked_fill(~mask, float("-inf"))
+
+            k = min(num_negatives, num_candidates)
+            pool_size = min(hard_pool, num_candidates)
+            pool_vals, pool_idx = torch.topk(sim_to_q, pool_size)
+            if k < pool_size:
+                # берём не жёстко top-k, а случайную выборку ИЗ пула ближайших —
+                # иначе на каждом шаге одни и те же самые близкие соседи, и граф
+                # быстро переобучается именно под них, а не под общую границу
+                perm = torch.randperm(pool_size, device=h.device)[:k]
+                neg_idx = pool_idx[perm]
+            else:
+                neg_idx = pool_idx[:k]
+
+            emb_neg = h_norm[neg_idx]
             neg_sim = (emb_q @ emb_neg.T).squeeze(0) * 10.0
             logits = torch.cat([pos_sim, neg_sim]).unsqueeze(0)
             labels = torch.zeros(1, dtype=torch.long, device=h.device)
