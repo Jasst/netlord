@@ -1,3 +1,4 @@
+# brain/brain.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,7 +23,6 @@ from brain.llm import LLMInterface
 from brain.utils import EmbeddingProvider, random_vector
 from brain.search import WebSearcher
 
-# Опциональные модули для агента (могут отсутствовать, если не нужны)
 from brain.motivation import DriveSystem
 from brain.emotion import EmotionModel
 from brain.user_model import UserModel
@@ -38,28 +38,22 @@ _SEARCH_TRIGGER_WORDS = (
 # Вспомогательные модули
 # ----------------------------------------------------------------------
 class Reflector:
-    """Улучшает короткие или неуверенные ответы."""
     def __init__(self, llm: LLMInterface):
         self.llm = llm
-
     def should_reflect(self, answer: str) -> bool:
         return len(answer.split()) < 3 or "не знаю" in answer.lower()
-
     def reflect(self, question: str, answer: str) -> str:
         prompt = f"Исправь и улучши ответ на вопрос '{question}'. Текущий ответ: '{answer}'. Улучшенный ответ:"
         improved = self.llm.generate(prompt, max_tokens=150, temperature=0.3, enable_thinking=False)
         return improved if improved.strip() else answer
 
-
 class EWC:
-    """Elastic Weight Consolidation – защита от катастрофического забывания."""
     def __init__(self, model: nn.Module, lambda_: float = 0.1, decay: float = 0.99):
         self.model = model
         self.lambda_ = lambda_
         self.decay = decay
         self.fisher: Dict[str, torch.Tensor] = {}
         self.anchor: Dict[str, torch.Tensor] = {}
-
     def accumulate(self):
         for name, param in self.model.named_parameters():
             if not (param.requires_grad and param.grad is not None):
@@ -70,12 +64,10 @@ class EWC:
                 self.anchor[name] = param.data.clone()
             else:
                 self.fisher[name].mul_(self.decay).add_(g2, alpha=1 - self.decay)
-
     def set_anchor(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.anchor[name] = param.data.clone()
-
     def penalty(self) -> torch.Tensor:
         params = list(self.model.parameters())
         device = params[0].device if params else torch.device("cpu")
@@ -88,13 +80,10 @@ class EWC:
             loss = loss + (self.fisher[name] * (param - self.anchor[name]) ** 2).sum()
         return self.lambda_ * loss
 
-
 class ToolRegistry:
-    """Инструменты: погода, калькулятор, дата/время."""
     def __init__(self, config: BrainConfig):
         self.config = config
         self.openweather_key = config.openweather_api_key
-
     def get_weather(self, city: str) -> str:
         if not self.openweather_key:
             return "API-ключ OpenWeather не настроен."
@@ -110,7 +99,6 @@ class ToolRegistry:
                 return f"Ошибка получения погоды: код {resp.status_code}"
         except Exception as e:
             return f"Ошибка: {e}"
-
     def calculate(self, expression: str) -> str:
         allowed = re.compile(r'^[\d+\-*/().\s]+$')
         if not allowed.match(expression):
@@ -126,23 +114,18 @@ class ToolRegistry:
             return f"{expression} = {result}"
         except Exception as e:
             return f"Ошибка вычисления: {e}"
-
     def get_datetime(self) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S")
-
     def execute(self, text: str) -> Optional[str]:
         lower = text.lower()
-        # Погода
         match = re.search(r'погод[ау]?\s+(в\s+)?([А-Яа-я\s\-]+)', lower)
         if match:
             city = match.group(2).strip()
             if city:
                 return self.get_weather(city)
-        # Калькулятор
         match = re.search(r'(\d+[\s+\-*/()]*\d+)', text)
         if match and any(kw in lower for kw in ['сколько', 'посчитай', 'вычисли', 'реши']):
             return self.calculate(match.group(1))
-        # Дата/время
         if any(kw in lower for kw in ['дата', 'время', 'сейчас', 'сегодня', 'который час']):
             return self.get_datetime()
         return None
@@ -233,7 +216,6 @@ class CognitiveBrain(nn.Module):
         self.lock = threading.RLock()
         self.proactive_thoughts = []
 
-        # Опциональные модули для агента
         self.emotion = EmotionModel() if config.enable_emotion else None
         self.motivation = DriveSystem() if config.enable_motivation else None
         self.user_model = UserModel(dim=config.dim_embedding) if config.enable_user_model else None
@@ -369,6 +351,61 @@ class CognitiveBrain(nn.Module):
             if self._learn_counter % self.config.checkpoint_every == 0:
                 self.save()
 
+    # ---------- МЕТОДЫ МЫШЛЕНИЯ (подкрепление, ассоциации, синтез) ----------
+    def reinforce_activated_pathway(self, start_nid: int, thought_stream: List[Tuple[int, float]], reward: float):
+        if not thought_stream or len(thought_stream) < 2:
+            return
+        g = self.graph.levels[0] if hasattr(self.graph, 'levels') else self.graph
+        sorted_stream = sorted(thought_stream, key=lambda x: x[1], reverse=True)
+        path_nodes = [nid for nid, _ in sorted_stream[:5]]
+        delta = (reward - 0.5) * 0.1
+        if abs(delta) < 0.005:
+            return
+        for i in range(len(path_nodes) - 1):
+            f = path_nodes[i]
+            t = path_nodes[i+1]
+            if g.increment_synapse(f, t, delta, relation="has_answer"):
+                continue
+            if abs(delta) > 0.01:
+                g.add_synapse(f, t, weight=delta * 0.5, relation="inferred", optimizer=self.optimizer)
+
+    def create_new_associations(self, thought_stream: List[Tuple[int, float]], threshold: float = 0.2):
+        if not thought_stream:
+            return
+        g = self.graph.levels[0] if hasattr(self.graph, 'levels') else self.graph
+        active_nodes = [nid for nid, strength in thought_stream if strength > threshold]
+        if len(active_nodes) < 2:
+            return
+        for i in range(len(active_nodes)):
+            for j in range(i+1, len(active_nodes)):
+                f, t = active_nodes[i], active_nodes[j]
+                if g.get_edges_between(f, t):
+                    continue
+                avg_strength = (thought_stream[i][1] + thought_stream[j][1]) / 2
+                if avg_strength > 0.15:
+                    g.add_synapse(f, t, weight=avg_strength * 0.15, relation="co_activated", optimizer=self.optimizer)
+
+    def synthesize_concepts(self, nid1: int, nid2: int, label: str = None, optimizer=None) -> int:
+        with self.lock:
+            g = self.graph.levels[0] if hasattr(self.graph, 'levels') else self.graph
+            if nid1 < 1 or nid2 < 1 or nid1 > g.node_emb.shape[0] or nid2 > g.node_emb.shape[0]:
+                return -1
+            emb1 = g.node_emb[nid1 - 1].detach()
+            emb2 = g.node_emb[nid2 - 1].detach()
+            new_emb = (emb1 + emb2) / 2
+            new_emb = F.normalize(new_emb, p=2, dim=0)
+            if label is None:
+                label1 = g.node_labels.get(nid1, "")
+                label2 = g.node_labels.get(nid2, "")
+                label = f"{label1}+{label2}" if label1 and label2 else f"synth_{nid1}_{nid2}"
+            new_nid = g.add_node(new_emb, label=label[:50], cluster="synthetic", node_type=NodeType.CONCEPT, optimizer=optimizer)
+            g.add_synapse(new_nid, nid1, weight=0.3, relation="derived_from", optimizer=optimizer)
+            g.add_synapse(new_nid, nid2, weight=0.3, relation="derived_from", optimizer=optimizer)
+            return new_nid
+
+    def expand_context_with_episodic_memory(self, query_vec: torch.Tensor, max_items: int = 3) -> List[Dict]:
+        return self.memory.retrieve(query_vec, k=max_items)
+
     # ---------- Основной шаг ----------
     def _needs_search(self, text: str) -> bool:
         lower = text.lower()
@@ -382,7 +419,7 @@ class CognitiveBrain(nn.Module):
                      temperature: Optional[float] = None) -> Dict[str, Any]:
         self.step_counter += 1
 
-        # ---- Инструменты ----
+        # Инструменты
         if self.tool_registry is not None:
             tool_result = self.tool_registry.execute(input_text)
             if tool_result:
@@ -392,7 +429,6 @@ class CognitiveBrain(nn.Module):
         if not use_search and self._needs_search(input_text):
             use_search = True
 
-        # ---- Криптовалюта (быстрый хак) ----
         lower = input_text.lower()
         if any(kw in lower for kw in ["биткоин", "btc", "курс биткоина"]):
             price = self._get_crypto_price("bitcoin", "usd")
@@ -401,7 +437,6 @@ class CognitiveBrain(nn.Module):
                 self._update_after_step(input_text, answer)
                 return {"input": input_text, "answer": answer, "activated_neurons": [], "memory_results": []}
 
-        # ---- Поиск в интернете ----
         if use_search:
             enhanced = self._enhance_search_query(input_text)
             results = self.searcher.search(enhanced)
@@ -428,7 +463,7 @@ class CognitiveBrain(nn.Module):
                 summary = full_answer
             return {"input": input_text, "answer": summary, "thoughts": full_answer, "activated_neurons": [], "memory_results": []}
 
-        # ---- Основной путь: граф + LLM ----
+        # Основной путь
         query_vec = self.text_to_embedding(input_text, is_query=True)
         memory_results = self.memory.retrieve(query_vec, k=10)
 
@@ -447,7 +482,6 @@ class CognitiveBrain(nn.Module):
 
         context = self._build_context(input_text, memory_results, start_nid, thought_stream, pre_confidence=pre_confidence)
 
-        # Генерация
         temp = temperature if temperature is not None else 0.7
         full_answer = self.llm.generate(
             context,
@@ -462,13 +496,11 @@ class CognitiveBrain(nn.Module):
             enable_thinking=self.config.enable_thinking,
         )
 
-        # ---- Рефлексия (если включена) ----
         if self.reflector is not None and self.reflector.should_reflect(full_answer):
             improved = self.reflector.reflect(input_text, full_answer)
             if improved != full_answer:
                 full_answer = improved
 
-        # ---- Teacher: оценка и улучшение ----
         if self.teacher is not None:
             score, improved_by_teacher, teacher_details = self.teacher.evaluate(input_text, full_answer)
             if improved_by_teacher != full_answer and score > 0.6:
@@ -478,11 +510,22 @@ class CognitiveBrain(nn.Module):
 
         answer_vec = self.text_to_embedding(full_answer, is_query=False)
 
-        # ---- Обучение (если оценка хорошая) ----
         if score > 0.55:
             self.learn_pair(input_text, full_answer, reward=score)
 
-        # ---- Обновление эмоций/мотивации/пользователя (для агента) ----
+        # ---------- ПОДКРЕПЛЕНИЕ, АССОЦИАЦИИ, СИНТЕЗ ----------
+        if thought_stream and len(thought_stream) > 1:
+            self.reinforce_activated_pathway(start_nid, thought_stream, score)
+            self.create_new_associations(thought_stream, threshold=0.15)
+            if score > 0.8 and len(thought_stream) >= 2:
+                top_two = sorted(thought_stream, key=lambda x: x[1], reverse=True)[:2]
+                nid1, nid2 = top_two[0][0], top_two[1][0]
+                if nid1 != nid2:
+                    new_nid = self.synthesize_concepts(nid1, nid2, optimizer=self.optimizer)
+                    if new_nid != -1:
+                        print(f"[Brain] Синтезирован новый узел: {self.graph.node_labels.get(new_nid, '')} (ID {new_nid})")
+
+        # Эмоции, мотивация, пользователь
         if self.emotion is not None:
             novelty = 0.0 if self.memory.retrieve(query_vec, k=1) else 0.3
             confidence = self._compute_confidence(query_vec, answer_vec, thought_stream)
@@ -493,8 +536,7 @@ class CognitiveBrain(nn.Module):
             self.motivation.update(feedback={'success': score > 0.6}, new_info=novelty > 0.2)
 
         if self.user_model is not None:
-            # обновляем интересы (пример)
-            self.user_model.update(query_vec, answer_vec, topic=None)  # можно определить тему
+            self.user_model.update(query_vec, answer_vec, topic=None)
 
         self.memory.add_working(query_vec, {"text": input_text, "answer": full_answer})
         self._update_after_step(input_text, full_answer)
@@ -599,7 +641,6 @@ class CognitiveBrain(nn.Module):
             context += "Релевантные факты и ассоциации (по убыванию релевантности):\n"
             context += "\n".join(f"- {line}" for line in selected) + "\n"
 
-        # Внутреннее состояние (если есть)
         state_lines = []
         if pre_confidence is not None:
             level = "высокая" if pre_confidence > 0.6 else ("средняя" if pre_confidence > 0.35 else "низкая")
@@ -750,6 +791,19 @@ class CognitiveBrain(nn.Module):
             print("😴 Сон завершён")
 
     # ---------- Сохранение / загрузка ----------
+    def _resize_parameter(self, param: nn.Parameter, new_shape: tuple) -> nn.Parameter:
+        if param.shape == new_shape:
+            return param
+        with torch.no_grad():
+            new_data = torch.randn(new_shape, dtype=param.dtype, device=param.device) * 0.01
+            if param.dim() >= 2:
+                min_rows = min(param.shape[0], new_shape[0])
+                new_data[:min_rows] = param.data[:min_rows]
+            else:
+                min_len = min(param.numel(), new_shape[0])
+                new_data[:min_len] = param.data[:min_len]
+        return nn.Parameter(new_data)
+
     def save(self, model_dir: str = None):
         path = model_dir or self.config.model_dir
         os.makedirs(path, exist_ok=True)
@@ -814,7 +868,20 @@ class CognitiveBrain(nn.Module):
         graph_path = f"{path}/graph.pth"
         if os.path.exists(graph_path):
             state_dict = torch.load(graph_path, map_location=self.device)
-            # адаптация размеров, если необходимо
+
+            def adapt_params(module, state_dict, prefix=""):
+                for name, param in list(module.named_parameters(recurse=False)):
+                    full_name = prefix + name if prefix else name
+                    if full_name in state_dict:
+                        saved_shape = state_dict[full_name].shape
+                        if param.shape != saved_shape:
+                            print(f"[Brain] Адаптация {full_name}: {param.shape} -> {saved_shape}")
+                            new_param = self._resize_parameter(param, saved_shape)
+                            setattr(module, name, new_param)
+                for child_name, child in module.named_children():
+                    adapt_params(child, state_dict, prefix + child_name + ".")
+
+            adapt_params(self.graph, state_dict)
             self.graph.load_state_dict(state_dict, strict=False)
 
         edges_path = f"{path}/edges.pkl"
@@ -869,7 +936,6 @@ class CognitiveBrain(nn.Module):
 
         self.load_dialog_history(os.path.join(path, "dialog_history.json"))
 
-        # Эмоции, мотивация, пользователь
         em_path = f"{path}/emotion.pkl"
         if os.path.exists(em_path) and self.emotion:
             with open(em_path, "rb") as f:

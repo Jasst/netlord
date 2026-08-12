@@ -10,23 +10,15 @@ from brain.utils import grow_parameter_in_optimizer
 
 
 # ----------------------------------------------------------------------
-# Типы отношений между узлами.
-# ИСПРАВЛЕНО: раньше каждое ребро несло только один скаляр (сила связи,
-# edge_dim=1) — граф физически не мог отличить "A — ответ на Q" от
-# "A противоречит Q" иначе как по знаку веса. При этом brain.py уже
-# собирал предикат отношения (semantic_memory: (subj, "has_answer", obj)),
-# но эти данные никуда не попадали в сам GATv2-граф — две системы знаний
-# жили параллельно. Теперь тип отношения — часть edge-фичи: обучаемый
-# embedding конкатенируется со скаляром веса, GAT-attention может
-# по-разному взвешивать "ответ на" и "противоречит", а не сваливать всё
-# в одну кучу.
-#
-# ВАЖНО: добавление нового элемента в этот список меняет edge_dim, а
-# значит и форму внутренних весов GATv2Conv, отвечающих за проекцию
-# edge-фичи — это архитектурное изменение, а не косметика. См. комментарий
-# в CognitiveBrain.load() про миграцию существующих чекпоинтов.
+# Типы отношений (расширены для новых механизмов)
 # ----------------------------------------------------------------------
-RELATION_TYPES: List[str] = ["has_answer", "contradicts"]
+RELATION_TYPES: List[str] = [
+    "has_answer",
+    "contradicts",
+    "inferred",        # выведенное ребро (транзитивное замыкание)
+    "co_activated",    # совместная активация
+    "derived_from"     # синтезированный узел
+]
 
 
 class NodeType(Enum):
@@ -39,7 +31,7 @@ class NodeType(Enum):
 
 
 # ----------------------------------------------------------------------
-# Базовый дифференцируемый граф (один уровень)
+# Базовый дифференцируемый граф
 # ----------------------------------------------------------------------
 class DifferentiableNeuralGraph(nn.Module):
     def __init__(self, dim: int, max_nodes: int = 5000, hidden_dim: int = 256,
@@ -54,7 +46,7 @@ class DifferentiableNeuralGraph(nn.Module):
         self.relation_types = list(relation_types) if relation_types else list(RELATION_TYPES)
         self.relation_to_idx = {r: i for i, r in enumerate(self.relation_types)}
         self.relation_embedding = nn.Embedding(len(self.relation_types), relation_embed_dim)
-        edge_dim = 1 + relation_embed_dim  # скаляр веса + обучаемый вектор типа отношения
+        edge_dim = 1 + relation_embed_dim
 
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -69,7 +61,7 @@ class DifferentiableNeuralGraph(nn.Module):
 
         self._edges: List[Tuple[int, int]] = []
         self._edge_weights = nn.ParameterList()
-        self._edge_relations: List[int] = []  # индекс в self.relation_types, параллельно self._edges
+        self._edge_relations: List[int] = []
         self._edge_index = None
         self._adjacency: Dict[int, List[Tuple[int, float]]] = {}
 
@@ -77,9 +69,7 @@ class DifferentiableNeuralGraph(nn.Module):
         self.node_types: Dict[int, NodeType] = {}
         self.node_clusters: Dict[int, str] = {}
 
-    # ------------------------------------------------------------------
-    # Рост графа
-    # ------------------------------------------------------------------
+    # ---------- Рост графа ----------
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden",
                  layer: int = 0, node_type: NodeType = NodeType.CONCEPT,
                  optimizer=None) -> int:
@@ -103,7 +93,6 @@ class DifferentiableNeuralGraph(nn.Module):
             self._edge_index = torch.zeros((2, 0), dtype=torch.long)
             self._adjacency = {}
             return
-        # Приводим ID к int
         u = [int(f) - 1 for f, _ in self._edges]
         v = [int(t) - 1 for _, t in self._edges]
         self._edge_index = torch.tensor([u, v], dtype=torch.long)
@@ -123,10 +112,6 @@ class DifferentiableNeuralGraph(nn.Module):
         to_id = int(to_id)
         rel_idx = self.relation_to_idx.get(relation)
         if rel_idx is None:
-            # неизвестный тип отношения — не роняем обучение, откатываемся на
-            # первый определённый тип и явно предупреждаем, чтобы это не
-            # прошло незамеченным при добавлении нового предиката без
-            # обновления RELATION_TYPES
             print(f"[Graph] Неизвестный тип отношения '{relation}', использую '{self.relation_types[0]}'")
             rel_idx = 0
         self._edges.append((from_id, to_id))
@@ -138,9 +123,7 @@ class DifferentiableNeuralGraph(nn.Module):
             optimizer.param_groups[0]["params"].append(new_w)
         return len(self._edges) - 1
 
-    # ------------------------------------------------------------------
-    # "Мышление" — message passing + spreading activation
-    # ------------------------------------------------------------------
+    # ---------- "Мышление" ----------
     def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
         if x is None:
             x = self.node_emb
@@ -219,16 +202,6 @@ class DifferentiableNeuralGraph(nn.Module):
 
     def find_most_similar_contextual(self, query: torch.Tensor, threshold: float = 0.6,
                                       max_nodes_for_gnn: Optional[int] = None) -> Optional[int]:
-        """
-        ИСПРАВЛЕНО (масштабирование): раньше этот метод БЕЗУСЛОВНО делал полный forward
-        через все GATv2-слои по всем узлам графа — на каждый вызов step(). При росте
-        графа (конфиг допускает до max_neurons=100000) это O(N) прогон GNN на каждый
-        пользовательский запрос, что при большом графе превращается в основную
-        задержку системы. Если узлов больше max_nodes_for_gnn — пропускаем GNN-forward
-        и ищем стартовый узел по "сырым" эмбеддингам (дешёвый cosine, без прогона через
-        слои). Это менее "контекстуально", зато не деградирует линейно с размером графа
-        на каждом шаге.
-        """
         if self.node_emb.shape[0] == 0:
             return None
         if max_nodes_for_gnn is not None and self.node_emb.shape[0] > max_nodes_for_gnn:
@@ -243,9 +216,44 @@ class DifferentiableNeuralGraph(nn.Module):
             return best_idx + 1
         return None
 
+    # ---------- НОВЫЕ МЕТОДЫ ДЛЯ РАБОТЫ С РЁБРАМИ ----------
+    def increment_synapse(self, from_id: int, to_id: int, delta: float, relation: str = "has_answer") -> bool:
+        """
+        Увеличить или уменьшить вес существующего ребра на delta.
+        Возвращает True, если ребро найдено и обновлено.
+        """
+        from_id = int(from_id)
+        to_id = int(to_id)
+        rel_idx = self.relation_to_idx.get(relation, 0)
+        for i, (f, t) in enumerate(self._edges):
+            if f == from_id and t == to_id and self._edge_relations[i] == rel_idx:
+                new_weight = self._edge_weights[i].item() + delta
+                new_weight = max(-1.0, min(1.0, new_weight))
+                self._edge_weights[i] = nn.Parameter(torch.tensor(new_weight, dtype=torch.float))
+                self._rebuild_edges()
+                return True
+        return False
+
+    def get_edges_between(self, nid1: int, nid2: int) -> List[Tuple[int, int, float, str]]:
+        """Возвращает все рёбра между двумя узлами с их типами."""
+        results = []
+        for i, (f, t) in enumerate(self._edges):
+            if (f == nid1 and t == nid2) or (f == nid2 and t == nid1):
+                rel = self.relation_types[self._edge_relations[i]]
+                results.append((f, t, self._edge_weights[i].item(), rel))
+        return results
+
+    def get_neighbors_with_weights(self, node_id: int) -> List[Tuple[int, float]]:
+        """Возвращает список (сосед, вес) для данного узла."""
+        return self._adjacency.get(node_id, [])
+
+    def get_all_edges(self) -> List[Tuple[int, int, float]]:
+        """Возвращает все рёбра в виде (from, to, weight)."""
+        return [(f, t, w.item()) for (f, t), w in zip(self._edges, self._edge_weights)]
+
 
 # ----------------------------------------------------------------------
-# Иерархический граф
+# Иерархический граф – обёртки для новых методов
 # ----------------------------------------------------------------------
 class HierarchicalGraph(nn.Module):
     def __init__(self, dims: List[int], num_heads: int = 4, num_layers: int = 2,
@@ -277,10 +285,8 @@ class HierarchicalGraph(nn.Module):
     def add_node(self, embedding: torch.Tensor, label: str = "", cluster: str = "hidden",
                  layer: int = 0, node_type: NodeType = NodeType.CONCEPT,
                  level_idx: int = 0, optimizer=None) -> int:
-        return self.levels[level_idx].add_node(embedding, label, cluster, layer, node_type,
-                                                 optimizer=optimizer)
+        return self.levels[level_idx].add_node(embedding, label, cluster, layer, node_type, optimizer=optimizer)
 
-    # ---------- ДОБАВЛЕННЫЙ МЕТОД (был пропущен) ----------
     def add_synapse(self, from_id: int, to_id: int, weight: float = 0.1,
                     relation: str = "has_answer", level_idx: int = 0, optimizer=None) -> int:
         return self.levels[level_idx].add_synapse(from_id, to_id, weight, relation=relation, optimizer=optimizer)
@@ -297,8 +303,6 @@ class HierarchicalGraph(nn.Module):
         level0 = self.levels[0]
         if level0.node_emb.shape[0] == 0:
             return None
-        # см. комментарий в DifferentiableNeuralGraph.find_most_similar_contextual —
-        # тот же fallback для верхнего уровня иерархии.
         if max_nodes_for_gnn is not None and level0.node_emb.shape[0] > max_nodes_for_gnn:
             return level0.find_most_similar(query, threshold=threshold)
         with torch.no_grad():
@@ -333,21 +337,6 @@ class HierarchicalGraph(nn.Module):
         return hs[0]
 
     def rebuild_hierarchy(self, optimizer=None, chunk_size: int = 2048):
-        """
-        ИСПРАВЛЕНО: раньше кластеризация делала n*(n-1)/2 отдельных питоновских
-        вызовов F.cosine_similarity(proj[a], proj[b]) — накладные расходы на вызов
-        функции доминировали над самим вычислением, и уже на нескольких тысячах
-        узлов rebuild_hierarchy (вызывается из sleep(), т.е. из фонового цикла
-        агента) становился основным потребителем времени в цикле обучения.
-
-        Теперь сходство считается блочным матричным умножением (proj_block @ proj.T)
-        — та же O(n^2) асимптотика по сути кластеризации (это неизбежно для
-        полного попарного сравнения), но вычисления идут внутри torch/BLAS,
-        а не питоновским циклом с вызовом функции на каждую пару. chunk_size
-        ограничивает пиковую память: вместо полной матрицы (n x n), которая при
-        больших n (десятки тысяч узлов) может занимать гигабайты, за раз строится
-        только блок (chunk_size x n).
-        """
         for i in range(len(self.levels) - 1):
             lower = self.levels[i]
             n = lower.node_emb.shape[0]
@@ -362,7 +351,7 @@ class HierarchicalGraph(nn.Module):
                 clusters: List[List[int]] = []
                 for start in range(0, n, chunk_size):
                     end = min(start + chunk_size, n)
-                    sim_block = proj[start:end] @ proj.T  # (block, n)
+                    sim_block = proj[start:end] @ proj.T
                     for local_a in range(end - start):
                         a = start + local_a
                         if assigned[a]:
@@ -391,6 +380,19 @@ class HierarchicalGraph(nn.Module):
 
     def get_edge_weights(self) -> torch.Tensor:
         return self.levels[0].get_edge_weights()
+
+    # ---------- ОБЁРТКИ ДЛЯ НОВЫХ МЕТОДОВ ----------
+    def increment_synapse(self, from_id: int, to_id: int, delta: float, relation: str = "has_answer", level_idx: int = 0) -> bool:
+        return self.levels[level_idx].increment_synapse(from_id, to_id, delta, relation)
+
+    def get_edges_between(self, nid1: int, nid2: int, level_idx: int = 0) -> List[Tuple[int, int, float, str]]:
+        return self.levels[level_idx].get_edges_between(nid1, nid2)
+
+    def get_neighbors_with_weights(self, node_id: int, level_idx: int = 0) -> List[Tuple[int, float]]:
+        return self.levels[level_idx].get_neighbors_with_weights(node_id)
+
+    def get_all_edges(self, level_idx: int = 0) -> List[Tuple[int, int, float]]:
+        return self.levels[level_idx].get_all_edges()
 
     @property
     def node_emb(self):

@@ -2,150 +2,131 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Редактор графа знаний (динамический)</title>
+    <title>Редактор графа знаний</title>
     <script src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
     <style>
-        /* ——— все стили без изменений ——— */
-        :root {
-            --bg: #1C1B1A;
-            --surface: #242322;
-            --surface-alt: #191918;
-            --border: #38362F;
-            --border-strong: #48453D;
-            --text: #DEDAD2;
-            --text-muted: #8C877D;
-            --accent: #A6897B;
-            --accent-hover: #BC9E8F;
-            --accent-soft: #322B26;
-            --danger: #99756A;
-            --danger-soft: #2E2522;
-            --focus: #A99B78;
-            --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", Helvetica, Arial, sans-serif;
-        }
         * { box-sizing: border-box; }
-        body {
-            margin: 0;
-            background: var(--bg);
-            color: var(--text);
-            font-family: var(--font-ui);
+        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a1a; color: #ddd; }
+        #toolbar {
+            background: #2a2a2a;
+            padding: 8px 16px;
             display: flex;
-            flex-direction: column;
-            height: 100vh;
-            overflow: hidden;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            border-bottom: 1px solid #444;
+            position: sticky;
+            top: 0;
+            z-index: 10;
         }
-        #toolbar { display: flex; flex-wrap: wrap; gap: 10px; padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--border); align-items: center; flex-shrink: 0; z-index: 10; box-shadow: 0 1px 0 rgba(0,0,0,0.15), 0 2px 10px rgba(0,0,0,0.25); }
-        #toolbar .group { display: flex; gap: 6px; align-items: center; padding: 0 10px; border-right: 1px solid var(--border); }
-        #toolbar .group:last-of-type { border-right: none; }
-        #toolbar .group.push-right { margin-left: auto; border-right: none; padding-right: 0; }
-        #toolbar button, #toolbar input, #toolbar select { background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); padding: 6px 13px; border-radius: 8px; cursor: pointer; font-family: var(--font-ui); font-size: 13px; font-weight: 500; transition: all 0.15s ease; }
-        #toolbar button:hover { border-color: var(--accent); color: var(--accent-hover); background: var(--accent-soft); }
-        #toolbar button:active { transform: translateY(1px); }
-        #toolbar button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-        #toolbar button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: #fff; }
-        #toolbar button.danger { color: var(--danger); border-color: var(--border-strong); }
-        #toolbar button.danger:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
-        #toolbar button.ghost { background: transparent; border-color: var(--border); color: var(--text-muted); }
-        #toolbar input, #toolbar select { background: var(--bg); cursor: text; font-weight: 400; }
-        #toolbar input { width: 140px; }
-        #toolbar input:focus, #toolbar select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-        #toolbar .brand { font-weight: 600; font-size: 14px; letter-spacing: -0.01em; color: var(--text); padding-right: 14px; border-right: 1px solid var(--border); display: flex; align-items: center; gap: 6px; white-space: nowrap; }
-        #toolbar .brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block; }
-        #graph-container { flex: 1; height: 100%; position: relative; background: radial-gradient(circle at 1px 1px, rgba(237,230,219,0.06) 1px, transparent 0) 0 0/24px 24px, var(--surface-alt); }
-        #info-panel { position: absolute; bottom: 24px; right: 24px; background: var(--surface); padding: 18px 22px; border-radius: 14px; border: 1px solid var(--border); max-width: 320px; min-width: 230px; max-height: 70vh; overflow-y: auto; font-size: 14px; display: none; z-index: 20; box-shadow: 0 10px 30px rgba(0,0,0,0.35); transition: opacity 0.3s; }
+        #toolbar button, #toolbar input, #toolbar select {
+            background: #3a3a3a;
+            color: #ddd;
+            border: 1px solid #555;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        #toolbar button:hover { background: #555; }
+        #toolbar .brand { font-weight: bold; color: #fff; margin-right: 10px; }
+        #graph-container {
+            width: 100%;
+            height: calc(100vh - 60px);
+            background: #1a1a1a;
+            position: relative;
+        }
+        #info-panel {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #2a2a2a;
+            border: 1px solid #555;
+            border-radius: 8px;
+            padding: 16px;
+            max-width: 300px;
+            min-width: 220px;
+            max-height: 70vh;
+            overflow-y: auto;
+            display: none;
+            z-index: 20;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+        }
         #info-panel.show { display: block; }
-        #info-panel .close { float: right; cursor: pointer; color: var(--text-muted); font-weight: bold; transition: color 0.2s; }
-        #info-panel .close:hover { color: var(--danger); }
-        #info-panel .info-row { margin: 7px 0; display: flex; justify-content: space-between; gap: 14px; }
-        #info-panel .info-label { color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; padding-top: 2px; }
-        #info-panel .info-value { color: var(--text); font-weight: 500; word-break: break-word; text-align: right; }
-        #info-panel .hint { color: var(--text-muted); font-size: 12px; margin-top: 8px; }
-        #info-panel .neighbors-title { margin-top: 14px; margin-bottom: 6px; color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; border-top: 1px solid var(--border); padding-top: 10px; }
-        #info-panel .neighbors { display: flex; flex-direction: column; gap: 2px; }
-        .neighbor-row { display: grid; grid-template-columns: 14px 1fr auto; gap: 8px; align-items: center; padding: 5px 6px; border-radius: 6px; cursor: pointer; transition: background 0.12s ease; }
-        .neighbor-row:hover { background: var(--accent-soft); }
-        .neighbor-row .arrow { color: var(--text-muted); font-size: 12px; }
-        .neighbor-row .n-label { font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .neighbor-row .w { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
-        .neighbor-row .w.neg { color: var(--danger); }
-        .reembed-toggle { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-muted); cursor: pointer; user-select: none; }
-        .reembed-toggle input { accent-color: var(--accent); cursor: pointer; }
-        #info-panel .btn-group { margin-top: 14px; display: flex; gap: 8px; justify-content: flex-end; }
-        #info-panel .btn-group button { background: var(--surface); border: 1px solid var(--border-strong); color: var(--text); padding: 5px 13px; border-radius: 7px; cursor: pointer; font-family: var(--font-ui); font-size: 12px; font-weight: 500; transition: 0.15s ease; }
-        #info-panel .btn-group button:hover { border-color: var(--accent); color: var(--accent-hover); background: var(--accent-soft); }
-        #legend { position: absolute; top: 20px; left: 20px; background: var(--surface); padding: 14px 18px; border-radius: 12px; border: 1px solid var(--border); font-size: 12px; z-index: 15; display: none; box-shadow: 0 6px 20px rgba(0,0,0,0.3); }
-        #legend.show { display: block; }
-        #legend .legend-title { font-weight: 600; margin-bottom: 8px; color: var(--text); text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; }
-        .legend-item { display: flex; align-items: center; gap: 10px; margin: 5px 0; color: var(--text); }
-        .legend-color { width: 12px; height: 12px; border-radius: 50%; border: 1px solid rgba(237,230,219,0.15); }
-        #loading-indicator { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--text-muted); font-size: 15px; font-weight: 500; z-index: 5; display: none; background: var(--surface); padding: 10px 18px; border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 6px 20px rgba(0,0,0,0.3); }
+        #info-panel .close { float: right; cursor: pointer; color: #aaa; }
+        #info-panel .close:hover { color: #fff; }
+        #loading-indicator {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #000;
+            color: #fff;
+            padding: 12px 24px;
+            border-radius: 8px;
+            display: none;
+            z-index: 30;
+        }
         #loading-indicator.show { display: block; }
+        .neighbor-row {
+            display: grid;
+            grid-template-columns: 16px 1fr auto;
+            gap: 6px;
+            padding: 4px 0;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        .neighbor-row:hover { background: #3a3a3a; }
+        .neighbor-row .w.neg { color: #ff6b6b; }
+        .hint { color: #888; font-size: 12px; margin-top: 6px; }
+        .info-row { display: flex; justify-content: space-between; margin: 4px 0; }
+        .info-label { color: #888; }
+        .info-value { color: #fff; font-weight: 500; }
+        .btn-group { margin-top: 12px; display: flex; gap: 8px; justify-content: flex-end; }
+        .btn-group button { background: #3a3a3a; border: 1px solid #555; color: #ddd; padding: 4px 12px; border-radius: 4px; cursor: pointer; }
+        .btn-group button:hover { background: #555; }
     </style>
 </head>
 <body>
     <div id="toolbar">
-        <span class="brand"><span class="dot"></span>Граф знаний</span>
-        <span class="group">
-            <button id="refreshBtn" class="ghost">⟳ Обновить</button>
-            <button id="resetPhysicsBtn" class="ghost">◎ Физика</button>
-        </span>
-        <span class="group">
-            <input type="text" id="newNodeLabelInput" placeholder="Название понятия">
-            <select id="newNodeTypeSelect">
-                <option value="CONCEPT">CONCEPT</option>
-                <option value="SENSORY">SENSORY</option>
-                <option value="MOTOR">MOTOR</option>
-                <option value="EMOTIONAL">EMOTIONAL</option>
-                <option value="ATTENTION">ATTENTION</option>
-            </select>
-            <button id="addNodeBtn" class="primary">➕ Узел</button>
-        </span>
-        <span class="group">
-            <input type="number" id="weightInput" value="0.5" step="0.01" style="width:64px;">
-            <button id="addEdgeBtn">➕ Ребро</button>
-        </span>
-        <span class="group">
-            <input type="text" id="newLabelInput" placeholder="Новая метка">
-            <select id="editNodeTypeSelect">
-                <option value="">тип: без изм.</option>
-                <option value="CONCEPT">CONCEPT</option>
-                <option value="SENSORY">SENSORY</option>
-                <option value="MOTOR">MOTOR</option>
-                <option value="EMOTIONAL">EMOTIONAL</option>
-                <option value="ATTENTION">ATTENTION</option>
-            </select>
-            <label class="reembed-toggle" title="Пересчитать embedding узла из новой метки — иначе поменяется только подпись, а «смысл» узла для графа останется прежним">
-                <input type="checkbox" id="reembedCheckbox" checked> embed
-            </label>
-            <button id="updateLabelBtn">✎ Изменить</button>
-        </span>
-        <span class="group">
-            <button id="deleteNodeBtn" class="danger">🗑 Узел</button>
-            <button id="deleteEdgeBtn" class="danger">🗑 Ребро</button>
-        </span>
-        <span class="group push-right">
-            <button id="saveBtn" class="primary">💾 Сохранить</button>
-        </span>
+        <span class="brand">🧠 Граф знаний</span>
+        <button id="refreshBtn">⟳ Обновить</button>
+        <button id="resetPhysicsBtn">◎ Физика</button>
+        <input type="text" id="newNodeLabelInput" placeholder="Название понятия" style="width:140px;">
+        <select id="newNodeTypeSelect">
+            <option value="CONCEPT">CONCEPT</option>
+            <option value="SENSORY">SENSORY</option>
+            <option value="MOTOR">MOTOR</option>
+            <option value="EMOTIONAL">EMOTIONAL</option>
+            <option value="ATTENTION">ATTENTION</option>
+        </select>
+        <button id="addNodeBtn">➕ Узел</button>
+        <input type="number" id="weightInput" value="0.5" step="0.01" style="width:60px;">
+        <button id="addEdgeBtn">➕ Ребро</button>
+        <input type="text" id="newLabelInput" placeholder="Новая метка" style="width:140px;">
+        <select id="editNodeTypeSelect">
+            <option value="">тип: без изм.</option>
+            <option value="CONCEPT">CONCEPT</option>
+            <option value="SENSORY">SENSORY</option>
+            <option value="MOTOR">MOTOR</option>
+            <option value="EMOTIONAL">EMOTIONAL</option>
+            <option value="ATTENTION">ATTENTION</option>
+        </select>
+        <label><input type="checkbox" id="reembedCheckbox" checked> embed</label>
+        <button id="updateLabelBtn">✎ Изменить</button>
+        <button id="deleteNodeBtn">🗑 Узел</button>
+        <button id="deleteEdgeBtn">🗑 Ребро</button>
+        <button id="saveBtn">💾 Сохранить</button>
     </div>
-
-    <div id="graph-container">
-        <div id="legend" class="show">
-            <div class="legend-title">Типы нейронов</div>
-            <div class="legend-item"><span class="legend-color" style="background:#A6897B;"></span> SENSORY</div>
-            <div class="legend-item"><span class="legend-color" style="background:#7E9088;"></span> CONCEPT</div>
-            <div class="legend-item"><span class="legend-color" style="background:#7E8B9C;"></span> MOTOR</div>
-            <div class="legend-item"><span class="legend-color" style="background:#957E8B;"></span> EMOTIONAL</div>
-            <div class="legend-item"><span class="legend-color" style="background:#96906F;"></span> ATTENTION</div>
-        </div>
-        <div id="loading-indicator" class="show">🔄 Загрузка графа...</div>
-        <div id="info-panel">
-            <span class="close" id="closeInfo">✖</span>
-            <div id="infoContent"></div>
-            <div class="btn-group">
-                <button id="focusNodeBtn">🎯 Центрировать</button>
-            </div>
+    <div id="graph-container"></div>
+    <div id="info-panel">
+        <span class="close" id="closeInfo">✖</span>
+        <div id="infoContent"></div>
+        <div class="btn-group">
+            <button id="focusNodeBtn">🎯 Центрировать</button>
         </div>
     </div>
-
+    <div id="loading-indicator">🔄 Загрузка графа...</div>
     <script src="/static/js/graf.js"></script>
 </body>
 </html>
