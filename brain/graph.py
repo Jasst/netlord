@@ -35,6 +35,7 @@ class NodeType(Enum):
     MOTOR = 2
     EMOTIONAL = 3
     ATTENTION = 4
+    SELF = 5
 
 
 # ----------------------------------------------------------------------
@@ -216,9 +217,22 @@ class DifferentiableNeuralGraph(nn.Module):
             return best_idx + 1
         return None
 
-    def find_most_similar_contextual(self, query: torch.Tensor, threshold: float = 0.6) -> Optional[int]:
+    def find_most_similar_contextual(self, query: torch.Tensor, threshold: float = 0.6,
+                                      max_nodes_for_gnn: Optional[int] = None) -> Optional[int]:
+        """
+        ИСПРАВЛЕНО (масштабирование): раньше этот метод БЕЗУСЛОВНО делал полный forward
+        через все GATv2-слои по всем узлам графа — на каждый вызов step(). При росте
+        графа (конфиг допускает до max_neurons=100000) это O(N) прогон GNN на каждый
+        пользовательский запрос, что при большом графе превращается в основную
+        задержку системы. Если узлов больше max_nodes_for_gnn — пропускаем GNN-forward
+        и ищем стартовый узел по "сырым" эмбеддингам (дешёвый cosine, без прогона через
+        слои). Это менее "контекстуально", зато не деградирует линейно с размером графа
+        на каждом шаге.
+        """
         if self.node_emb.shape[0] == 0:
             return None
+        if max_nodes_for_gnn is not None and self.node_emb.shape[0] > max_nodes_for_gnn:
+            return self.find_most_similar(query, threshold=threshold)
         with torch.no_grad():
             h = self.forward()
         if h.shape[0] == 0:
@@ -275,9 +289,18 @@ class HierarchicalGraph(nn.Module):
         return self.levels[level_idx].find_most_similar(query, threshold)
 
     def find_most_similar_contextual(self, query: torch.Tensor, level_idx: int = 0,
-                                      threshold: float = 0.6) -> Optional[int]:
+                                      threshold: float = 0.6,
+                                      max_nodes_for_gnn: Optional[int] = None) -> Optional[int]:
         if level_idx != 0:
-            return self.levels[level_idx].find_most_similar_contextual(query, threshold)
+            return self.levels[level_idx].find_most_similar_contextual(
+                query, threshold, max_nodes_for_gnn=max_nodes_for_gnn)
+        level0 = self.levels[0]
+        if level0.node_emb.shape[0] == 0:
+            return None
+        # см. комментарий в DifferentiableNeuralGraph.find_most_similar_contextual —
+        # тот же fallback для верхнего уровня иерархии.
+        if max_nodes_for_gnn is not None and level0.node_emb.shape[0] > max_nodes_for_gnn:
+            return level0.find_most_similar(query, threshold=threshold)
         with torch.no_grad():
             h = self.forward()
         if h.shape[0] == 0:

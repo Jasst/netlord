@@ -11,6 +11,8 @@ import random
 import threading
 import pickle
 import requests
+import math
+
 from collections import deque
 from typing import List, Dict, Optional, Any, Tuple
 
@@ -21,9 +23,23 @@ from brain.llm import LLMInterface
 from brain.utils import EmbeddingProvider, random_vector, cosine_similarity
 from brain.search import WebSearcher
 
+# Новые модули
+from brain.self_model import SelfModel, AutobiographicalMemory
+from brain.global_workspace import GlobalWorkspace
+from brain.motivation import DriveSystem
+from brain.emotion import EmotionModel
+from brain.user_model import UserModel
+from brain.brain_bus import bus
+from brain.teacher import Teacher
+
+_SEARCH_TRIGGER_WORDS = (
+    "сейчас", "сегодня", "текущ", "актуальн", "последн", "свежие", "новост",
+    "курс", "погода", "прямо сейчас", "в этом году", "недавно",
+)
+
 
 # ----------------------------------------------------------------------
-# Вспомогательные модули (без изменений)
+# Вспомогательные модули
 # ----------------------------------------------------------------------
 class CuriosityModule:
     def __init__(self, lr: float = 0.01):
@@ -37,7 +53,8 @@ class Planner:
         self.llm = llm
     def plan(self, question: str, context: str) -> List[str]:
         prompt = f"Составь план действий для ответа на вопрос: {question}\nКонтекст: {context}\nПлан (каждый пункт с новой строки):"
-        plan_text = self.llm.generate(prompt, max_tokens=60, temperature=0.5)
+        # QWEN3.5: отключаем thinking для короткого плана
+        plan_text = self.llm.generate(prompt, max_tokens=60, temperature=0.5, enable_thinking=False)
         lines = [line.strip() for line in plan_text.split('\n') if line.strip()]
         return lines if lines else ["answer_directly"]
 
@@ -50,7 +67,8 @@ class Reflector:
         return False
     def reflect(self, question: str, answer: str) -> str:
         prompt = f"Исправь и улучши ответ на вопрос '{question}'. Текущий ответ: '{answer}'. Улучшенный ответ:"
-        improved = self.llm.generate(prompt, max_tokens=150, temperature=0.3)
+        # QWEN3.5: отключаем thinking для быстрой правки
+        improved = self.llm.generate(prompt, max_tokens=150, temperature=0.3, enable_thinking=False)
         return improved if improved.strip() else answer
 
 class EWC:
@@ -92,13 +110,32 @@ class EWC:
 # ----------------------------------------------------------------------
 class CognitiveBrain(nn.Module):
     SYSTEM_PROMPT = (
-        "Ты — речевой аппарат когнитивного графа Smart Brain, а не самостоятельный источник знаний. "
-        "Ниже дан 'поток ассоциаций' — концепты и факты, которые граф активировал в ответ на вопрос "
-        "через распространение активации по своим связям (это и есть его мышление и память). "
-        "Твоя задача — связно, естественно и кратко сформулировать ответ, опираясь ТОЛЬКО на эти "
-        "активированные ассоциации и данные из памяти/базы знаний ниже. Не добавляй факты, которых "
-        "там нет, и не рассуждай от себя. Если активированных ассоциаций недостаточно для ответа — "
-        "прямо скажи, что граф пока не связал с этим вопросом ничего релевантного."
+        "# Роль\n"
+        "Ты — речевой аппарат когнитивного графа Smart Brain, а не самостоятельный источник "
+        "знаний. У тебя нет собственной памяти между сообщениями — вся память приходит тебе "
+        "в user-сообщении явным текстом.\n\n"
+        "# Структура входа\n"
+        "В каждом user-сообщении, после вопроса, идёт список 'Релевантные факты и ассоциации', "
+        "отсортированный по убыванию релевантности. Источник каждой строки помечен тегом:\n"
+        "- [ассоциация графа] — концепт, активированный распространением активации по графу "
+        "(это твоё 'мышление' и ассоциативная память);\n"
+        "- [эпизодическая память] — фрагмент прошлого диалога/опыта;\n"
+        "- [база знаний] — ранее выученная пара вопрос-ответ;\n"
+        "- [семантическая память] — факт в виде тройки субъект-предикат-объект;\n"
+        "- [глобальное пространство] — то, что сейчас в фокусе внимания системы.\n"
+        "Также может быть блок 'Внутреннее состояние' — это НЕ факт для ответа, а сигнал, как "
+        "тебе калибровать тон и степень уверенности в формулировках. Никогда не показывай эти "
+        "цифры пользователю напрямую и не упоминай сам факт их существования.\n\n"
+        "# Правила ответа\n"
+        "1. Опирайся ТОЛЬКО на активированные ассоциации и данные из памяти/базы знаний выше. "
+        "Не добавляй факты, которых там нет, и не рассуждай от себя.\n"
+        "2. Если релевантных ассоциаций недостаточно — прямо скажи, что граф пока не связал "
+        "с этим вопросом ничего релевантного, вместо того чтобы придумывать ответ.\n"
+        "3. Если 'Внутреннее состояние' показывает низкую уверенность — явно обозначь это в "
+        "формулировке (например, 'вероятно', 'не до конца уверен'), не выдавай предположение "
+        "за факт.\n"
+        "4. Отвечай связно, естественно и по существу, обращаясь напрямую к пользователю — "
+        "не пересказывай структуру входных данных и не перечисляй теги источников."
     )
 
     def __init__(self, config: BrainConfig):
@@ -151,12 +188,28 @@ class CognitiveBrain(nn.Module):
         self.knowledge_base = []
         self.lock = threading.RLock()
         self.short_memory = deque(maxlen=100)
-        self.proactive_thoughts = []  # отдельное хранилище для внутренних мыслей
+        self.proactive_thoughts = []
 
         self.curiosity = CuriosityModule(lr=config.curiosity_lr) if config.enable_curiosity else None
         self.planner = Planner(self.llm) if config.enable_planning else None
         self.reflector = Reflector(self.llm) if config.enable_reflection else None
         self.ewc = EWC(self.graph, lambda_=config.ewc_lambda) if config.enable_ewc else None
+
+        self.teacher = Teacher(llm_client=self.llm.client) if getattr(self.llm, "client", None) else None
+
+        self._kb_emb_cache: Optional[torch.Tensor] = None
+        self._kb_cache_dirty: bool = True
+
+        # Новые модули
+        self.self_model = SelfModel(dim=config.self_model_dim, input_dim=config.dim_embedding)
+        self.auto_memory = AutobiographicalMemory(capacity=config.auto_memory_capacity)
+        self.global_workspace = GlobalWorkspace(capacity=config.global_workspace_capacity)
+        self.motivation = DriveSystem() if config.enable_motivation else None
+        self.emotion = EmotionModel() if config.enable_emotion else None
+        self.user_model = UserModel(dim=config.self_model_dim) if config.enable_user_model else None
+
+        bus.subscribe('answer_generated', self._on_answer_generated)
+        bus.subscribe('new_fact_learned', self._on_fact_learned)
 
         self._init_architecture()
 
@@ -181,6 +234,7 @@ class CognitiveBrain(nn.Module):
             self._learn_counter += epochs
             if self._learn_counter % self.config.checkpoint_every == 0:
                 self.save()
+            bus.publish('new_fact_learned', {'q': input_text, 'a': output_text, 'reward': reward})
 
     def _learn_from_pair(self, q: str, a: str, reward: float):
         q_vec = self.text_to_embedding(q, is_query=True)
@@ -210,14 +264,6 @@ class CognitiveBrain(nn.Module):
         loss = self._contrastive_loss(q_nid, a_nid)
 
         if self.ewc is not None:
-            # ИСПРАВЛЕНО: раньше accumulate() вызывался ПОСЛЕ backward() суммарного
-            # (task_loss + ewc.penalty()) лосса — Fisher-информация (оценка "важности"
-            # параметра) считалась по градиенту, уже включающему сам EWC-штраф, который
-            # тянет параметры к якорю. Это систематически занижало важность параметров,
-            # уже близких к якорю, и искажало то, что EWC должен защищать при continual
-            # learning. Теперь Fisher считается по градиенту ЧИСТОГО task loss (первый
-            # backward, retain_graph=True), а второй backward — уже с penalty — идёт
-            # в оптимизатор как обычно.
             loss.backward(retain_graph=True)
             self.ewc.accumulate()
             self.optimizer.zero_grad()
@@ -234,23 +280,6 @@ class CognitiveBrain(nn.Module):
             self.memory.add_semantic_triple(q, "has_answer", a, confidence=reward)
 
     def _contrastive_loss(self, q_nid: int, a_nid: int) -> torch.Tensor:
-        """
-        ИСПРАВЛЕНО: раньше негативы для контрастива брались случайно из ВСЕХ
-        узлов графа (random.sample(candidates, k)). Пока граф маленький,
-        случайный узел ещё туда-сюда информативен, но с ростом графа случайный
-        негатив почти гарантированно семантически далёк от вопроса — сходство
-        к нему околонулевое ещё до обучения, cross_entropy сразу маленький,
-        градиент через него почти нулевой. Лосс выглядит "хорошо", но перестаёт
-        чему-либо учить — классическая ловушка контрастивного обучения на
-        растущем графе.
-
-        Теперь негативы — top-K УЖЕ БЛИЗКИХ к вопросу узлов (кроме самого
-        правильного ответа), т.е. "похоже, но неверно" вместо "далеко и так
-        понятно, что неверно". Это заставляет граф учиться тонким различиям
-        между близкими по смыслу узлами, а не тривиальному отсеиванию мусора.
-        Используется уже посчитанный h — без лишнего forward и без похода в
-        отдельный индекс.
-        """
         h = self.graph.forward()
         n = h.shape[0]
         h_norm = F.normalize(h, p=2, dim=1)
@@ -274,9 +303,6 @@ class CognitiveBrain(nn.Module):
             pool_size = min(hard_pool, num_candidates)
             pool_vals, pool_idx = torch.topk(sim_to_q, pool_size)
             if k < pool_size:
-                # берём не жёстко top-k, а случайную выборку ИЗ пула ближайших —
-                # иначе на каждом шаге одни и те же самые близкие соседи, и граф
-                # быстро переобучается именно под них, а не под общую границу
                 perm = torch.randperm(pool_size, device=h.device)[:k]
                 neg_idx = pool_idx[perm]
             else:
@@ -317,37 +343,47 @@ class CognitiveBrain(nn.Module):
                 self.save()
 
     # ---------- Основной шаг ----------
+    def _needs_search(self, text: str) -> bool:
+        lower = text.lower()
+        return any(kw in lower for kw in _SEARCH_TRIGGER_WORDS)
+
     def step(self, input_text: str, use_search: bool = False, temperature: Optional[float] = None) -> Dict[str, Any]:
+        with self.lock:
+            return self._step_locked(input_text, use_search=use_search, temperature=temperature)
+
+    def _step_locked(self, input_text: str, use_search: bool = False,
+                      temperature: Optional[float] = None) -> Dict[str, Any]:
         self.step_counter += 1
 
-        # Планирование
-        if self.planner is not None:
-            context = self._build_context(input_text, [], None)
-            plan = self.planner.plan(input_text, context)
-            if "search" in plan or "поиск" in plan:
-                use_search = True
+        if not use_search and self._needs_search(input_text):
+            use_search = True
 
-        # Обработка крипто
         lower = input_text.lower()
         if any(kw in lower for kw in ["биткоин", "btc", "курс биткоина"]):
             price = self._get_crypto_price("bitcoin", "usd")
             if price is not None:
                 answer = f"Текущий курс BTC/USD: ${price:.2f}"
                 self._update_after_step(input_text, answer)
+                self.global_workspace.publish(answer, source='crypto', priority=0.9)
                 return {"input": input_text, "answer": answer, "activated_neurons": [], "memory_results": []}
 
-        # Поиск в интернете
         if use_search:
             enhanced = self._enhance_search_query(input_text)
             results = self.searcher.search(enhanced)
             if results:
                 context = self._build_search_context(input_text, enhanced, results)
+                # QWEN3.5: основной ответ используем enable_thinking из конфига, presence_penalty тоже
                 full_answer = self.llm.generate(
                     context,
                     system=self.SYSTEM_PROMPT,
                     history=self._recent_history(),
                     max_tokens=2000,
                     temperature=temperature if temperature is not None else 0.3,
+                    top_p=self.config.llm_top_p,
+                    repetition_penalty=self.config.llm_repetition_penalty,
+                    top_k=self.config.llm_top_k,
+                    presence_penalty=self.config.presence_penalty,
+                    enable_thinking=self.config.enable_thinking,
                 )
             else:
                 full_answer = "Не удалось найти информацию."
@@ -364,14 +400,16 @@ class CognitiveBrain(nn.Module):
                 "memory_results": []
             }
 
-        # Основной путь: граф + LLM
         query_vec = self.text_to_embedding(input_text, is_query=True)
         memory_results = self.memory.retrieve(query_vec, k=10)
 
+        contextual_kwargs = {"max_nodes_for_gnn": self.config.gnn_contextual_max_nodes}
         if hasattr(self.graph, 'levels'):
-            start_nid = self.graph.find_most_similar_contextual(query_vec, level_idx=0, threshold=0.5)
+            start_nid = self.graph.find_most_similar_contextual(
+                query_vec, level_idx=0, threshold=0.5, **contextual_kwargs)
         else:
-            start_nid = self.graph.find_most_similar_contextual(query_vec, threshold=0.5)
+            start_nid = self.graph.find_most_similar_contextual(
+                query_vec, threshold=0.5, **contextual_kwargs)
 
         if start_nid is None:
             start_nid = self.graph.add_node(query_vec, label=input_text[:30], cluster="input", layer=0,
@@ -379,28 +417,76 @@ class CognitiveBrain(nn.Module):
 
         thought_stream = self.graph.spreading_activation(start_nid, steps=3, decay=0.6, top_k=6)
 
-        context = self._build_context(input_text, memory_results, start_nid, thought_stream)
+        self.global_workspace.publish(thought_stream, source='graph', priority=0.6)
+        self.global_workspace.publish(memory_results, source='memory', priority=0.5)
+        gw_content = self.global_workspace.get_current()
+
+        pre_confidence = self._compute_confidence(query_vec, None, thought_stream)
+
+        context = self._build_context(input_text, memory_results, start_nid, thought_stream,
+                                       gw_content=gw_content, pre_confidence=pre_confidence)
+
+        # QWEN3.5: основной ответ с параметрами из конфига
         full_answer = self.llm.generate(
             context,
             system=self.SYSTEM_PROMPT,
             history=self._recent_history(),
             max_tokens=2000,
             temperature=temperature if temperature is not None else 0.7,
+            top_p=self.config.llm_top_p,
+            repetition_penalty=self.config.llm_repetition_penalty,
+            top_k=self.config.llm_top_k,
+            presence_penalty=self.config.presence_penalty,
+            enable_thinking=self.config.enable_thinking,
         )
 
-        # Рефлексия и любопытство
+        self.global_workspace.publish(full_answer, source='llm', priority=0.8)
+
         if self.reflector is not None and self.reflector.should_reflect(full_answer):
             improved = self.reflector.reflect(input_text, full_answer)
             if improved != full_answer:
                 full_answer = improved
-                self.learn_pair(input_text, full_answer, reward=0.9)
 
+        if self.teacher is not None:
+            score, improved_by_teacher, teacher_details = self.teacher.evaluate(input_text, full_answer)
+            if improved_by_teacher != full_answer and score > 0.6:
+                full_answer = improved_by_teacher
+        else:
+            score, teacher_details = 0.5, {}
+
+        answer_vec = self.text_to_embedding(full_answer, is_query=False)
+
+        curiosity_reward = None
         if self.curiosity is not None:
-            predicted_vec = query_vec
-            actual_vec = self.text_to_embedding(full_answer, is_query=False)
-            reward = self.curiosity.compute_reward(query_vec, predicted_vec, actual_vec)
-            if reward > 0.1:
-                self.learn_pair(input_text, full_answer, reward=min(reward, 1.0))
+            curiosity_reward = self.curiosity.compute_reward(query_vec, query_vec, answer_vec)
+
+        learn_reward = score
+        if curiosity_reward is not None and curiosity_reward > score:
+            learn_reward = min(max(curiosity_reward, score), 1.0)
+        if learn_reward > 0.55:
+            self.learn_pair(input_text, full_answer, reward=learn_reward)
+
+        self.self_model.update(query_vec, context_vec=answer_vec)
+        self.auto_memory.add({
+            'input': input_text,
+            'answer': full_answer,
+            'self_state': self.self_model.get_state().clone(),
+            'timestamp': time.time(),
+            'emotion': self.emotion.get_vector() if self.emotion else None
+        })
+
+        novelty = 0.0 if self.memory.retrieve(query_vec, k=1) else 0.3
+        confidence = self._compute_confidence(query_vec, answer_vec, thought_stream)
+
+        if self.emotion:
+            self.emotion.update(reward=score, novelty=novelty, goal_achieved=(score > 0.75), confidence=confidence)
+            if temperature is None:
+                temperature = self.emotion.modulate_temperature(self.config.exploration_temperature)
+
+        if self.motivation:
+            self.motivation.update(feedback={'success': score > 0.6}, new_info=novelty > 0.2)
+
+        bus.publish('answer_generated', {'input': input_text, 'answer': full_answer})
 
         self.memory.add_working(query_vec, {"text": input_text, "answer": full_answer})
         self._update_after_step(input_text, full_answer)
@@ -416,7 +502,10 @@ class CognitiveBrain(nn.Module):
             "thoughts": full_answer,
             "activated_neurons": [start_nid] + [nid for nid, _ in thought_stream] if start_nid else [],
             "thought_stream": thought_stream,
-            "memory_results": memory_results
+            "memory_results": memory_results,
+            "confidence": confidence,
+            "teacher_score": score,
+            "teacher_details": teacher_details,
         }
 
     def _summarize_answer(self, full_answer: str) -> str:
@@ -426,10 +515,12 @@ class CognitiveBrain(nn.Module):
             "Сократи следующий текст до 2–3 предложений, обращаясь прямо к пользователю. "
             "Сохрани суть, убери воду. Текст:\n" + full_answer
         )
+        # QWEN3.5: отключаем thinking для краткого резюме
         summary = self.llm.generate(
             prompt,
             max_tokens=self.config.summary_max_tokens,
-            temperature=self.config.summary_temperature
+            temperature=self.config.summary_temperature,
+            enable_thinking=False,
         )
         return summary if summary.strip() else full_answer
 
@@ -438,7 +529,6 @@ class CognitiveBrain(nn.Module):
         if not self.config.proactive_enabled:
             return
         with self.lock:
-            # Получаем граф уровня 0 (для иерархического) или сам граф
             if hasattr(self.graph, 'levels'):
                 g = self.graph.levels[0]
             else:
@@ -448,10 +538,12 @@ class CognitiveBrain(nn.Module):
             if n_nodes < 2:
                 return
 
-            # Выбор узла по степени (топ-10)
-            degrees = {nid: len(g._adjacency.get(nid, [])) for nid in range(1, n_nodes + 1)}
-            top_nodes = sorted(degrees, key=degrees.get, reverse=True)[:10]
-            start_id = random.choice(top_nodes) if top_nodes else random.randint(1, n_nodes)
+            if self.motivation and self.motivation.drives.get('curiosity', 0.5) > 0.7:
+                start_id = random.randint(1, n_nodes)
+            else:
+                degrees = {nid: len(g._adjacency.get(nid, [])) for nid in range(1, n_nodes + 1)}
+                top_nodes = sorted(degrees, key=degrees.get, reverse=True)[:10]
+                start_id = random.choice(top_nodes) if top_nodes else random.randint(1, n_nodes)
 
             stream = g.spreading_activation(
                 start_id,
@@ -463,13 +555,12 @@ class CognitiveBrain(nn.Module):
             if not stream:
                 return
 
-            node_labels = g.node_labels  # метки узлов уровня 0
+            node_labels = g.node_labels
             associations = "\n".join(
                 f"- {node_labels.get(nid, f'нейрон_{nid}')} (сила: {strength:.2f})"
                 for nid, strength in stream
             )
 
-            # Контекст диалога (без изменений)
             recent_context = ""
             if self.dialog_memory:
                 last_turns = self.dialog_memory[-6:]
@@ -485,13 +576,14 @@ class CognitiveBrain(nn.Module):
                 f"Поток ассоциаций (концепты с силой активации):\n{associations}\n"
                 "Сформулируй одну связную мысль, которая естественно вытекает из этих ассоциаций и развивает тему диалога."
             )
-            thought = self.llm.generate(prompt, max_tokens=100, temperature=0.8)
+            # QWEN3.5: отключаем thinking для быстрой внутренней мысли
+            thought = self.llm.generate(prompt, max_tokens=100, temperature=0.8, enable_thinking=False)
             if thought and len(thought.strip()) > 20:
                 self.learn_pair("внутренняя мысль", thought, reward=self.config.proactive_reward)
                 self.proactive_thoughts.append({"thought": thought, "time": time.time()})
                 print(f"[Proactive] Сгенерирована мысль: {thought[:80]}...")
 
-    # ---------- Вспомогательные методы ----------
+    # ---------- Вспомогательные методы (без изменений) ----------
     def _recent_history(self, n_pairs: int = 4) -> List[Dict[str, str]]:
         msgs = []
         for turn in self.dialog_memory[-n_pairs:]:
@@ -529,39 +621,27 @@ class CognitiveBrain(nn.Module):
         })
         if len(self.knowledge_base) > self.config.max_kb_size:
             self.knowledge_base.pop(0)
+        self._kb_cache_dirty = True
 
     def _build_context(self, query: str, memory_results: List[Dict], start_nid: int,
                         thought_stream: Optional[List[Tuple[int, float]]] = None,
-                        max_facts: int = 12) -> str:
-        """
-        ИСПРАВЛЕНО: раньше поток активации графа (top_k=6), эпизодическая память
-        (top 10) и база знаний (top 10) просто конкатенировались тремя независимыми
-        списками — до 26 строк без дедупликации и без единой шкалы релевантности.
-        Одна и та же информация часто встречается сразу в KB и в эпизодической
-        памяти (KB заполняется из тех же learn_pair, что попадают в эпизодическую
-        память), из-за чего LLM получала избыточный, "размытый" контекст — это
-        напрямую снижает качество ответа, т.к. модели сложнее выделить релевантное
-        среди повторов.
-
-        Теперь все источники нормализуются в единый список (текст, score, источник),
-        схожие по тексту факты дедуплицируются (оставляем более релевантный),
-        сортируются по score и обрезаются общим бюджетом max_facts — а не
-        независимо по каждому источнику.
-        """
+                        gw_content: Optional[List[Dict]] = None,
+                        max_facts: int = 12,
+                        pre_confidence: Optional[float] = None) -> str:
         context = f"Вопрос: {query}\n"
         node_labels = getattr(self.graph, 'node_labels', {})
         start_label = node_labels.get(start_nid, "")
         if start_label:
             context += f"Отправная ассоциация графа: {start_label}\n"
 
-        candidates: List[Tuple[float, str, str]] = []  # (score, text, source_line)
+        candidates: List[Tuple[float, str, str]] = []
 
         if thought_stream:
             max_strength = max((s for _, s in thought_stream), default=1.0) or 1.0
             for nid, strength in thought_stream:
                 label = node_labels.get(nid, "")
                 if label:
-                    norm_score = strength / max_strength  # приводим к [0, 1], сопоставимо с cosine-based score
+                    norm_score = strength / max_strength
                     candidates.append((
                         norm_score, self._normalize(label),
                         f"[ассоциация графа] {label} (активация: {strength:.2f})"
@@ -578,9 +658,24 @@ class CognitiveBrain(nn.Module):
         for score, q, a in kb_facts:
             candidates.append((score, self._normalize(f"{q} {a}"), f"[база знаний] Q: {q} -> A: {a}"))
 
-        # Дедупликация: если новый факт по тексту почти совпадает с уже отобранным
-        # более релевантным — пропускаем (простое подстрочное совпадение достаточно
-        # для этого случая, т.к. дубли обычно приходят из одного и того же q/a).
+        norm_query = self._normalize(query)
+        semantic_hits = self.memory.query_semantic(subj=query)
+        if not semantic_hits:
+            semantic_hits = [
+                (s, p, o, c) for s, p, o, c in self.memory.semantic_memory.triples
+                if norm_query in self._normalize(s) or self._normalize(s) in norm_query
+            ][:max_facts]
+        for s, p, o, c in semantic_hits[:max_facts]:
+            candidates.append((c, self._normalize(f"{s} {o}"), f"[семантическая память] {s} -> {o}"))
+
+        if gw_content:
+            for item in gw_content:
+                content = str(item['content'])
+                if len(content) > 100:
+                    content = content[:100] + "..."
+                candidates.append((item['priority'], self._normalize(content),
+                                   f"[глобальное пространство] {content} (источник: {item['source']})"))
+
         candidates.sort(key=lambda c: c[0], reverse=True)
         selected: List[str] = []
         seen_norms: List[str] = []
@@ -596,6 +691,22 @@ class CognitiveBrain(nn.Module):
             context += "Релевантные факты и ассоциации (по убыванию релевантности):\n"
             context += "\n".join(f"- {line}" for line in selected) + "\n"
 
+        state_lines = []
+        if pre_confidence is not None:
+            level = "высокая" if pre_confidence > 0.6 else ("средняя" if pre_confidence > 0.35 else "низкая")
+            state_lines.append(f"уверенность в активированных ассоциациях: {level} ({pre_confidence:.2f})")
+        if self.emotion is not None:
+            state_lines.append(
+                f"эмоциональный тон: valence={self.emotion.valence:.2f}, arousal={self.emotion.arousal:.2f}"
+            )
+        if self.motivation is not None:
+            top_drive = max(self.motivation.drives.items(), key=lambda kv: kv[1], default=None)
+            if top_drive:
+                state_lines.append(f"доминирующий драйв: {top_drive[0]} ({top_drive[1]:.2f})")
+        if state_lines:
+            context += "Внутреннее состояние (сигнал для тона, не для содержания ответа): "
+            context += "; ".join(state_lines) + "\n"
+
         context += "Сформулируй ответ на основе потока ассоциаций и данных выше. Если ничего релевантного не активировано, скажи: 'Я не знаю'."
         return context
 
@@ -607,21 +718,42 @@ class CognitiveBrain(nn.Module):
         context += "На основе этих данных дай точный ответ. Если данных недостаточно, скажи: 'Не удалось найти'."
         return context
 
-    def _search_knowledge_base(self, query: str, top_k: int = 3, return_scored: bool = False):
-        if not self.knowledge_base:
-            return []
-        q_vec = self.text_to_embedding(query, is_query=True)
-        scored = []
-        for item in self.knowledge_base:
+    def _rebuild_kb_cache(self):
+        valid_embs = []
+        valid_idx = []
+        for i, item in enumerate(self.knowledge_base):
             emb = item.get("emb")
             if emb is None:
                 continue
             if isinstance(emb, list):
                 emb = torch.tensor(emb, dtype=torch.float32)
-            sim = cosine_similarity(q_vec, emb)
-            scored.append((sim, item))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = [(sim, item) for sim, item in scored[:top_k] if sim > 0.4]
+                item["emb"] = emb
+            valid_embs.append(emb.detach())
+            valid_idx.append(i)
+        if valid_embs:
+            self._kb_emb_cache = (torch.stack(valid_embs), valid_idx)
+        else:
+            self._kb_emb_cache = (torch.empty(0), [])
+        self._kb_cache_dirty = False
+
+    def _search_knowledge_base(self, query: str, top_k: int = 3, return_scored: bool = False):
+        if not self.knowledge_base:
+            return []
+        if self._kb_cache_dirty or self._kb_emb_cache is None:
+            self._rebuild_kb_cache()
+        stacked, valid_idx = self._kb_emb_cache
+        if stacked.numel() == 0:
+            return []
+        q_vec = self.text_to_embedding(query, is_query=True)
+        with torch.no_grad():
+            sims = F.cosine_similarity(q_vec.unsqueeze(0), stacked, dim=1)
+        k = min(top_k, sims.shape[0])
+        top_vals, top_pos = torch.topk(sims, k)
+        top = [
+            (float(v.item()), self.knowledge_base[valid_idx[p.item()]])
+            for v, p in zip(top_vals, top_pos)
+            if v.item() > 0.4
+        ]
         if return_scored:
             return [(sim, item["q"], item["a"]) for sim, item in top]
         return [f"Q: {item['q']} -> A: {item['a']}" for sim, item in top]
@@ -639,6 +771,31 @@ class CognitiveBrain(nn.Module):
     def _enhance_search_query(self, query: str) -> str:
         return query + " " + time.strftime("%d.%m.%Y")
 
+    # ---------- МЕТА-ПОЗНАНИЕ ----------
+    def _compute_confidence(self, query_vec: torch.Tensor, answer_vec: torch.Tensor,
+                            thought_stream: Optional[List[Tuple[int, float]]]) -> float:
+        if not thought_stream:
+            return 0.3
+        strengths = [s for _, s in thought_stream]
+        if not strengths:
+            return 0.3
+        import math
+        entropy = -sum(p * math.log(p) for p in strengths if p > 0)
+        max_entropy = math.log(len(strengths) + 1)
+        norm_entropy = entropy / max_entropy if max_entropy > 0 else 0
+        confidence = 1.0 - norm_entropy
+        if answer_vec is not None and query_vec is not None:
+            sim = F.cosine_similarity(query_vec.unsqueeze(0), answer_vec.unsqueeze(0)).item()
+            confidence = 0.7 * confidence + 0.3 * sim
+        return max(0.1, min(0.9, confidence))
+
+    # ---------- ОБРАБОТЧИКИ СОБЫТИЙ ----------
+    def _on_answer_generated(self, data):
+        pass
+
+    def _on_fact_learned(self, data):
+        pass
+
     # ---------- Сон и консолидация ----------
     def sleep(self, duration_steps: int = 10):
         with self.lock:
@@ -653,26 +810,20 @@ class CognitiveBrain(nn.Module):
                 time.sleep(0.5)
             print("😴 Сон завершён")
 
-    # ---------- Сохранение / загрузка (ИСПРАВЛЕНЫ) ----------
+    # ---------- Сохранение / загрузка ----------
     def save(self, model_dir: str = None):
         path = model_dir or self.config.model_dir
         os.makedirs(path, exist_ok=True)
 
-        # 1. Сохраняем параметры графа (веса)
         torch.save(self.graph.state_dict(), f"{path}/graph.pth")
         with open(f"{path}/edges.pkl", "wb") as f:
             if hasattr(self.graph, '_edges') and hasattr(self.graph, '_edge_weights'):
                 edges = self.graph._edges
                 weights = [w.detach().cpu().numpy() for w in self.graph._edge_weights]
-                # ИСПРАВЛЕНО: добавлен третий элемент — тип отношения каждого ребра
-                # (индекс в graph.relation_types). Раньше синапс нёс только скаляр
-                # веса. load() ниже умеет читать и старый двухэлементный формат.
                 relations = list(getattr(self.graph, '_edge_relations', [0] * len(edges)))
                 pickle.dump((edges, weights, relations), f)
 
-        # 2. Сохраняем метаданные узлов (метки, типы, кластеры) — ЭТО НОВОЕ
         if hasattr(self.graph, 'levels'):
-            # Иерархический граф — сохраняем все уровни
             meta_data = {}
             for idx, level in enumerate(self.graph.levels):
                 meta_data[f'level_{idx}'] = {
@@ -689,25 +840,33 @@ class CognitiveBrain(nn.Module):
         with open(f"{path}/nodes_meta.pkl", "wb") as f:
             pickle.dump(meta_data, f)
 
-        # 3. База знаний
-        kb_temp = f"{path}/knowledge_base.pkl.tmp"
-        with open(kb_temp, "wb") as f:
+        with open(f"{path}/knowledge_base.pkl", "wb") as f:
             pickle.dump(self.knowledge_base, f)
-        os.replace(kb_temp, f"{path}/knowledge_base.pkl")
 
-        # 4. Остальные метаданные (счётчики, concept_index)
         meta = {
             "step_counter": self.step_counter,
             "learn_counter": self._learn_counter,
             "concept_index": self.concept_index,
         }
-        meta_temp = f"{path}/meta.json.tmp"
-        with open(meta_temp, "w") as f:
+        with open(f"{path}/meta.json", "w") as f:
             json.dump(meta, f, default=lambda o: o.tolist() if isinstance(o, torch.Tensor) else o)
-        os.replace(meta_temp, f"{path}/meta.json")
 
-        # 5. История диалогов
         self.save_dialog_history(os.path.join(path, "dialog_history.json"))
+
+        torch.save(self.self_model.state_dict(), f"{path}/self_model.pth")
+        with open(f"{path}/auto_memory.pkl", "wb") as f:
+            pickle.dump(self.auto_memory.episodes, f)
+        if self.user_model:
+            with open(f"{path}/user_model.pkl", "wb") as f:
+                pickle.dump(self.user_model, f)
+        if self.emotion:
+            with open(f"{path}/emotion.pkl", "wb") as f:
+                pickle.dump({'valence': self.emotion.valence, 'arousal': self.emotion.arousal,
+                             'dominance': self.emotion.dominance}, f)
+        if self.motivation:
+            with open(f"{path}/motivation.pkl", "wb") as f:
+                pickle.dump(self.motivation.drives, f)
+
         print(f"[Brain] Модель сохранена в {path}")
 
     def _resize_parameter(self, param: nn.Parameter, new_shape: tuple) -> nn.Parameter:
@@ -729,12 +888,11 @@ class CognitiveBrain(nn.Module):
             print(f"[Brain] Папка модели {path} не найдена, начинаем с нуля.")
             return
 
-        # 1. Загружаем параметры графа
         graph_path = f"{path}/graph.pth"
         if os.path.exists(graph_path):
             state_dict = torch.load(graph_path, map_location=self.device)
 
-            def adapt_params(module, prefix=""):
+            def adapt_params(module, state_dict, prefix=""):
                 for name, param in list(module.named_parameters(recurse=False)):
                     full_name = prefix + name if prefix else name
                     if full_name in state_dict:
@@ -744,12 +902,11 @@ class CognitiveBrain(nn.Module):
                             new_param = self._resize_parameter(param, saved_shape)
                             setattr(module, name, new_param)
                 for child_name, child in module.named_children():
-                    adapt_params(child, prefix + child_name + ".")
+                    adapt_params(child, state_dict, prefix + child_name + ".")
 
-            adapt_params(self.graph)
+            adapt_params(self.graph, state_dict)
             self.graph.load_state_dict(state_dict, strict=False)
 
-        # 2. Загружаем рёбра
         edges_path = f"{path}/edges.pkl"
         if os.path.exists(edges_path):
             with open(edges_path, "rb") as f:
@@ -757,13 +914,8 @@ class CognitiveBrain(nn.Module):
             if len(loaded) == 3:
                 edges, weights, relations = loaded
             else:
-                # старый формат (до типизации рёбер) — все существующие синапсы
-                # были обучены как безымянная "положительная" связь, ближе всего
-                # семантически к has_answer (индекс 0 в RELATION_TYPES)
                 edges, weights = loaded
                 relations = [0] * len(edges)
-                print(f"[Brain] edges.pkl в старом формате (без типов отношений), "
-                      f"{len(edges)} рёбер помечены как '{self.graph.relation_types[0] if hasattr(self.graph, 'relation_types') else 'has_answer'}'.")
             if hasattr(self.graph, 'levels'):
                 level0 = self.graph.levels[0]
                 level0._edges = edges
@@ -776,7 +928,6 @@ class CognitiveBrain(nn.Module):
                 self.graph._edge_relations = list(relations)
                 self.graph._rebuild_edges()
 
-        # 3. Загружаем метаданные узлов (ЭТО НОВОЕ)
         meta_path = f"{path}/nodes_meta.pkl"
         if os.path.exists(meta_path):
             with open(meta_path, "rb") as f:
@@ -792,22 +943,7 @@ class CognitiveBrain(nn.Module):
                 self.graph.node_labels = meta_data['labels']
                 self.graph.node_types = meta_data['types']
                 self.graph.node_clusters = meta_data['clusters']
-        else:
-            # Если файла с метаданными нет (старая модель) — попробуем восстановить метки из concept_index
-            print("[Brain] nodes_meta.pkl не найден, восстанавливаем метки из concept_index (если возможно).")
-            reverse_index = {v: k for k, v in self.concept_index.items()}
-            if hasattr(self.graph, 'levels'):
-                level = self.graph.levels[0]
-                for nid in range(1, level.node_emb.shape[0] + 1):
-                    if nid not in level.node_labels and nid in reverse_index:
-                        level.node_labels[nid] = reverse_index[nid]
-                        # типы и кластеры оставляем по умолчанию
-            else:
-                for nid in range(1, self.graph.node_emb.shape[0] + 1):
-                    if nid not in self.graph.node_labels and nid in reverse_index:
-                        self.graph.node_labels[nid] = reverse_index[nid]
 
-        # 4. Загружаем meta.json
         meta_path_json = f"{path}/meta.json"
         if os.path.exists(meta_path_json):
             with open(meta_path_json, "r") as f:
@@ -815,26 +951,47 @@ class CognitiveBrain(nn.Module):
             self.step_counter = meta.get("step_counter", 0)
             self._learn_counter = meta.get("learn_counter", 0)
             self.concept_index = meta.get("concept_index", {})
-            if "knowledge_base" in meta:
-                self.knowledge_base = meta["knowledge_base"]
-                for item in self.knowledge_base:
-                    if "emb" in item and isinstance(item["emb"], list):
-                        item["emb"] = torch.tensor(item["emb"], dtype=torch.float32)
-                with open(f"{path}/knowledge_base.pkl", "wb") as f:
-                    pickle.dump(self.knowledge_base, f)
-                print("[Brain] Старый формат knowledge_base перенесён в отдельный файл.")
-            else:
-                kb_path = f"{path}/knowledge_base.pkl"
-                if os.path.exists(kb_path):
-                    with open(kb_path, "rb") as f:
-                        self.knowledge_base = pickle.load(f)
-                else:
-                    self.knowledge_base = []
 
-        # 5. История диалогов
+        kb_path = f"{path}/knowledge_base.pkl"
+        if os.path.exists(kb_path):
+            with open(kb_path, "rb") as f:
+                self.knowledge_base = pickle.load(f)
+
         self.load_dialog_history(os.path.join(path, "dialog_history.json"))
 
-        # 6. Пересоздаём оптимизатор
+        sm_path = f"{path}/self_model.pth"
+        if os.path.exists(sm_path):
+            missing, unexpected = self.self_model.load_state_dict(
+                torch.load(sm_path, map_location=self.device), strict=False
+            )
+            if missing:
+                print(f"[Brain] SelfModel: новые слои без сохранённых весов (доучатся с нуля): {missing}")
+            if unexpected:
+                print(f"[Brain] SelfModel: неиспользуемые ключи в чекпоинте (проигнорированы): {unexpected}")
+
+        am_path = f"{path}/auto_memory.pkl"
+        if os.path.exists(am_path):
+            with open(am_path, "rb") as f:
+                self.auto_memory.episodes = pickle.load(f)
+
+        um_path = f"{path}/user_model.pkl"
+        if os.path.exists(um_path) and self.user_model:
+            with open(um_path, "rb") as f:
+                self.user_model = pickle.load(f)
+
+        em_path = f"{path}/emotion.pkl"
+        if os.path.exists(em_path) and self.emotion:
+            with open(em_path, "rb") as f:
+                data = pickle.load(f)
+                self.emotion.valence = data.get('valence', 0.0)
+                self.emotion.arousal = data.get('arousal', 0.0)
+                self.emotion.dominance = data.get('dominance', 0.0)
+
+        mot_path = f"{path}/motivation.pkl"
+        if os.path.exists(mot_path) and self.motivation:
+            with open(mot_path, "rb") as f:
+                self.motivation.drives = pickle.load(f)
+
         self.optimizer = optim.Adam(self.graph.parameters(), lr=self.config.learning_rate)
         print(f"[Brain] Модель загружена из {path}")
 
@@ -855,7 +1012,7 @@ class CognitiveBrain(nn.Module):
     def get_stats(self) -> Dict[str, Any]:
         num_nodes = self.graph.node_emb.shape[0] if hasattr(self.graph, 'node_emb') else sum(g.node_emb.shape[0] for g in self.graph.levels)
         num_edges = len(self.graph._edges) if hasattr(self.graph, '_edges') else 0
-        return {
+        stats = {
             "neurons": num_nodes,
             "synapses": num_edges,
             "concepts": len(self.concept_index),
@@ -867,3 +1024,13 @@ class CognitiveBrain(nn.Module):
             },
             "step_counter": self.step_counter,
         }
+        if self.emotion:
+            stats["emotion"] = {
+                "valence": self.emotion.valence,
+                "arousal": self.emotion.arousal,
+                "dominance": self.emotion.dominance
+            }
+        if self.motivation:
+            stats["drives"] = self.motivation.drives
+        stats["auto_memory_length"] = len(self.auto_memory.episodes)
+        return stats

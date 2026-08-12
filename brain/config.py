@@ -11,6 +11,7 @@ class BrainConfig:
     gnn_num_layers: int = 3
     gnn_num_heads: int = 4
     max_neurons: int = 100000
+    gnn_contextual_max_nodes: int = 20000
     max_synapses: int = 500000
     use_hierarchical_graph: bool = True
     graph_levels: List[int] = field(default_factory=lambda: [1024, 512, 256])
@@ -29,6 +30,13 @@ class BrainConfig:
     use_openai_api: bool = False
     openai_api_key: Optional[str] = None
     llm_base_url: Optional[str] = "http://192.168.0.13:1234/v1"
+
+    # ---------- Сэмплинг для Qwen3.5 (обновлено) ----------
+    llm_top_p: float = 0.8
+    llm_top_k: int = 20
+    llm_repetition_penalty: float = 1.05
+    presence_penalty: float = 0.0           # стандартный параметр OpenAI
+    enable_thinking: bool = True            # включать ли thinking mode (Qwen3.5)
 
     learning_rate: float = 1e-4
     contrastive_margin: float = 0.5
@@ -51,7 +59,6 @@ class BrainConfig:
     self_play_rounds: int = 3
     exploration_temperature: float = 0.9
 
-    # ---------- НОВЫЕ ПАРАМЕТРЫ ----------
     proactive_enabled: bool = True
     proactive_interval_seconds: int = 60
     proactive_steps: int = 3
@@ -61,3 +68,11 @@ class BrainConfig:
     two_level_answer: bool = True
     summary_max_tokens: int = 250
     summary_temperature: float = 0.3
+
+    auto_memory_capacity: int = 500
+    self_model_dim: int = 512
+    enable_metacognition: bool = True
+    enable_emotion: bool = True
+    enable_user_model: bool = True
+    enable_motivation: bool = True
+    global_workspace_capacity: int = 20
