@@ -25,6 +25,9 @@ class BrainAgent:
         self_play_rounds: int = 3,
         exploration_factor: float = 0.2,
         history_per_topic: int = 15,
+        # НОВЫЕ ПАРАМЕТРЫ ДЛЯ АВТООБУЧЕНИЯ
+        teacher_threshold: float = 0.7,
+        use_dynamic_threshold: bool = True,
     ):
         self.brain = brain
         self.teacher = teacher
@@ -39,6 +42,8 @@ class BrainAgent:
         self.self_play_rounds = self_play_rounds
         self.exploration_factor = exploration_factor
         self.history_per_topic = history_per_topic
+        self.teacher_threshold = teacher_threshold
+        self.use_dynamic_threshold = use_dynamic_threshold
 
         self._stop_flag = False
         self._thread = None
@@ -51,6 +56,11 @@ class BrainAgent:
         self.asked_questions: Dict[str, List[str]] = {t: [] for t in self.topics}
 
         self._proactive_counter = 0
+        # Счётчики для статистики автообучения
+        self.accepted_count = 0
+        self.improved_count = 0
+        self.rejected_count = 0
+        self.negative_count = 0
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -87,9 +97,16 @@ class BrainAgent:
                     self.brain.save_dialog_history()
                     print("[Agent] Автосохранение выполнено.")
 
-                # --- ФОНОВЫЙ СИНТЕЗ НОВЫХ УЗЛОВ (каждые 5 циклов) ---
+                # --- ФОНОВЫЙ СИНТЕЗ НОВЫХ УЗЛОВ ---
                 if cycle_counter % 5 == 0:
                     self._synthesize_random_pair()
+
+                # --- ПЕРИОДИЧЕСКАЯ СТАТИСТИКА АВТООБУЧЕНИЯ ---
+                if cycle_counter % 20 == 0:
+                    total = self.accepted_count + self.improved_count + self.rejected_count + self.negative_count
+                    if total > 0:
+                        print(f"[Agent] Автообучение: принято={self.accepted_count}, улучшено={self.improved_count}, "
+                              f"отклонено={self.rejected_count}, отрицательных={self.negative_count}")
 
             for _ in range(self.interval):
                 if self._stop_flag:
@@ -97,7 +114,6 @@ class BrainAgent:
                 time.sleep(1)
 
     def _synthesize_random_pair(self):
-        """Выбирает два узла с высокой степенью и синтезирует новый узел."""
         graph = self.brain.graph
         if hasattr(graph, 'levels'):
             g = graph.levels[0]
@@ -106,21 +122,17 @@ class BrainAgent:
         n_nodes = g.node_emb.shape[0]
         if n_nodes < 5:
             return
-        # Вычисляем степень узлов
         degrees = {nid: len(g._adjacency.get(nid, [])) for nid in range(1, n_nodes+1)}
         if not degrees:
             return
-        # Берём топ-20 узлов по степени
         sorted_nodes = sorted(degrees, key=degrees.get, reverse=True)[:20]
         if len(sorted_nodes) < 2:
             return
-        # Случайно выбираем два разных узла из топ-20
         nid1, nid2 = random.sample(sorted_nodes, 2)
         new_nid = self.brain.synthesize_concepts(nid1, nid2, optimizer=self.brain.optimizer)
         if new_nid != -1:
             print(f"[Agent] Фоновый синтез: создан узел {new_nid} из {nid1} и {nid2}")
 
-    # ---------- Остальные методы без изменений ----------
     def _cycle(self):
         if self.interactive_mode:
             self._interactive_cycle()
@@ -216,24 +228,7 @@ class BrainAgent:
             q = self._generate_question_for_topic(topic)
             if not q:
                 break
-            result = self.brain.step(q)
-            answer = result["answer"]
-            thoughts = result.get("thoughts", answer)
-            score, improved, _ = self.teacher.evaluate(q, thoughts)
-            if score >= 0.7:
-                self.brain.learn_pair(q, thoughts, reward=score)
-                self._update_topic_confidence(topic, score)
-            else:
-                if improved != thoughts:
-                    self.brain.learn_pair(q, improved, reward=0.8)
-                    self._update_topic_confidence(topic, 0.8)
-                else:
-                    self.brain.learn_negative_pair(q, thoughts)
-                    search_result = self.brain.step(q, use_search=True)
-                    if search_result["answer"] != "Не удалось найти информацию.":
-                        self.brain.learn_pair(q, search_result["thoughts"], reward=0.6)
-            time.sleep(0.5)
-        self.brain.sleep()
+            self._ask_and_learn(topic)
 
     def _ask_and_learn(self, topic: str):
         q = self._generate_question_for_topic(topic)
@@ -241,19 +236,40 @@ class BrainAgent:
             return
         result = self.brain.step(q)
         thoughts = result.get("thoughts", result["answer"])
+        confidence = result.get("confidence", 0.5)
+
+        # ----- НОВАЯ ЛОГИКА ОЦЕНКИ -----
         score, improved, _ = self.teacher.evaluate(q, thoughts)
-        if score >= 0.7:
+
+        # Динамический порог
+        if self.use_dynamic_threshold:
+            # Чем выше уверенность графа, тем ниже порог
+            dynamic_threshold = 0.5 + 0.25 * (1 - confidence)  # от 0.5 до 0.75
+            threshold = dynamic_threshold
+        else:
+            threshold = self.teacher_threshold
+
+        # Принятие решения
+        if score >= threshold:
+            # Хороший ответ – обучаем
             self.brain.learn_pair(q, thoughts, reward=score)
             self._update_topic_confidence(topic, score)
+            self.accepted_count += 1
         else:
-            if improved != thoughts:
-                self.brain.learn_pair(q, improved, reward=0.8)
-                self._update_topic_confidence(topic, 0.8)
+            # Пытаемся улучшить
+            if improved != thoughts and score > 0.3:
+                # Есть улучшенный вариант и оценка не совсем провальная
+                self.brain.learn_pair(q, improved, reward=max(0.5, score + 0.1))
+                self._update_topic_confidence(topic, max(0.5, score + 0.1))
+                self.improved_count += 1
             else:
-                self.brain.learn_negative_pair(q, thoughts)
-                search_result = self.brain.step(q, use_search=True)
-                if search_result["answer"] != "Не удалось найти информацию.":
-                    self.brain.learn_pair(q, search_result["thoughts"], reward=0.6)
+                # Плохо – либо отрицательное обучение, либо пропуск
+                if score < 0.3:
+                    self.brain.learn_negative_pair(q, thoughts)
+                    self.negative_count += 1
+                else:
+                    # Пропускаем (средний ответ без улучшения)
+                    self.rejected_count += 1
 
     def _select_topic_for_exploration(self) -> str:
         if self.brain.user_model is not None:
@@ -368,6 +384,8 @@ if __name__ == "__main__":
         teacher=teacher,
         llm_client=llm_client,
         interactive_mode=False,
+        teacher_threshold=0.7,
+        use_dynamic_threshold=True,
     )
 
     def _shutdown():

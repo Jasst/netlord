@@ -78,6 +78,9 @@ class AgentConfigRequest(BaseModel):
     questions_per_cycle: Optional[int] = None
     interactive_mode: Optional[bool] = None
     user_question_timeout: Optional[int] = None
+    # НОВЫЕ ПОЛЯ
+    teacher_threshold: Optional[float] = None
+    use_dynamic_threshold: Optional[bool] = None
 
 class TrainPairRequest(BaseModel):
     question: str
@@ -135,30 +138,29 @@ bulk_jobs = {}  # job_id -> {'status': 'running'|'completed'|'error', 'log': [],
 async def upload_jsonl(request: Request):
     """
     Принимает JSONL-файл и запускает bulk_train в фоновом потоке.
+    Поддерживает параметры валидации.
     """
     form = await request.form()
     file = form.get("file")
     if not file:
         raise HTTPException(400, "No file uploaded")
 
-    # Читаем параметры
     sleep_every = int(form.get("sleep_every", 200))
     reward = float(form.get("reward", 1.0))
+    validate = form.get("validate", "false").lower() == "true"
+    validation_threshold = float(form.get("validation_threshold", 0.6))
+    validation_retries = int(form.get("validation_retries", 1))
 
-    # Сохраняем файл во временную папку
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl") as tmp:
         content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 
-    # Генерируем job_id
     job_id = str(uuid.uuid4())[:8]
     bulk_jobs[job_id] = {"status": "running", "log": [], "total_pairs": 0}
 
-    # Запускаем обучение в отдельном потоке
     def run_bulk_train():
         try:
-            # Используем subprocess для запуска bulk_train.py с параметрами
             cmd = [
                 "python", "bulk_train.py",
                 "--data", tmp_path,
@@ -166,6 +168,15 @@ async def upload_jsonl(request: Request):
                 "--reward", str(reward),
                 "--model-dir", brain.config.model_dir
             ]
+            if validate:
+                cmd.append("--validate")
+                cmd.append("--validation-threshold")
+                cmd.append(str(validation_threshold))
+                cmd.append("--validation-retries")
+                cmd.append(str(validation_retries))
+                # Можно добавить --sample-rate, если нужно
+                # cmd.extend(["--sample-rate", "1.0"])
+
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -173,11 +184,9 @@ async def upload_jsonl(request: Request):
                 text=True,
                 bufsize=1
             )
-            # Читаем вывод построчно и сохраняем в лог
             for line in iter(process.stdout.readline, ''):
                 if line:
                     bulk_jobs[job_id]["log"].append(line.strip())
-                    # Если есть строка с "Готово. Загружено X пар", парсим количество
                     if "Готово. Загружено" in line:
                         import re
                         m = re.search(r"Загружено (\d+) пар", line)
@@ -194,7 +203,6 @@ async def upload_jsonl(request: Request):
             bulk_jobs[job_id]["status"] = "error"
             bulk_jobs[job_id]["log"].append(f"Ошибка: {str(e)}")
         finally:
-            # Удаляем временный файл
             try:
                 os.unlink(tmp_path)
             except:
@@ -372,6 +380,11 @@ async def agent_config(req: AgentConfigRequest):
         agent.interactive_mode = req.interactive_mode
     if req.user_question_timeout is not None:
         agent.user_question_timeout = req.user_question_timeout
+    # НОВЫЕ ПАРАМЕТРЫ
+    if req.teacher_threshold is not None:
+        agent.teacher_threshold = req.teacher_threshold
+    if req.use_dynamic_threshold is not None:
+        agent.use_dynamic_threshold = req.use_dynamic_threshold
     return {"status": "updated", "topics": agent.topics}
 
 

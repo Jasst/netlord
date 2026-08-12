@@ -163,34 +163,51 @@
                     <div class="log" id="sleepLog">Готов.</div>
                 </div>
 
-                <!-- ===== АГЕНТ-ИССЛЕДОВАТЕЛЬ ===== -->
-                <div class="settings-section">
-                    <h3>🤖 Агент-исследователь</h3>
-                    <button id="agentToggleBtn">⏸ Остановить</button>
-                    <div class="input-group"><label>Темы (через ,)</label><input type="text" id="agentTopics" value="наука, природа, технологии, история, искусство, философия" /></div>
-                    <div class="input-group"><label>Интервал (сек)</label><input type="number" id="agentInterval" value="120" min="10" /></div>
-                    <div class="input-group"><label>Вопросов/цикл</label><input type="number" id="agentQCount" value="2" min="1" max="10" /></div>
-                    <button id="updateAgentConfig">⚙️ Обновить</button>
-                    <div class="log" id="agentLog">Агент активен.</div>
-                </div>
+               <!-- ===== АГЕНТ-ИССЛЕДОВАТЕЛЬ ===== -->
+               <div class="settings-section">
+    <h3>🤖 Агент-исследователь</h3>
+    <button id="agentToggleBtn">⏸ Остановить</button>
+    <div class="input-group"><label>Темы (через ,)</label><input type="text" id="agentTopics" value="наука, природа, технологии, история, искусство, философия" /></div>
+    <div class="input-group"><label>Интервал (сек)</label><input type="number" id="agentInterval" value="120" min="10" /></div>
+    <div class="input-group"><label>Вопросов/цикл</label><input type="number" id="agentQCount" value="2" min="1" max="10" /></div>
+    <!-- НОВЫЕ ПОЛЯ -->
+    <div class="input-group">
+        <label>Порог Teacher</label>
+        <input type="number" id="agentTeacherThreshold" value="0.7" step="0.05" min="0.0" max="1.0" />
+    </div>
+    <label class="checkbox-label">
+        <input type="checkbox" id="agentUseDynamicThreshold" checked />
+        <span>Динамический порог (зависит от уверенности графа)</span>
+    </label>
+    <button id="updateAgentConfig">⚙️ Обновить</button>
+    <div class="log" id="agentLog">Агент активен.</div>
+</div>
 
                 <!-- ===== BULK TRAIN ИЗ JSONL ===== -->
                 <div class="settings-section">
-                    <h3>📂 Массовое обучение (JSONL)</h3>
-                    <p style="font-size:13px; color:var(--text-muted);">
-                        Загрузите файл .jsonl, сгенерированный <code>words.py</code>.
-                    </p>
-                    <form id="uploadJsonlForm" style="display:flex; flex-direction:column; gap:8px;">
-                        <input type="file" id="jsonlFileInput" accept=".jsonl,.json" style="background:var(--bg); color:var(--text); border:1px solid var(--border); padding:6px; border-radius:6px;" />
-                        <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                            <label style="font-size:12px; color:var(--text-muted);">Sleep every: <input type="number" id="bulkSleepEvery" value="200" style="width:60px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px;" /></label>
-                            <label style="font-size:12px; color:var(--text-muted);">Reward: <input type="number" id="bulkReward" value="1.0" step="0.1" style="width:60px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px;" /></label>
-                        </div>
-                        <button id="uploadJsonlBtn" class="primary" style="background:var(--accent); border:none; padding:8px 16px; border-radius:8px; color:#fff; cursor:pointer;">📤 Загрузить и обучить</button>
-                        <div id="uploadStatus" style="font-size:13px; color:var(--text-muted);"></div>
-                        <div id="bulkTrainLog" style="background:var(--bg); padding:10px; border-radius:8px; border:1px solid var(--border); font-family: monospace; font-size:12px; max-height:200px; overflow-y:auto; white-space:pre-wrap; color:var(--text);"></div>
-                    </form>
-                </div>
+    <h3>📂 Массовое обучение (JSONL)</h3>
+    <p style="font-size:13px; color:var(--text-muted);">
+        Загрузите файл .jsonl, сгенерированный <code>words.py</code> или <code>words_v2.py</code>.
+    </p>
+    <form id="uploadJsonlForm" style="display:flex; flex-direction:column; gap:8px;">
+        <input type="file" id="jsonlFileInput" accept=".jsonl,.json" style="background:var(--bg); color:var(--text); border:1px solid var(--border); padding:6px; border-radius:6px;" />
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <label style="font-size:12px; color:var(--text-muted);">Sleep every: <input type="number" id="bulkSleepEvery" value="200" style="width:60px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px;" /></label>
+            <label style="font-size:12px; color:var(--text-muted);">Reward: <input type="number" id="bulkReward" value="1.0" step="0.1" style="width:60px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px;" /></label>
+        </div>
+        <!-- НОВЫЙ БЛОК ВАЛИДАЦИИ -->
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; border-top:1px solid var(--border); padding-top:8px;">
+            <label style="font-size:12px; color:var(--text-muted); display:flex; align-items:center; gap:4px;">
+                <input type="checkbox" id="bulkValidate" /> Валидировать через Teacher
+            </label>
+            <label style="font-size:12px; color:var(--text-muted);">Порог: <input type="number" id="bulkThreshold" value="0.6" step="0.05" min="0.0" max="1.0" style="width:50px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px;" /></label>
+            <label style="font-size:12px; color:var(--text-muted);">Попыток: <input type="number" id="bulkRetries" value="1" min="0" max="5" style="width:50px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px;" /></label>
+        </div>
+        <button id="uploadJsonlBtn" class="primary" style="background:var(--accent); border:none; padding:8px 16px; border-radius:8px; color:#fff; cursor:pointer;">📤 Загрузить и обучить</button>
+        <div id="uploadStatus" style="font-size:13px; color:var(--text-muted);"></div>
+        <div id="bulkTrainLog" style="background:var(--bg); padding:10px; border-radius:8px; border:1px solid var(--border); font-family: monospace; font-size:12px; max-height:200px; overflow-y:auto; white-space:pre-wrap; color:var(--text);"></div>
+    </form>
+</div>
             </aside>
         </div>
 

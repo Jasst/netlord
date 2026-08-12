@@ -159,6 +159,7 @@ function autoResizeTextarea() {
 }
 
 // ---------- Управление настройками ----------
+// ---------- Управление настройками ----------
 function loadSettings() {
     const stored = localStorage.getItem(SETTINGS_KEY);
     let hadStoredChatListState = false;
@@ -183,6 +184,16 @@ function loadSettings() {
             if (s.agentTopics !== undefined) document.getElementById('agentTopics').value = s.agentTopics;
             if (s.agentInterval !== undefined) document.getElementById('agentInterval').value = s.agentInterval;
             if (s.agentQCount !== undefined) document.getElementById('agentQCount').value = s.agentQCount;
+            // НОВЫЕ ПОЛЯ
+            if (s.agentTeacherThreshold !== undefined) document.getElementById('agentTeacherThreshold').value = s.agentTeacherThreshold;
+            if (s.agentUseDynamicThreshold !== undefined) document.getElementById('agentUseDynamicThreshold').checked = s.agentUseDynamicThreshold;
+            // Для bulk train тоже можно сохранять, но это не критично
+            if (s.bulkSleepEvery !== undefined) document.getElementById('bulkSleepEvery').value = s.bulkSleepEvery;
+            if (s.bulkReward !== undefined) document.getElementById('bulkReward').value = s.bulkReward;
+            if (s.bulkValidate !== undefined) document.getElementById('bulkValidate').checked = s.bulkValidate;
+            if (s.bulkThreshold !== undefined) document.getElementById('bulkThreshold').value = s.bulkThreshold;
+            if (s.bulkRetries !== undefined) document.getElementById('bulkRetries').value = s.bulkRetries;
+
             if (s.chatListCollapsed !== undefined) {
                 hadStoredChatListState = true;
                 chatListCollapsed = s.chatListCollapsed;
@@ -212,6 +223,15 @@ function saveSettings() {
         agentTopics: document.getElementById('agentTopics').value,
         agentInterval: parseInt(document.getElementById('agentInterval').value) || 120,
         agentQCount: parseInt(document.getElementById('agentQCount').value) || 2,
+        // НОВЫЕ ПОЛЯ
+        agentTeacherThreshold: parseFloat(document.getElementById('agentTeacherThreshold').value) || 0.7,
+        agentUseDynamicThreshold: document.getElementById('agentUseDynamicThreshold').checked,
+        // Для bulk train (опционально)
+        bulkSleepEvery: parseInt(document.getElementById('bulkSleepEvery').value) || 200,
+        bulkReward: parseFloat(document.getElementById('bulkReward').value) || 1.0,
+        bulkValidate: document.getElementById('bulkValidate').checked,
+        bulkThreshold: parseFloat(document.getElementById('bulkThreshold').value) || 0.6,
+        bulkRetries: parseInt(document.getElementById('bulkRetries').value) || 1,
         chatListCollapsed: chatListCollapsed,
         settingsOpen: settingsOpen
     };
@@ -923,6 +943,10 @@ async function updateAgentConfig() {
     const topics = document.getElementById('agentTopics').value.split(',').map(s => s.trim()).filter(Boolean);
     const interval = parseInt(document.getElementById('agentInterval').value);
     const qCount = parseInt(document.getElementById('agentQCount').value);
+    // НОВЫЕ ПАРАМЕТРЫ
+    const teacherThreshold = parseFloat(document.getElementById('agentTeacherThreshold').value) || 0.7;
+    const useDynamicThreshold = document.getElementById('agentUseDynamicThreshold').checked;
+
     if (!topics.length || interval < 1 || qCount < 1) {
         showToast('⚠️ Проверьте настройки', 'error');
         return;
@@ -931,7 +955,13 @@ async function updateAgentConfig() {
         const res = await fetch('/agent/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ topics, interval, questions_per_cycle: qCount })
+            body: JSON.stringify({
+                topics,
+                interval,
+                questions_per_cycle: qCount,
+                teacher_threshold: teacherThreshold,
+                use_dynamic_threshold: useDynamicThreshold
+            })
         });
         const data = await res.json();
         agentLog.textContent = '✅ Настройки обновлены: темы=' + data.topics.join(', ');

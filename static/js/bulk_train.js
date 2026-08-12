@@ -25,11 +25,20 @@ document.addEventListener('DOMContentLoaded', function() {
         // Формируем FormData
         const formData = new FormData();
         formData.append('file', file);
-        // Можно передать дополнительные параметры
+
+        // Базовые параметры
         const sleepEvery = parseInt(document.getElementById('bulkSleepEvery')?.value) || 200;
         const reward = parseFloat(document.getElementById('bulkReward')?.value) || 1.0;
         formData.append('sleep_every', sleepEvery);
         formData.append('reward', reward);
+
+        // НОВЫЕ ПАРАМЕТРЫ ВАЛИДАЦИИ
+        const validate = document.getElementById('bulkValidate')?.checked || false;
+        const threshold = parseFloat(document.getElementById('bulkThreshold')?.value) || 0.6;
+        const retries = parseInt(document.getElementById('bulkRetries')?.value) || 1;
+        formData.append('validate', validate ? 'true' : 'false');
+        formData.append('validation_threshold', threshold);
+        formData.append('validation_retries', retries);
 
         // Блокируем кнопку
         uploadBtn.disabled = true;
