@@ -1,4 +1,4 @@
-# brain/brain.py
+# brain/brain.py (полный файл с изменениями)
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,7 +12,8 @@ import threading
 import pickle
 import requests
 import math
-
+import ast
+import operator
 from collections import deque
 from typing import List, Dict, Optional, Any, Tuple
 
@@ -37,9 +38,8 @@ _SEARCH_TRIGGER_WORDS = (
     "курс", "погода", "прямо сейчас", "в этом году", "недавно",
 )
 
-
 # ----------------------------------------------------------------------
-# Вспомогательные модули
+# Вспомогательные модули (без изменений)
 # ----------------------------------------------------------------------
 class CuriosityModule:
     def __init__(self, lr: float = 0.01):
@@ -53,7 +53,6 @@ class Planner:
         self.llm = llm
     def plan(self, question: str, context: str) -> List[str]:
         prompt = f"Составь план действий для ответа на вопрос: {question}\nКонтекст: {context}\nПлан (каждый пункт с новой строки):"
-        # QWEN3.5: отключаем thinking для короткого плана
         plan_text = self.llm.generate(prompt, max_tokens=60, temperature=0.5, enable_thinking=False)
         lines = [line.strip() for line in plan_text.split('\n') if line.strip()]
         return lines if lines else ["answer_directly"]
@@ -67,7 +66,6 @@ class Reflector:
         return False
     def reflect(self, question: str, answer: str) -> str:
         prompt = f"Исправь и улучши ответ на вопрос '{question}'. Текущий ответ: '{answer}'. Улучшенный ответ:"
-        # QWEN3.5: отключаем thinking для быстрой правки
         improved = self.llm.generate(prompt, max_tokens=150, temperature=0.3, enable_thinking=False)
         return improved if improved.strip() else answer
 
@@ -104,6 +102,176 @@ class EWC:
             loss = loss + (self.fisher[name] * (param - self.anchor[name]) ** 2).sum()
         return self.lambda_ * loss
 
+# ----------------------------------------------------------------------
+# НОВЫЕ МОДУЛИ: IntentClassifier, Critic, ToolRegistry
+# ----------------------------------------------------------------------
+class IntentClassifier:
+    """
+    Классифицирует вопрос по намерению на основе эмбеддинга.
+    Использует простой подход: сравнивает с эталонными векторами для каждого типа.
+    """
+    def __init__(self, embedder, dim: int, types: List[str] = None):
+        self.embedder = embedder
+        self.dim = dim
+        self.types = types or ["fact", "creative", "summary", "default"]
+        # Эталонные векторы будут вычислены при первом вызове или загружены
+        self.reference_vectors = {}  # type -> torch.Tensor
+        self._init_reference_vectors()
+
+    def _init_reference_vectors(self):
+        # Создаём примерные фразы для каждого типа
+        examples = {
+            "fact": ["Столица Франции", "Кто написал Войну и мир", "Когда произошла битва"],
+            "creative": ["Придумай историю", "Напиши стихотворение", "Как бы выглядел мир"],
+            "summary": ["Кратко опиши", "Резюмируй", "Суммируй основные пункты"],
+            "default": ["Что такое", "Как работает", "Объясни"]
+        }
+        for t in self.types:
+            if t in examples:
+                vecs = [self.embedder.get_embedding(ex, is_query=True) for ex in examples[t]]
+                self.reference_vectors[t] = torch.stack(vecs).mean(dim=0)
+            else:
+                self.reference_vectors[t] = torch.randn(self.dim)
+                self.reference_vectors[t] = F.normalize(self.reference_vectors[t], p=2, dim=0)
+
+    def classify(self, question: str) -> str:
+        q_vec = self.embedder.get_embedding(question, is_query=True)
+        best_type = "default"
+        best_sim = -1.0
+        for t, ref in self.reference_vectors.items():
+            sim = F.cosine_similarity(q_vec.unsqueeze(0), ref.unsqueeze(0)).item()
+            if sim > best_sim:
+                best_sim = sim
+                best_type = t
+        return best_type
+
+
+class Critic:
+    """
+    Оценивает согласованность ответа с активированными фактами.
+    При низкой согласованности инициирует повторную генерацию.
+    """
+    def __init__(self, brain, threshold: float = 0.7, max_attempts: int = 3):
+        self.brain = brain
+        self.threshold = threshold
+        self.max_attempts = max_attempts
+
+    def evaluate(self, question: str, answer: str, facts: List[str]) -> Tuple[float, bool]:
+        """
+        Возвращает (score, is_consistent)
+        score – косинусное сходство между эмбеддингом ответа и усреднённым эмбеддингом фактов.
+        is_consistent – True, если score >= threshold.
+        """
+        if not facts:
+            # Если фактов нет, считаем ответ приемлемым (или можно вернуть 0.5)
+            return 0.5, True
+        # Получаем эмбеддинги
+        ans_emb = self.brain.text_to_embedding(answer, is_query=False)
+        fact_embs = [self.brain.text_to_embedding(f, is_query=False) for f in facts]
+        if not fact_embs:
+            return 0.5, True
+        # Усредняем факты
+        fact_avg = torch.stack(fact_embs).mean(dim=0)
+        fact_avg = F.normalize(fact_avg, p=2, dim=0)
+        score = F.cosine_similarity(ans_emb.unsqueeze(0), fact_avg.unsqueeze(0)).item()
+        return score, score >= self.threshold
+
+    def revise(self, question: str, answer: str, facts: List[str], attempt: int) -> str:
+        """Попросить LLM переформулировать ответ с учётом фактов."""
+        prompt = (
+            f"Вопрос: {question}\n"
+            f"Предыдущий ответ: {answer}\n"
+            f"Релевантные факты:\n" + "\n".join(f"- {f}" for f in facts) + "\n"
+            "Переформулируй ответ, строго опираясь на факты выше. Если фактов недостаточно, скажи об этом."
+        )
+        # Используем более низкую температуру для точности
+        new_answer = self.brain.llm.generate(
+            prompt,
+            system=self.brain.SYSTEM_PROMPT,
+            max_tokens=2000,
+            temperature=0.3,
+            top_p=0.6,
+            repetition_penalty=1.1,
+            enable_thinking=False
+        )
+        return new_answer if new_answer.strip() else answer
+
+
+class ToolRegistry:
+    """
+    Регистр инструментов: погода, калькулятор, дата/время.
+    """
+    def __init__(self, config: BrainConfig):
+        self.config = config
+        self.openweather_key = config.openweather_api_key
+
+    def get_weather(self, city: str) -> str:
+        if not self.openweather_key:
+            return "API-ключ OpenWeather не настроен."
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={self.openweather_key}&units=metric&lang=ru"
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                temp = data['main']['temp']
+                desc = data['weather'][0]['description']
+                return f"Погода в {city}: {desc}, температура {temp}°C"
+            else:
+                return f"Ошибка получения погоды: код {resp.status_code}"
+        except Exception as e:
+            return f"Ошибка: {e}"
+
+    def calculate(self, expression: str) -> str:
+        # Безопасный eval – разрешены только числа, арифметические операторы, скобки
+        allowed = re.compile(r'^[\d+\-*/().\s]+$')
+        if not allowed.match(expression):
+            return "Недопустимое выражение."
+        try:
+            # Используем ast.literal_eval для чисел, но для арифметики безопасный eval
+            # Заменим на безопасный вычислятор
+            result = self._safe_eval(expression)
+            return f"{expression} = {result}"
+        except Exception as e:
+            return f"Ошибка вычисления: {e}"
+
+    def _safe_eval(self, expr: str):
+        # Используем встроенный eval с ограничением на функции
+        # Разрешаем только операторы + - * / и возведение в степень **
+        # Не разрешаем вызовы функций, атрибуты и т.п.
+        # Для простоты используем ast
+        tree = ast.parse(expr, mode='eval')
+        allowed_nodes = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num, ast.Constant,
+                         ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.USub, ast.UAdd)
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed_nodes):
+                raise ValueError(f"Запрещённый узел: {type(node).__name__}")
+        # Выполняем eval с пустым globals и locals, только операторы
+        return eval(expr, {"__builtins__": {}}, {})
+
+    def get_datetime(self) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def execute(self, text: str) -> Optional[str]:
+        """Проверяет, не содержит ли текст запрос на инструмент, и выполняет его."""
+        lower = text.lower()
+        # Погода
+        match = re.search(r'погод[ау]?\s+(в\s+)?([А-Яа-я\s\-]+)', lower)
+        if match:
+            city = match.group(2).strip()
+            if city:
+                return self.get_weather(city)
+        # Калькулятор
+        match = re.search(r'(\d+[\s+\-*/()]*\d+)', text)
+        if match:
+            expr = match.group(1)
+            # Проверим, что это не вопрос с числом в тексте
+            # Будем считать, что если в тексте есть "сколько" или "посчитай", то это калькулятор
+            if any(kw in lower for kw in ['сколько', 'посчитай', 'вычисли', 'реши']):
+                return self.calculate(expr)
+        # Дата/время
+        if any(kw in lower for kw in ['дата', 'время', 'сейчас', 'сегодня', 'который час']):
+            return self.get_datetime()
+        return None
 
 # ----------------------------------------------------------------------
 # Основной класс CognitiveBrain
@@ -145,6 +313,9 @@ class CognitiveBrain(nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.embedder = EmbeddingProvider(dim=self.dim, model_name=config.embedding_model)
+        # Загружаем кэш эмбеддингов
+        if os.path.exists(config.embedding_cache_path):
+            self.embedder.load_cache(config.embedding_cache_path)
 
         if config.use_hierarchical_graph:
             self.graph = HierarchicalGraph(
@@ -200,13 +371,18 @@ class CognitiveBrain(nn.Module):
         self._kb_emb_cache: Optional[torch.Tensor] = None
         self._kb_cache_dirty: bool = True
 
-        # Новые модули
+        # Новые модули (SelfModel, AutobiographicalMemory и т.д.)
         self.self_model = SelfModel(dim=config.self_model_dim, input_dim=config.dim_embedding)
         self.auto_memory = AutobiographicalMemory(capacity=config.auto_memory_capacity)
         self.global_workspace = GlobalWorkspace(capacity=config.global_workspace_capacity)
         self.motivation = DriveSystem() if config.enable_motivation else None
         self.emotion = EmotionModel() if config.enable_emotion else None
         self.user_model = UserModel(dim=config.self_model_dim) if config.enable_user_model else None
+
+        # Интеллектуальные дополнения
+        self.intent_classifier = IntentClassifier(self.embedder, self.dim) if config.enable_dynamic_sampling else None
+        self.critic = Critic(self, threshold=config.critic_threshold, max_attempts=config.critic_max_attempts) if config.enable_critic else None
+        self.tool_registry = ToolRegistry(config) if config.enable_tools else None
 
         bus.subscribe('answer_generated', self._on_answer_generated)
         bus.subscribe('new_fact_learned', self._on_fact_learned)
@@ -225,7 +401,7 @@ class CognitiveBrain(nn.Module):
     def text_to_embedding(self, text: str, is_query: bool = True) -> torch.Tensor:
         return self.embedder.get_embedding(text, is_query=is_query).to(self.device)
 
-    # ---------- Обучение ----------
+    # ---------- Обучение (без изменений) ----------
     def learn_pair(self, input_text: str, output_text: str, reward: float = 1.0, epochs: int = 1):
         with self.lock:
             for _ in range(epochs):
@@ -276,10 +452,11 @@ class CognitiveBrain(nn.Module):
         self.optimizer.zero_grad()
 
         self._add_to_knowledge_base(q, a, q_vec, a_vec)
-        if hasattr(self, 'memory'):
-            self.memory.add_semantic_triple(q, "has_answer", a, confidence=reward)
+        # Добавляем семантическую тройку (используем embedder)
+        self.memory.add_semantic_triple(q, "has_answer", a, confidence=reward, embedder=self.embedder)
 
     def _contrastive_loss(self, q_nid: int, a_nid: int) -> torch.Tensor:
+        # (без изменений)
         h = self.graph.forward()
         n = h.shape[0]
         h_norm = F.normalize(h, p=2, dim=1)
@@ -342,10 +519,26 @@ class CognitiveBrain(nn.Module):
             if self._learn_counter % self.config.checkpoint_every == 0:
                 self.save()
 
-    # ---------- Основной шаг ----------
+    # ---------- Основной шаг (с новыми возможностями) ----------
     def _needs_search(self, text: str) -> bool:
         lower = text.lower()
         return any(kw in lower for kw in _SEARCH_TRIGGER_WORDS)
+
+    def _get_sampling_params(self, question: str):
+        """Возвращает параметры сэмплинга в зависимости от намерения."""
+        if not self.config.enable_dynamic_sampling or self.intent_classifier is None:
+            return {
+                "temperature": 0.7,
+                "top_p": self.config.llm_top_p,
+                "repetition_penalty": self.config.llm_repetition_penalty
+            }
+        intent = self.intent_classifier.classify(question)
+        params = self.config.sampling_params_by_intent.get(intent, self.config.sampling_params_by_intent["default"])
+        return {
+            "temperature": params.get("temperature", 0.7),
+            "top_p": params.get("top_p", self.config.llm_top_p),
+            "repetition_penalty": params.get("repetition_penalty", self.config.llm_repetition_penalty)
+        }
 
     def step(self, input_text: str, use_search: bool = False, temperature: Optional[float] = None) -> Dict[str, Any]:
         with self.lock:
@@ -355,9 +548,25 @@ class CognitiveBrain(nn.Module):
                       temperature: Optional[float] = None) -> Dict[str, Any]:
         self.step_counter += 1
 
+        # ---- Обработка инструментов ----
+        if self.tool_registry is not None:
+            tool_result = self.tool_registry.execute(input_text)
+            if tool_result:
+                # Сохраняем в диалог
+                self._update_after_step(input_text, tool_result)
+                self.global_workspace.publish(tool_result, source='tool', priority=0.9)
+                return {
+                    "input": input_text,
+                    "answer": tool_result,
+                    "activated_neurons": [],
+                    "memory_results": [],
+                    "tool_result": True
+                }
+
         if not use_search and self._needs_search(input_text):
             use_search = True
 
+        # ---- Обработка криптовалют (оставляем) ----
         lower = input_text.lower()
         if any(kw in lower for kw in ["биткоин", "btc", "курс биткоина"]):
             price = self._get_crypto_price("bitcoin", "usd")
@@ -367,20 +576,21 @@ class CognitiveBrain(nn.Module):
                 self.global_workspace.publish(answer, source='crypto', priority=0.9)
                 return {"input": input_text, "answer": answer, "activated_neurons": [], "memory_results": []}
 
+        # ---- Поиск в интернете ----
         if use_search:
             enhanced = self._enhance_search_query(input_text)
             results = self.searcher.search(enhanced)
             if results:
                 context = self._build_search_context(input_text, enhanced, results)
-                # QWEN3.5: основной ответ используем enable_thinking из конфига, presence_penalty тоже
+                params = self._get_sampling_params(input_text)
                 full_answer = self.llm.generate(
                     context,
                     system=self.SYSTEM_PROMPT,
                     history=self._recent_history(),
                     max_tokens=2000,
-                    temperature=temperature if temperature is not None else 0.3,
-                    top_p=self.config.llm_top_p,
-                    repetition_penalty=self.config.llm_repetition_penalty,
+                    temperature=temperature if temperature is not None else params["temperature"],
+                    top_p=params["top_p"],
+                    repetition_penalty=params["repetition_penalty"],
                     top_k=self.config.llm_top_k,
                     presence_penalty=self.config.presence_penalty,
                     enable_thinking=self.config.enable_thinking,
@@ -400,6 +610,7 @@ class CognitiveBrain(nn.Module):
                 "memory_results": []
             }
 
+        # ---- Основной путь: граф + LLM ----
         query_vec = self.text_to_embedding(input_text, is_query=True)
         memory_results = self.memory.retrieve(query_vec, k=10)
 
@@ -426,15 +637,18 @@ class CognitiveBrain(nn.Module):
         context = self._build_context(input_text, memory_results, start_nid, thought_stream,
                                        gw_content=gw_content, pre_confidence=pre_confidence)
 
-        # QWEN3.5: основной ответ с параметрами из конфига
+        # ---- Генерация с динамическими параметрами ----
+        params = self._get_sampling_params(input_text)
+        # Если temperature передан явно, используем его
+        temp = temperature if temperature is not None else params["temperature"]
         full_answer = self.llm.generate(
             context,
             system=self.SYSTEM_PROMPT,
             history=self._recent_history(),
             max_tokens=2000,
-            temperature=temperature if temperature is not None else 0.7,
-            top_p=self.config.llm_top_p,
-            repetition_penalty=self.config.llm_repetition_penalty,
+            temperature=temp,
+            top_p=params["top_p"],
+            repetition_penalty=params["repetition_penalty"],
             top_k=self.config.llm_top_k,
             presence_penalty=self.config.presence_penalty,
             enable_thinking=self.config.enable_thinking,
@@ -442,11 +656,27 @@ class CognitiveBrain(nn.Module):
 
         self.global_workspace.publish(full_answer, source='llm', priority=0.8)
 
+        # ---- Критик (самооценка) ----
+        if self.critic is not None:
+            # Собираем факты из контекста (для оценки)
+            facts = self._extract_facts_from_context(context)
+            score, consistent = self.critic.evaluate(input_text, full_answer, facts)
+            attempt = 1
+            while not consistent and attempt < self.critic.max_attempts:
+                full_answer = self.critic.revise(input_text, full_answer, facts, attempt)
+                score, consistent = self.critic.evaluate(input_text, full_answer, facts)
+                attempt += 1
+            if not consistent:
+                # Если после всех попыток всё ещё не согласовано, используем последний ответ
+                pass
+
+        # ---- Рефлексия (если включена) ----
         if self.reflector is not None and self.reflector.should_reflect(full_answer):
             improved = self.reflector.reflect(input_text, full_answer)
             if improved != full_answer:
                 full_answer = improved
 
+        # ---- Teacher оценка и обучение ----
         if self.teacher is not None:
             score, improved_by_teacher, teacher_details = self.teacher.evaluate(input_text, full_answer)
             if improved_by_teacher != full_answer and score > 0.6:
@@ -466,6 +696,7 @@ class CognitiveBrain(nn.Module):
         if learn_reward > 0.55:
             self.learn_pair(input_text, full_answer, reward=learn_reward)
 
+        # ---- Обновление SelfModel, AutoMemory и т.д. ----
         self.self_model.update(query_vec, context_vec=answer_vec)
         self.auto_memory.add({
             'input': input_text,
@@ -508,6 +739,21 @@ class CognitiveBrain(nn.Module):
             "teacher_details": teacher_details,
         }
 
+    def _extract_facts_from_context(self, context: str) -> List[str]:
+        """Извлекает строки фактов из контекста (после 'Релевантные факты и ассоциации')."""
+        facts = []
+        in_facts = False
+        for line in context.split('\n'):
+            if "Релевантные факты и ассоциации" in line:
+                in_facts = True
+                continue
+            if in_facts and line.startswith('- '):
+                facts.append(line[2:])
+            elif in_facts and not line.startswith('-') and line.strip():
+                # конец блока
+                break
+        return facts
+
     def _summarize_answer(self, full_answer: str) -> str:
         if not self.config.two_level_answer:
             return full_answer
@@ -515,7 +761,6 @@ class CognitiveBrain(nn.Module):
             "Сократи следующий текст до 2–3 предложений, обращаясь прямо к пользователю. "
             "Сохрани суть, убери воду. Текст:\n" + full_answer
         )
-        # QWEN3.5: отключаем thinking для краткого резюме
         summary = self.llm.generate(
             prompt,
             max_tokens=self.config.summary_max_tokens,
@@ -524,7 +769,7 @@ class CognitiveBrain(nn.Module):
         )
         return summary if summary.strip() else full_answer
 
-    # ---------- ПРОАКТИВНЫЙ РЕЖИМ ----------
+    # ---------- ПРОАКТИВНЫЙ РЕЖИМ (без изменений) ----------
     def proactive_thought(self):
         if not self.config.proactive_enabled:
             return
@@ -576,7 +821,6 @@ class CognitiveBrain(nn.Module):
                 f"Поток ассоциаций (концепты с силой активации):\n{associations}\n"
                 "Сформулируй одну связную мысль, которая естественно вытекает из этих ассоциаций и развивает тему диалога."
             )
-            # QWEN3.5: отключаем thinking для быстрой внутренней мысли
             thought = self.llm.generate(prompt, max_tokens=100, temperature=0.8, enable_thinking=False)
             if thought and len(thought.strip()) > 20:
                 self.learn_pair("внутренняя мысль", thought, reward=self.config.proactive_reward)
@@ -658,15 +902,11 @@ class CognitiveBrain(nn.Module):
         for score, q, a in kb_facts:
             candidates.append((score, self._normalize(f"{q} {a}"), f"[база знаний] Q: {q} -> A: {a}"))
 
-        norm_query = self._normalize(query)
-        semantic_hits = self.memory.query_semantic(subj=query)
-        if not semantic_hits:
-            semantic_hits = [
-                (s, p, o, c) for s, p, o, c in self.memory.semantic_memory.triples
-                if norm_query in self._normalize(s) or self._normalize(s) in norm_query
-            ][:max_facts]
-        for s, p, o, c in semantic_hits[:max_facts]:
-            candidates.append((c, self._normalize(f"{s} {o}"), f"[семантическая память] {s} -> {o}"))
+        # Семантическая память теперь ищет векторно по тексту
+        semantic_hits = self.memory.query_semantic(query_text=query, embedder=self.embedder, k=max_facts)
+        for s, p, o, sim in semantic_hits:
+            # sim – косинусное сходство
+            candidates.append((sim, self._normalize(f"{s} {o}"), f"[семантическая память] {s} -> {o}"))
 
         if gw_content:
             for item in gw_content:
@@ -810,10 +1050,13 @@ class CognitiveBrain(nn.Module):
                 time.sleep(0.5)
             print("😴 Сон завершён")
 
-    # ---------- Сохранение / загрузка ----------
+    # ---------- Сохранение / загрузка (добавлено сохранение кэша эмбеддингов) ----------
     def save(self, model_dir: str = None):
         path = model_dir or self.config.model_dir
         os.makedirs(path, exist_ok=True)
+
+        # Сохраняем кэш эмбеддингов
+        self.embedder.save_cache(self.config.embedding_cache_path)
 
         torch.save(self.graph.state_dict(), f"{path}/graph.pth")
         with open(f"{path}/edges.pkl", "wb") as f:
@@ -887,6 +1130,10 @@ class CognitiveBrain(nn.Module):
         if not os.path.exists(path):
             print(f"[Brain] Папка модели {path} не найдена, начинаем с нуля.")
             return
+
+        # Загружаем кэш эмбеддингов
+        if os.path.exists(self.config.embedding_cache_path):
+            self.embedder.load_cache(self.config.embedding_cache_path)
 
         graph_path = f"{path}/graph.pth"
         if os.path.exists(graph_path):

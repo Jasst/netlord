@@ -1013,3 +1013,6 @@ async function sleepBrain() {
         showToast('❌ Ошибка запуска сна', 'error');
     }
 }
+
+// Экспортируем loadStats для использования из других скриптов
+window.loadStats = loadStats;

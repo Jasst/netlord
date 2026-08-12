@@ -20,6 +20,11 @@ from brain.graph import NodeType
 from brain import CognitiveBrain, BrainConfig
 from brain.teacher import Teacher
 from agent import BrainAgent
+import uuid
+import subprocess
+import threading
+import tempfile
+import os
 
 torch.set_default_dtype(torch.float32)
 
@@ -121,6 +126,103 @@ async def ask_stream(req: AskRequest):
         return StreamingResponse(generate(), media_type="text/event-stream")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Хранилище для заданий bulk_train
+bulk_jobs = {}  # job_id -> {'status': 'running'|'completed'|'error', 'log': [], 'total_pairs': 0}
+
+@app.post("/upload_jsonl")
+async def upload_jsonl(request: Request):
+    """
+    Принимает JSONL-файл и запускает bulk_train в фоновом потоке.
+    """
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        raise HTTPException(400, "No file uploaded")
+
+    # Читаем параметры
+    sleep_every = int(form.get("sleep_every", 200))
+    reward = float(form.get("reward", 1.0))
+
+    # Сохраняем файл во временную папку
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl") as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    # Генерируем job_id
+    job_id = str(uuid.uuid4())[:8]
+    bulk_jobs[job_id] = {"status": "running", "log": [], "total_pairs": 0}
+
+    # Запускаем обучение в отдельном потоке
+    def run_bulk_train():
+        try:
+            # Используем subprocess для запуска bulk_train.py с параметрами
+            cmd = [
+                "python", "bulk_train.py",
+                "--data", tmp_path,
+                "--sleep-every", str(sleep_every),
+                "--reward", str(reward),
+                "--model-dir", brain.config.model_dir
+            ]
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            # Читаем вывод построчно и сохраняем в лог
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    bulk_jobs[job_id]["log"].append(line.strip())
+                    # Если есть строка с "Готово. Загружено X пар", парсим количество
+                    if "Готово. Загружено" in line:
+                        import re
+                        m = re.search(r"Загружено (\d+) пар", line)
+                        if m:
+                            bulk_jobs[job_id]["total_pairs"] = int(m.group(1))
+            process.stdout.close()
+            return_code = process.wait()
+            if return_code == 0:
+                bulk_jobs[job_id]["status"] = "completed"
+            else:
+                bulk_jobs[job_id]["status"] = "error"
+                bulk_jobs[job_id]["log"].append(f"Процесс завершился с кодом {return_code}")
+        except Exception as e:
+            bulk_jobs[job_id]["status"] = "error"
+            bulk_jobs[job_id]["log"].append(f"Ошибка: {str(e)}")
+        finally:
+            # Удаляем временный файл
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+
+    thread = threading.Thread(target=run_bulk_train)
+    thread.start()
+
+    return {"job_id": job_id, "status": "started"}
+
+
+@app.get("/upload_jsonl/logs/{job_id}")
+async def get_bulk_logs(job_id: str, last: int = 0):
+    """
+    Возвращает новые строки лога для задания.
+    """
+    job = bulk_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    log = job.get("log", [])
+    new_lines = log[last:]
+    return {
+        "lines": new_lines,
+        "last_line": len(log),
+        "done": job["status"] != "running",
+        "status": job["status"],
+        "total_pairs": job.get("total_pairs", 0)
+    }
 
 @app.get("/graph-editor", response_class=HTMLResponse)
 async def graph_editor():
@@ -389,7 +491,12 @@ async def delete_node(req: dict):
             g = graph.levels[0]
         else:
             g = graph
-        # удаляем все рёбра, связанные с этим узлом
+
+        # Проверяем, что узел существует
+        if node_id < 1 or node_id > g.node_emb.shape[0]:
+            raise HTTPException(400, f"Node {node_id} does not exist")
+
+        # 1. Удаляем все рёбра, связанные с узлом
         new_edges = []
         new_weights = []
         for (f, t), w in zip(g._edges, g._edge_weights):
@@ -400,14 +507,15 @@ async def delete_node(req: dict):
                 new_weights.append(w)
         g._edges = new_edges
         g._edge_weights = nn.ParameterList(new_weights)
-        g._rebuild_edges()
-        # удаляем сам узел
+
+        # 2. Удаляем сам узел из тензора эмбеддингов
         old_emb = g.node_emb
         mask = torch.ones(old_emb.shape[0], dtype=torch.bool)
         mask[node_id-1] = False
         new_emb = nn.Parameter(old_emb.data[mask])
         g.node_emb = new_emb
-        # обновляем оптимизатор
+
+        # 3. Обновляем оптимизатор (заменяем параметр)
         for group in brain.optimizer.param_groups:
             for i, p in enumerate(group["params"]):
                 if p is old_emb:
@@ -416,11 +524,28 @@ async def delete_node(req: dict):
                     if state:
                         brain.optimizer.state[new_emb] = state
                     break
-        # чистим метаданные
+
+        # 4. Удаляем метаданные для этого узла
         g.node_labels.pop(node_id, None)
         g.node_types.pop(node_id, None)
         g.node_clusters.pop(node_id, None)
-        # сдвигаем индексы в _edges
+
+        # 5. Сдвигаем индексы всех оставшихся узлов (для рёбер и метаданных)
+        #    Все ID больше node_id уменьшаем на 1
+        def shift_dict(d: dict):
+            new_d = {}
+            for k, v in d.items():
+                if k == node_id:
+                    continue
+                new_k = k if k < node_id else k - 1
+                new_d[new_k] = v
+            return new_d
+
+        g.node_labels = shift_dict(g.node_labels)
+        g.node_types = shift_dict(g.node_types)
+        g.node_clusters = shift_dict(g.node_clusters)
+
+        # 6. Сдвигаем индексы в рёбрах
         new_edges2 = []
         for f, t in g._edges:
             f = int(f)
@@ -430,6 +555,35 @@ async def delete_node(req: dict):
             new_edges2.append((f2, t2))
         g._edges = new_edges2
         g._rebuild_edges()
+
+        # 7. Удаляем ссылки из concept_index (и сдвигаем ID)
+        new_concept_index = {}
+        for key, val in brain.concept_index.items():
+            if val == node_id:
+                continue
+            new_val = val if val < node_id else val - 1
+            new_concept_index[key] = new_val
+        brain.concept_index = new_concept_index
+
+        # 8. Если граф иерархический, удаляем ссылки в cluster_of (уровень 0)
+        if hasattr(graph, 'levels') and len(graph.cluster_of) > 0:
+            # cluster_of[0] – словарь для первого уровня (нижний -> верхний)
+            cluster_dict = graph.cluster_of[0]
+            new_cluster = {}
+            for member, cluster_id in cluster_dict.items():
+                if member == node_id:
+                    continue
+                new_member = member if member < node_id else member - 1
+                # cluster_id (ID на верхнем уровне) тоже может сдвинуться?
+                # Но верхний уровень не затрагивается, и ID кластеров не меняются,
+                # поэтому оставляем как есть.
+                new_cluster[new_member] = cluster_id
+            graph.cluster_of[0] = new_cluster
+
+            # Перестраиваем иерархию, чтобы синхронизировать верхние уровни
+            graph.rebuild_hierarchy(optimizer=brain.optimizer)
+
+        # 9. Сохраняем изменения
         brain.save()
     return {"status": "deleted"}
 

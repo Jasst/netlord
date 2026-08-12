@@ -1,6 +1,5 @@
-# brain/config.py
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 @dataclass
 class BrainConfig:
@@ -31,12 +30,34 @@ class BrainConfig:
     openai_api_key: Optional[str] = None
     llm_base_url: Optional[str] = "http://192.168.0.13:1234/v1"
 
-    # ---------- Сэмплинг для Qwen3.5 (обновлено) ----------
+    # ---------- Сэмплинг (Qwen3.5) ----------
     llm_top_p: float = 0.8
     llm_top_k: int = 20
     llm_repetition_penalty: float = 1.05
-    presence_penalty: float = 0.0           # стандартный параметр OpenAI
-    enable_thinking: bool = True            # включать ли thinking mode (Qwen3.5)
+    presence_penalty: float = 0.0
+    enable_thinking: bool = True
+
+    # ---------- Динамическая регуляция по намерению ----------
+    enable_dynamic_sampling: bool = True
+    # Параметры для разных типов вопросов
+    sampling_params_by_intent: Dict[str, Dict] = field(default_factory=lambda: {
+        "fact": {"temperature": 0.2, "top_p": 0.6, "repetition_penalty": 1.1},
+        "creative": {"temperature": 0.9, "top_p": 0.9, "repetition_penalty": 1.0},
+        "summary": {"temperature": 0.3, "top_p": 0.7, "repetition_penalty": 1.1},
+        "default": {"temperature": 0.7, "top_p": 0.8, "repetition_penalty": 1.05},
+    })
+
+    # ---------- Критик / самооценка ----------
+    enable_critic: bool = True
+    critic_threshold: float = 0.7          # минимальное сходство ответа с фактами для принятия
+    critic_max_attempts: int = 3
+
+    # ---------- Инструменты ----------
+    enable_tools: bool = True
+    openweather_api_key: Optional[str] = None   # если пусто, погода не работает
+
+    # ---------- Кэш эмбеддингов ----------
+    embedding_cache_path: str = "embedding_cache.pkl"
 
     learning_rate: float = 1e-4
     contrastive_margin: float = 0.5

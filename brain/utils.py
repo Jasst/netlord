@@ -7,18 +7,10 @@ import numpy as np
 from collections import OrderedDict
 from typing import Optional, List
 from transformers import AutoTokenizer, AutoModel
-
+import pickle
+import os
 
 class EmbeddingProvider:
-    """
-    ИСПРАВЛЕНО:
-    - e5-модели асимметричны: вопросы нужно кодировать с префиксом "query: ",
-      а сохраняемый контент (ответы, факты, документы) — с префиксом "passage: ".
-      Раньше везде стоял "query: ", из-за чего similarity между двумя "query"-векторами
-      систематически занижалась и поиск по памяти/графу промахивался мимо релевантных узлов.
-    - Кэш эмбеддингов был неограниченным (self._cache = {}) — при непрерывном обучении
-      это неограниченно растущая утечка памяти. Теперь это LRU-кэш с ограничением размера.
-    """
     def __init__(self, dim: int = 384, model_name: str = "intfloat/e5-large-v2", cache_size: int = 20000):
         self.dim = dim
         self.model_name = model_name
@@ -27,6 +19,7 @@ class EmbeddingProvider:
         self.model.eval()
         self.cache_size = cache_size
         self._cache: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        self._loaded = False
 
     def _cache_get(self, key: str) -> Optional[torch.Tensor]:
         if key in self._cache:
@@ -38,7 +31,7 @@ class EmbeddingProvider:
         self._cache[key] = value.clone()
         self._cache.move_to_end(key)
         if len(self._cache) > self.cache_size:
-            self._cache.popitem(last=False)  # вытесняем самый старый (LRU)
+            self._cache.popitem(last=False)
 
     def get_embedding(self, text: str, is_query: bool = True) -> torch.Tensor:
         cache_key = f"{'q' if is_query else 'p'}::{text}"
@@ -62,46 +55,45 @@ class EmbeddingProvider:
     def get_embeddings_batch(self, texts: List[str], is_query: bool = True) -> List[torch.Tensor]:
         return [self.get_embedding(t, is_query=is_query) for t in texts]
 
+    def save_cache(self, path: str):
+        """Сохранить кэш эмбеддингов на диск."""
+        if not self._cache:
+            return
+        # Преобразуем тензоры в список для сериализации
+        cache_data = {k: v.cpu().numpy() for k, v in self._cache.items()}
+        with open(path, "wb") as f:
+            pickle.dump(cache_data, f)
+        print(f"[Embedder] Кэш сохранён ({len(cache_data)} записей) в {path}")
 
+    def load_cache(self, path: str):
+        """Загрузить кэш эмбеддингов с диска."""
+        if not os.path.exists(path):
+            return
+        with open(path, "rb") as f:
+            cache_data = pickle.load(f)
+        for k, arr in cache_data.items():
+            self._cache[k] = torch.from_numpy(arr)
+        print(f"[Embedder] Кэш загружен ({len(cache_data)} записей) из {path}")
+
+# остальные функции без изменений
 def random_vector(dim: int) -> torch.Tensor:
     v = torch.randn(dim)
     return F.normalize(v, p=2, dim=0)
-
 
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     a = F.normalize(a.flatten(), p=2, dim=0)
     b = F.normalize(b.flatten(), p=2, dim=0)
     return float(torch.dot(a, b).item())
 
-
 def hash_text(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
-
 def compute_importance(access_count: int, age: float, max_age: float = 30 * 24 * 3600) -> float:
-    # важность = частота доступа * (1 - возраст/макс_возраст)
     age_factor = max(0, 1 - age / max_age)
     return (access_count + 1) * age_factor
 
-
 def grow_parameter_in_optimizer(optimizer, old_param: nn.Parameter, new_param: nn.Parameter,
                                  num_old_rows: Optional[int] = None) -> bool:
-    """
-    КЛЮЧЕВОЙ ФИКС continual learning.
-
-    Проблема: graph.py при добавлении узла/ребра создавал НОВЫЙ объект nn.Parameter
-    (torch.cat + переприсвоение). Но self.optimizer = Adam(self.graph.parameters(), ...)
-    был создан один раз в CognitiveBrain.__init__ и держит СНИМОК списка параметров на
-    момент создания. Новый параметр в этот список не попадает -> градиенты на него
-    считаются (backward доходит), но optimizer.step() их никогда не применяет.
-    Итог: node_emb (а значит и всё "содержимое" узлов графа) на практике НЕ обучается
-    после самого первого шага — отсюда повторяющиеся/не меняющиеся ответы.
-
-    Это находит old_param в param_groups оптимизатора, заменяет его на new_param,
-    и переносит накопленную Adam-статистику (exp_avg, exp_avg_sq, step) для первых
-    num_old_rows строк, чтобы не терять историю обучения уже существующих узлов/рёбер.
-    Новые строки (только что добавленный узел) стартуют со свежей статистикой Adam.
-    """
     for group in optimizer.param_groups:
         params = group["params"]
         for i, p in enumerate(params):
@@ -123,8 +115,6 @@ def grow_parameter_in_optimizer(optimizer, old_param: nn.Parameter, new_param: n
                             new_state[key] = new_buf
                     optimizer.state[new_param] = new_state
                 return True
-    # old_param ещё не был в оптимизаторе (например, самый первый add_node до его создания) —
-    # просто добавляем новый параметр, чтобы он в принципе обучался.
     if optimizer.param_groups:
         optimizer.param_groups[0]["params"].append(new_param)
         return True
