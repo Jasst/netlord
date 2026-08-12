@@ -11,12 +11,13 @@ document.addEventListener('DOMContentLoaded', function () {
     let pendingEdgeSource = null;
     let dragSourceId = null;
 
-    // Переменные для отталкивания и подсветки цели
     let savedPositions = {};
     let draggingNodeId = null;
-    let hoverTargetId = null; // ID узла, на который навели при drag
+    let hoverTargetId = null;
     const repelThreshold = 120;
     const repelStrength = 0.35;
+
+    let darkMode = true;
 
     const container = document.getElementById('graph-container');
     const infoPanel = document.getElementById('info-panel');
@@ -24,6 +25,7 @@ document.addEventListener('DOMContentLoaded', function () {
     const loadingIndicator = document.getElementById('loading-indicator');
     const focusNodeBtn = document.getElementById('focusNodeBtn');
     const weightInput = document.getElementById('weightInput');
+    const contextMenu = document.getElementById('contextMenu');
 
     const typeColors = {
         SENSORY: '#8F8178',
@@ -50,6 +52,31 @@ document.addEventListener('DOMContentLoaded', function () {
         return Math.max(12, Math.min(45, base + Math.log(degree + 1) * 6));
     }
 
+    // ===== АДАПТИВНАЯ ИНФОРМАЦИОННАЯ ПАНЕЛЬ =====
+    function adjustInfoPanel() {
+        if (!infoPanel || !infoPanel.classList.contains('show')) return;
+        const maxWidth = Math.min(320, window.innerWidth * 0.9);
+        infoPanel.style.maxWidth = maxWidth + 'px';
+        const rect = infoPanel.getBoundingClientRect();
+        if (rect.right > window.innerWidth - 10) {
+            infoPanel.style.right = '10px';
+        } else {
+            infoPanel.style.right = '20px';
+        }
+        if (window.innerWidth < 600) {
+            infoPanel.style.bottom = '10px';
+            infoPanel.style.right = '10px';
+            infoPanel.style.maxHeight = '60vh';
+        } else {
+            infoPanel.style.bottom = '20px';
+            infoPanel.style.maxHeight = '70vh';
+        }
+    }
+
+    // Вызываем при изменении размера окна
+    window.addEventListener('resize', adjustInfoPanel);
+
+    // Инициализация сети
     function initNetwork(data) {
         const rawNodes = data.nodes || [];
         const rawEdges = data.edges || [];
@@ -164,11 +191,11 @@ document.addEventListener('DOMContentLoaded', function () {
             nodes: {
                 shape: 'dot',
                 font: {
-                    color: '#EDE6DB',
+                    color: darkMode ? '#EDE6DB' : '#222',
                     size: 12,
                     face: '-apple-system, Segoe UI, Inter, sans-serif',
                     strokeWidth: 3,
-                    strokeColor: '#211D19'
+                    strokeColor: darkMode ? '#211D19' : '#f5f5f5'
                 },
                 borderWidth: 1.5,
                 shadow: {
@@ -211,7 +238,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }, 5000);
     }
 
-    // ---------- МАССОВЫЕ ОБНОВЛЕНИЯ ДЛЯ ПРОИЗВОДИТЕЛЬНОСТИ ----------
+    // ---------- МАССОВЫЕ ОБНОВЛЕНИЯ ----------
     function highlightNode(id) {
         const connected = new Set([id]);
         const connectedEdges = new Set();
@@ -311,9 +338,8 @@ document.addEventListener('DOMContentLoaded', function () {
         if (edgeUpdates.length) edges.update(edgeUpdates);
     }
 
-    // ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПОДСВЕТКИ ЦЕЛИ ----------
+    // ---------- ПОДСВЕТКА ЦЕЛИ ----------
     function highlightTarget(nodeId) {
-        // Подсветить узел как цель (золотая обводка)
         if (nodeId === null) return;
         const node = nodes.get(nodeId);
         if (!node) return;
@@ -321,7 +347,7 @@ document.addEventListener('DOMContentLoaded', function () {
             id: nodeId,
             color: {
                 background: node.originalColor,
-                border: '#FFD700'  // золотой
+                border: '#FFD700'
             },
             borderWidth: 4
         });
@@ -377,6 +403,9 @@ document.addEventListener('DOMContentLoaded', function () {
         const node = nodes.get(id);
         if (!node) return;
         const neighborEdges = edges.get().filter(e => e.from === id || e.to === id);
+        const degree = neighborEdges.length;
+        const avgWeight = neighborEdges.reduce((sum, e) => sum + Math.abs(getWeight(e)), 0) / (degree || 1);
+
         const neighborRows = neighborEdges.slice()
             .sort((a, b) => Math.abs(getWeight(b)) - Math.abs(getWeight(a)))
             .slice(0, 15)
@@ -398,7 +427,8 @@ document.addEventListener('DOMContentLoaded', function () {
             <div class="info-row"><span class="info-label">Метка</span><span class="info-value">${node.full_label || node.label || '—'}</span></div>
             <div class="info-row"><span class="info-label">Тип</span><span class="info-value">${node.type || '—'}</span></div>
             <div class="info-row"><span class="info-label">Кластер</span><span class="info-value">${node.cluster || '—'}</span></div>
-            <div class="info-row"><span class="info-label">Связей</span><span class="info-value">${neighborEdges.length}</span></div>
+            <div class="info-row"><span class="info-label">Связей</span><span class="info-value">${degree}</span></div>
+            <div class="info-row"><span class="info-label">Ср. вес связей</span><span class="info-value">${avgWeight.toFixed(3)}</span></div>
             ${neighborEdges.length ? `
                 <div class="neighbors-title">Связанные понятия</div>
                 <div class="neighbors">${neighborRows}</div>
@@ -411,6 +441,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
         infoPanel.classList.add('show');
         infoPanel.style.display = 'block';
+        adjustInfoPanel(); // адаптация
 
         const startEdgeBtn = document.getElementById('startEdgeFromNode');
         if (startEdgeBtn) {
@@ -451,6 +482,9 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
             };
         }
+        document.getElementById('animateActivationBtn').onclick = function() {
+            if (selectedNode !== null) animateActivation(selectedNode);
+        };
     }
 
     function showEdgeInfo(id) {
@@ -462,10 +496,52 @@ document.addEventListener('DOMContentLoaded', function () {
             <div class="info-row"><span class="info-label">Ребро</span><span class="info-value">${edge.from} → ${edge.to}</span></div>
             <div class="info-row"><span class="info-label">Вес</span><span class="info-value" style="color:${weight >= 0 ? edgePositiveColor : edgeNegativeColor};">${weight.toFixed(4)}</span></div>
             <div class="info-row"><span class="info-label">Тип</span><span class="info-value">${weight >= 0 ? 'положительная' : 'отрицательная'}</span></div>
-            <div class="hint">Для удаления нажмите «🗑 Ребро».</div>
+            <div class="hint">Двойной клик по ребру — изменить вес.</div>
         `;
         infoPanel.classList.add('show');
         infoPanel.style.display = 'block';
+        adjustInfoPanel(); // адаптация
+    }
+
+    // ---------- АНИМАЦИЯ АКТИВАЦИИ (с учётом силы связи) ----------
+    function animateActivation(startId) {
+        if (!network) return;
+        const steps = 3;
+        let current = [startId];
+        const activated = new Set();
+
+        function stepActivation(step) {
+            if (step >= steps) {
+                setTimeout(() => {
+                    nodes.forEach(n => {
+                        if (activated.has(n.id)) {
+                            nodes.update({ id: n.id, color: { background: n.originalColor, border: n.originalColor } });
+                        }
+                    });
+                }, 300);
+                return;
+            }
+            const neighbors = [];
+            current.forEach(id => {
+                const connected = edges.get().filter(e => e.from === id || e.to === id);
+                connected.forEach(e => {
+                    const target = e.from === id ? e.to : e.from;
+                    if (!activated.has(target)) {
+                        activated.add(target);
+                        neighbors.push(target);
+                        // Вычисляем интенсивность на основе веса ребра
+                        const weight = getWeight(e);
+                        const intensity = Math.min(1, Math.abs(weight) * 2);
+                        const color = `rgba(255, 215, 0, ${intensity})`;
+                        nodes.update({ id: target, color: { background: color, border: color } });
+                    }
+                });
+            });
+            current = neighbors;
+            setTimeout(() => stepActivation(step + 1), 500);
+        }
+        activated.add(startId);
+        stepActivation(0);
     }
 
     // ---------- ЗАГРУЗКА ГРАФА ----------
@@ -644,9 +720,69 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
-    // ---------- НАСТРОЙКА СОБЫТИЙ ГРАФА (ВКЛЮЧАЯ ОТТАЛКИВАНИЕ И ПРЕДПРОСМОТР) ----------
+    // ---------- ЭКСПОРТ PNG ----------
+    function exportPNG() {
+        if (!network) return;
+        network.canvas.toBlob(function(blob) {
+            const link = document.createElement('a');
+            link.download = 'graph.png';
+            link.href = URL.createObjectURL(blob);
+            link.click();
+        });
+    }
+
+    // ---------- ПОИСК УЗЛА ----------
+    function searchNode() {
+        const query = document.getElementById('searchNodeInput').value.trim().toLowerCase();
+        if (!query) return;
+        const found = nodes.get().find(n =>
+            n.label?.toLowerCase().includes(query) ||
+            n.full_label?.toLowerCase().includes(query)
+        );
+        if (found) {
+            selectedNode = found.id;
+            selectedEdge = null;
+            network.selectNodes([found.id]);
+            network.focus(found.id, { scale: 1.5, animation: true });
+            highlightNode(found.id);
+            showNodeInfo(found.id);
+        } else {
+            alert('Узел не найден');
+        }
+    }
+
+    // ---------- ПЕРЕКЛЮЧЕНИЕ ТЕМЫ ----------
+    function toggleTheme() {
+        darkMode = !darkMode;
+        document.body.classList.toggle('light', !darkMode);
+        if (network) {
+            network.setOptions({
+                nodes: {
+                    font: {
+                        color: darkMode ? '#EDE6DB' : '#222',
+                        strokeColor: darkMode ? '#211D19' : '#f5f5f5'
+                    }
+                }
+            });
+            network.fit();
+        }
+    }
+
+    // ---------- КОНТЕКСТНОЕ МЕНЮ ----------
+    function showContextMenu(x, y, nodeId) {
+        contextMenu.style.left = x + 'px';
+        contextMenu.style.top = y + 'px';
+        contextMenu.style.display = 'block';
+        contextMenu.dataset.nodeId = nodeId;
+    }
+    function hideContextMenu() {
+        contextMenu.style.display = 'none';
+    }
+    document.addEventListener('click', hideContextMenu);
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideContextMenu(); });
+
+    // ---------- НАСТРОЙКА СОБЫТИЙ ГРАФА ----------
     function setupEvents() {
-        // Hover
         network.on('hoverNode', function (params) {
             if (selectedNode === null) highlightNode(params.node);
         });
@@ -654,21 +790,17 @@ document.addEventListener('DOMContentLoaded', function () {
             if (selectedNode === null) restoreAppearance();
         });
 
-        // DragStart – отключаем физику, запоминаем позиции
         network.on('dragStart', function (params) {
             network.setOptions({ physics: { enabled: false } });
             if (params.nodes.length) {
                 dragSourceId = params.nodes[0];
                 draggingNodeId = params.nodes[0];
                 savedPositions = network.getPositions();
-                // Сбросить подсветку цели
                 unhighlightTarget();
             }
         });
 
-        // Dragging – отталкивание + подсветка целевого узла
         network.on('dragging', function (params) {
-            // Отталкивание
             if (draggingNodeId !== null) {
                 const dragPos = network.getPosition(draggingNodeId);
                 if (dragPos) {
@@ -682,28 +814,21 @@ document.addEventListener('DOMContentLoaded', function () {
                         const dist = Math.sqrt(dx * dx + dy * dy);
                         if (dist < repelThreshold && dist > 0.1) {
                             const force = (repelThreshold - dist) / repelThreshold * repelStrength;
-                            const moveX = dx / dist * force;
-                            const moveY = dy / dist * force;
-                            updates.push({ id: id, x: pos.x + moveX, y: pos.y + moveY });
+                            updates.push({ id: id, x: pos.x + dx / dist * force, y: pos.y + dy / dist * force });
                         }
                     }
                     if (updates.length) nodes.update(updates);
                 }
             }
-
-            // Подсветка цели под курсором
             if (draggingNodeId !== null) {
-                // Получаем узел под мышью
                 const target = network.getNodeAt({ x: params.pointer.DOM.x, y: params.pointer.DOM.y });
-                // Если есть целевой узел, не равный перетаскиваемому, и он не равен уже подсвеченному
                 if (target !== undefined && target !== null && target !== draggingNodeId) {
                     if (hoverTargetId !== target) {
-                        unhighlightTarget(); // снять старую подсветку
+                        unhighlightTarget();
                         hoverTargetId = target;
                         highlightTarget(target);
                     }
                 } else {
-                    // Нет цели под мышью или это сам перетаскиваемый узел
                     if (hoverTargetId !== null) {
                         unhighlightTarget();
                     }
@@ -711,31 +836,24 @@ document.addEventListener('DOMContentLoaded', function () {
             }
         });
 
-        // DragEnd – возврат позиций, создание ребра (если цель подсвечена)
         network.on('dragEnd', function (params) {
-            // Возвращаем узлы на места (кроме перетаскиваемого)
             if (draggingNodeId !== null) {
                 const updates = [];
                 for (let id in savedPositions) {
                     if (id == draggingNodeId) continue;
-                    const pos = savedPositions[id];
-                    updates.push({ id: id, x: pos.x, y: pos.y });
+                    updates.push({ id: id, x: savedPositions[id].x, y: savedPositions[id].y });
                 }
                 if (updates.length) nodes.update(updates);
                 savedPositions = {};
                 draggingNodeId = null;
             }
-
-            // Создание ребра, если есть подсвеченная цель
             if (dragSourceId !== null && hoverTargetId !== null) {
                 createEdge(dragSourceId, hoverTargetId);
             }
-            // Сброс подсветки
             unhighlightTarget();
             dragSourceId = null;
         });
 
-        // Click – выбор узла/ребра
         network.on('click', function (params) {
             restoreAppearance();
             if (params.nodes.length) {
@@ -771,9 +889,43 @@ document.addEventListener('DOMContentLoaded', function () {
             infoPanel.classList.remove('show');
             infoPanel.style.display = 'none';
         });
+
+        network.on('doubleClick', function (params) {
+            if (params.edges.length) {
+                const edgeId = params.edges[0];
+                const edge = edges.get(edgeId);
+                if (!edge) return;
+                const newWeight = prompt('Введите новый вес (от -1 до 1):', edge.weight);
+                if (newWeight !== null) {
+                    const w = parseFloat(newWeight);
+                    if (!isNaN(w) && w >= -1 && w <= 1) {
+                        fetch('/graph/update_edge', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ from: edge.from, to: edge.to, weight: w })
+                        })
+                            .then(resp => {
+                                if (!resp.ok) throw new Error('Ошибка');
+                                loadGraph();
+                            })
+                            .catch(e => alert('Ошибка: ' + e.message));
+                    }
+                }
+            }
+        });
+
+        network.on('oncontext', function (params) {
+            params.event.preventDefault();
+            hideContextMenu();
+            if (params.nodes.length) {
+                const nodeId = params.nodes[0];
+                selectedNode = nodeId;
+                showContextMenu(params.event.clientX, params.event.clientY, nodeId);
+            }
+        });
     }
 
-    // ---------- ПРИВЯЗКА КНОПОК И ЗАПУСК ----------
+    // ---------- ПРИВЯЗКА КНОПОК ----------
     document.getElementById('refreshBtn')?.addEventListener('click', loadGraph);
     document.getElementById('addNodeBtn')?.addEventListener('click', addNode);
     document.getElementById('deleteNodeBtn')?.addEventListener('click', deleteNode);
@@ -782,6 +934,10 @@ document.addEventListener('DOMContentLoaded', function () {
     document.getElementById('addEdgeBtn')?.addEventListener('click', addEdgeManually);
     document.getElementById('saveBtn')?.addEventListener('click', saveModel);
     document.getElementById('resetPhysicsBtn')?.addEventListener('click', resetPhysics);
+    document.getElementById('exportBtn')?.addEventListener('click', exportPNG);
+    document.getElementById('themeToggle')?.addEventListener('click', toggleTheme);
+    document.getElementById('searchNodeBtn')?.addEventListener('click', searchNode);
+    document.getElementById('searchNodeInput')?.addEventListener('keydown', e => { if (e.key === 'Enter') searchNode(); });
     document.getElementById('closeInfo')?.addEventListener('click', function () {
         selectedNode = null;
         selectedEdge = null;
@@ -803,7 +959,71 @@ document.addEventListener('DOMContentLoaded', function () {
                 network.selectEdges([]);
             }
             restoreAppearance();
+            hideContextMenu();
         }
+    });
+
+    // Контекстное меню – действия
+    document.querySelectorAll('#contextMenu .menu-item').forEach(item => {
+        item.addEventListener('click', function (e) {
+            e.stopPropagation();
+            const action = this.dataset.action;
+            const nodeId = parseInt(contextMenu.dataset.nodeId);
+            if (!nodeId) { hideContextMenu(); return; }
+            selectedNode = nodeId;
+            switch (action) {
+                case 'focus':
+                    network.focus(nodeId, { scale: 1.5, animation: true });
+                    break;
+                case 'edit':
+                    const newLabel = prompt('Введите новую метку:', nodes.get(nodeId).label);
+                    if (newLabel !== null && newLabel.trim()) {
+                        document.getElementById('newLabelInput').value = newLabel;
+                        updateLabel();
+                    }
+                    break;
+                case 'addEdge':
+                    addEdgeManually();
+                    break;
+                case 'animate':
+                    animateActivation(nodeId);
+                    break;
+                case 'delete':
+                    deleteNode();
+                    break;
+            }
+            hideContextMenu();
+        });
+    });
+
+document.getElementById('sleepBtn')?.addEventListener('click', async function() {
+    if (!confirm('Запустить сон? Это может занять время.')) return;
+    try {
+        const resp = await fetch('/sleep', { method: 'POST' });  // было '/brain/sleep'
+        if (resp.ok) {
+            const data = await resp.json();
+            const changes = data.changes || {};
+            alert(`Сон завершён.\nУдалено нейронов: ${changes.neurons_removed || 0}\nУдалено синапсов: ${changes.synapses_removed || 0}\nУдалено понятий: ${changes.concepts_removed || 0}\nУдалено воспоминаний: ${changes.memory_removed || 0}`);
+            loadGraph();
+        } else {
+            alert('Ошибка при запуске сна.');
+        }
+    } catch (e) {
+        alert('Ошибка сети: ' + e.message);
+    }
+});
+
+    // Фильтр по типам (легенда)
+    document.querySelectorAll('#legend input[data-type]').forEach(cb => {
+        cb.addEventListener('change', function () {
+            const type = this.dataset.type;
+            const visible = this.checked;
+            nodes.get().forEach(n => {
+                if (n.type === type) {
+                    nodes.update({ id: n.id, hidden: !visible });
+                }
+            });
+        });
     });
 
     loadGraph();

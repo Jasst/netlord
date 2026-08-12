@@ -6,36 +6,108 @@
     <script src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
     <style>
         * { box-sizing: border-box; }
-        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a1a; color: #ddd; }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1a1a;
+            color: #ddd;
+            transition: background 0.3s, color 0.3s;
+            overflow: hidden;
+            height: 100vh;
+        }
+        body.light {
+            background: #f5f5f5;
+            color: #222;
+        }
+
+        /* ===== АДАПТИВНЫЙ ТУЛБАР ===== */
         #toolbar {
             background: #2a2a2a;
-            padding: 8px 16px;
+            padding: 6px 12px;
             display: flex;
             flex-wrap: wrap;
-            gap: 8px;
+            gap: 6px;
             align-items: center;
             border-bottom: 1px solid #444;
             position: sticky;
             top: 0;
             z-index: 10;
+            max-height: 120px;
+            overflow-y: auto;
+            transition: background 0.3s, max-height 0.3s;
+        }
+        body.light #toolbar {
+            background: #e8e8e8;
+            border-bottom: 1px solid #ccc;
         }
         #toolbar button, #toolbar input, #toolbar select {
             background: #3a3a3a;
             color: #ddd;
             border: 1px solid #555;
-            padding: 4px 10px;
+            padding: 4px 8px;
             border-radius: 4px;
-            font-size: 13px;
+            font-size: 12px;
             cursor: pointer;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+        body.light #toolbar button,
+        body.light #toolbar input,
+        body.light #toolbar select {
+            background: #fff;
+            color: #222;
+            border: 1px solid #aaa;
         }
         #toolbar button:hover { background: #555; }
-        #toolbar .brand { font-weight: bold; color: #fff; margin-right: 10px; }
+        body.light #toolbar button:hover { background: #ddd; }
+        #toolbar .brand {
+            font-weight: bold;
+            color: #fff;
+            margin-right: 6px;
+            font-size: 13px;
+        }
+        body.light #toolbar .brand { color: #222; }
+        #toolbar input { width: 100px; }
+        #toolbar input#searchNodeInput { width: 120px; }
+        #toolbar input#newNodeLabelInput { width: 120px; }
+        #toolbar input#newLabelInput { width: 120px; }
+        #toolbar input#weightInput { width: 55px; }
+
+        /* Компактный вид для мобильных */
+        @media (max-width: 768px) {
+            #toolbar {
+                max-height: 160px;
+                padding: 4px 8px;
+                gap: 4px;
+            }
+            #toolbar button, #toolbar input, #toolbar select {
+                font-size: 11px;
+                padding: 3px 6px;
+            }
+            #toolbar input { width: 70px; }
+            #toolbar input#searchNodeInput { width: 80px; }
+            #toolbar input#newNodeLabelInput { width: 80px; }
+            #toolbar input#newLabelInput { width: 80px; }
+            #toolbar .brand { font-size: 12px; }
+            #toolbar .hide-mobile { display: none; }
+        }
+        @media (max-width: 500px) {
+            #toolbar input { width: 60px; }
+            #toolbar input#searchNodeInput { width: 70px; }
+            #toolbar input#newNodeLabelInput { width: 70px; }
+            #toolbar input#newLabelInput { width: 70px; }
+        }
+
         #graph-container {
             width: 100%;
             height: calc(100vh - 60px);
             background: #1a1a1a;
             position: relative;
+            transition: background 0.3s;
         }
+        body.light #graph-container { background: #f5f5f5; }
+
+        /* ===== АДАПТИВНАЯ ИНФОРМАЦИОННАЯ ПАНЕЛЬ ===== */
         #info-panel {
             position: fixed;
             bottom: 20px;
@@ -44,17 +116,30 @@
             border: 1px solid #555;
             border-radius: 8px;
             padding: 16px;
-            max-width: 300px;
-            min-width: 220px;
+            max-width: min(320px, 90vw);
+            min-width: 200px;
             max-height: 70vh;
             overflow-y: auto;
             display: none;
             z-index: 20;
             box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+            transition: background 0.3s;
+        }
+        body.light #info-panel {
+            background: #f0f0f0;
+            border-color: #bbb;
         }
         #info-panel.show { display: block; }
-        #info-panel .close { float: right; cursor: pointer; color: #aaa; }
+        #info-panel .close {
+            float: right;
+            cursor: pointer;
+            color: #aaa;
+            font-size: 18px;
+        }
+        body.light #info-panel .close { color: #555; }
         #info-panel .close:hover { color: #fff; }
+        body.light #info-panel .close:hover { color: #000; }
+
         #loading-indicator {
             position: fixed;
             top: 50%;
@@ -68,6 +153,7 @@
             z-index: 30;
         }
         #loading-indicator.show { display: block; }
+
         .neighbor-row {
             display: grid;
             grid-template-columns: 16px 1fr auto;
@@ -77,22 +163,130 @@
             border-radius: 4px;
         }
         .neighbor-row:hover { background: #3a3a3a; }
+        body.light .neighbor-row:hover { background: #ddd; }
         .neighbor-row .w.neg { color: #ff6b6b; }
         .hint { color: #888; font-size: 12px; margin-top: 6px; }
         .info-row { display: flex; justify-content: space-between; margin: 4px 0; }
         .info-label { color: #888; }
+        body.light .info-label { color: #666; }
         .info-value { color: #fff; font-weight: 500; }
-        .btn-group { margin-top: 12px; display: flex; gap: 8px; justify-content: flex-end; }
-        .btn-group button { background: #3a3a3a; border: 1px solid #555; color: #ddd; padding: 4px 12px; border-radius: 4px; cursor: pointer; }
+        body.light .info-value { color: #222; }
+        .btn-group { margin-top: 12px; display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+        .btn-group button {
+            background: #3a3a3a;
+            border: 1px solid #555;
+            color: #ddd;
+            padding: 4px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        body.light .btn-group button {
+            background: #fff;
+            border-color: #aaa;
+            color: #222;
+        }
         .btn-group button:hover { background: #555; }
+        body.light .btn-group button:hover { background: #ddd; }
+
+        /* ===== ЛЕГЕНДА (адаптивная) ===== */
+        #legend {
+            position: absolute;
+            top: 70px;
+            left: 20px;
+            background: rgba(42,42,42,0.95);
+            padding: 10px 14px;
+            border-radius: 8px;
+            border: 1px solid #555;
+            font-size: 12px;
+            z-index: 15;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            max-height: calc(80vh - 80px);
+            overflow-y: auto;
+            transition: background 0.3s, left 0.3s, top 0.3s;
+        }
+        body.light #legend {
+            background: rgba(240,240,240,0.95);
+            border-color: #bbb;
+        }
+        #legend .legend-title {
+            font-weight: 600;
+            margin-bottom: 4px;
+            font-size: 12px;
+            color: #ddd;
+        }
+        body.light #legend .legend-title { color: #222; }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin: 2px 0;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .legend-item input { cursor: pointer; }
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            border: 1px solid rgba(255,255,255,0.2);
+            flex-shrink: 0;
+        }
+        body.light .legend-color { border-color: rgba(0,0,0,0.2); }
+
+        @media (max-width: 768px) {
+            #legend {
+                top: 80px;
+                left: 10px;
+                padding: 8px 12px;
+                font-size: 11px;
+                max-height: calc(70vh - 80px);
+            }
+            .legend-item { font-size: 11px; }
+        }
+
+        /* ===== КОНТЕКСТНОЕ МЕНЮ ===== */
+        #contextMenu {
+            display: none;
+            position: fixed;
+            background: #2a2a2a;
+            border: 1px solid #555;
+            border-radius: 6px;
+            padding: 6px 0;
+            min-width: 150px;
+            z-index: 100;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+            transition: background 0.3s;
+        }
+        body.light #contextMenu {
+            background: #f0f0f0;
+            border-color: #bbb;
+        }
+        #contextMenu .menu-item {
+            padding: 6px 16px;
+            cursor: pointer;
+            font-size: 13px;
+            color: #ddd;
+            transition: background 0.15s;
+        }
+        body.light #contextMenu .menu-item { color: #222; }
+        #contextMenu .menu-item:hover { background: #3a3a3a; }
+        body.light #contextMenu .menu-item:hover { background: #ddd; }
+        #contextMenu .menu-item.danger { color: #ff6b6b; }
     </style>
 </head>
 <body>
     <div id="toolbar">
         <span class="brand">🧠 Граф знаний</span>
-        <button id="refreshBtn">⟳ Обновить</button>
-        <button id="resetPhysicsBtn">◎ Физика</button>
-        <input type="text" id="newNodeLabelInput" placeholder="Название понятия" style="width:140px;">
+        <button id="refreshBtn">⟳</button>
+        <button id="resetPhysicsBtn">◎</button>
+        <button id="exportBtn">📥</button>
+        <button id="sleepBtn">💤 Сон</button>
+        <button id="themeToggle">🌓</button>
+
+        <input type="text" id="searchNodeInput" placeholder="Поиск...">
+        <button id="searchNodeBtn">🔍</button>
+        <input type="text" id="newNodeLabelInput" placeholder="Новое понятие">
         <select id="newNodeTypeSelect">
             <option value="CONCEPT">CONCEPT</option>
             <option value="SENSORY">SENSORY</option>
@@ -100,33 +294,55 @@
             <option value="EMOTIONAL">EMOTIONAL</option>
             <option value="ATTENTION">ATTENTION</option>
         </select>
-        <button id="addNodeBtn">➕ Узел</button>
-        <input type="number" id="weightInput" value="0.5" step="0.01" style="width:60px;">
-        <button id="addEdgeBtn">➕ Ребро</button>
-        <input type="text" id="newLabelInput" placeholder="Новая метка" style="width:140px;">
+        <button id="addNodeBtn">➕</button>
+        <input type="number" id="weightInput" value="0.5" step="0.01">
+        <button id="addEdgeBtn">➕Ребро</button>
+        <input type="text" id="newLabelInput" placeholder="Метка">
         <select id="editNodeTypeSelect">
-            <option value="">тип: без изм.</option>
+            <option value="">тип</option>
             <option value="CONCEPT">CONCEPT</option>
             <option value="SENSORY">SENSORY</option>
             <option value="MOTOR">MOTOR</option>
             <option value="EMOTIONAL">EMOTIONAL</option>
             <option value="ATTENTION">ATTENTION</option>
         </select>
-        <label><input type="checkbox" id="reembedCheckbox" checked> embed</label>
-        <button id="updateLabelBtn">✎ Изменить</button>
-        <button id="deleteNodeBtn">🗑 Узел</button>
-        <button id="deleteEdgeBtn">🗑 Ребро</button>
-        <button id="saveBtn">💾 Сохранить</button>
+        <label><input type="checkbox" id="reembedCheckbox" checked> emb</label>
+        <button id="updateLabelBtn">✎</button>
+        <button id="deleteNodeBtn" class="danger">🗑</button>
+        <button id="deleteEdgeBtn" class="danger">🗑Р</button>
+        <button id="saveBtn">💾</button>
     </div>
+
     <div id="graph-container"></div>
+
     <div id="info-panel">
         <span class="close" id="closeInfo">✖</span>
         <div id="infoContent"></div>
         <div class="btn-group">
-            <button id="focusNodeBtn">🎯 Центрировать</button>
+            <button id="focusNodeBtn">🎯 Центр</button>
+            <button id="animateActivationBtn">⚡ Акт</button>
         </div>
     </div>
-    <div id="loading-indicator">🔄 Загрузка графа...</div>
+
+    <div id="loading-indicator">🔄 Загрузка...</div>
+
+    <div id="legend">
+        <div class="legend-title">Типы</div>
+        <label class="legend-item"><input type="checkbox" data-type="SENSORY" checked> <span class="legend-color" style="background:#8F8178;"></span> SENSORY</label>
+        <label class="legend-item"><input type="checkbox" data-type="CONCEPT" checked> <span class="legend-color" style="background:#6F9587;"></span> CONCEPT</label>
+        <label class="legend-item"><input type="checkbox" data-type="MOTOR" checked> <span class="legend-color" style="background:#7285A0;"></span> MOTOR</label>
+        <label class="legend-item"><input type="checkbox" data-type="EMOTIONAL" checked> <span class="legend-color" style="background:#9B7890;"></span> EMOTIONAL</label>
+        <label class="legend-item"><input type="checkbox" data-type="ATTENTION" checked> <span class="legend-color" style="background:#A49A65;"></span> ATTENTION</label>
+    </div>
+
+    <div id="contextMenu">
+        <div class="menu-item" data-action="focus">🎯 Центрировать</div>
+        <div class="menu-item" data-action="edit">✎ Редактировать</div>
+        <div class="menu-item" data-action="addEdge">➕ Ребро</div>
+        <div class="menu-item" data-action="animate">⚡ Активация</div>
+        <div class="menu-item danger" data-action="delete">🗑 Удалить</div>
+    </div>
+
     <script src="/static/js/graf.js"></script>
 </body>
 </html>

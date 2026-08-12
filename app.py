@@ -687,6 +687,22 @@ async def refresh_graph():
     brain.load_dialog_history()
     return {"status": "refreshed"}
 
+@app.post("/graph/update_edge")
+async def update_edge(req: dict):
+    from_id = req.get("from")
+    to_id = req.get("to")
+    weight = req.get("weight")
+    if from_id is None or to_id is None or weight is None:
+        raise HTTPException(400, "Missing fields")
+    with brain.lock:
+        g = brain.graph.levels[0] if hasattr(brain.graph, 'levels') else brain.graph
+        for i, (f, t) in enumerate(g._edges):
+            if f == from_id and t == to_id:
+                g._edge_weights[i] = nn.Parameter(torch.tensor(weight, dtype=torch.float))
+                g._rebuild_edges()
+                brain.save()
+                return {"status": "updated"}
+        raise HTTPException(404, "Edge not found")
 
 
 # ---------- ЗАВЕРШЕНИЕ ----------
