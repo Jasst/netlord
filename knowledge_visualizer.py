@@ -199,12 +199,9 @@ def main():
 
     # --- Эпизодическая память (последние 20) ---
     html_parts.append("<h2>Эпизодическая память (последние записи)</h2>")
-    # Получим все векторы из индекса с метаданными
-    # У VectorMemoryIndex нет прямого метода получить все, но можно пройти по всем id
     episodic_metadata = memory.episodic.metadata
     if episodic_metadata:
         html_parts.append("<table border='1'><tr><th>ID</th><th>Контекст</th><th>Время</th></tr>")
-        # Сортируем по времени (последние сверху)
         sorted_ids = sorted(episodic_metadata.keys(), key=lambda x: memory.episodic.timestamps.get(x, 0), reverse=True)
         for vid in sorted_ids[:20]:
             meta = episodic_metadata[vid]
@@ -234,6 +231,40 @@ def main():
     stats = brain.get_stats()
     html_parts.append("<h2>Статистика</h2>")
     html_parts.append("<pre>" + json.dumps(stats, indent=2, default=str) + "</pre>")
+
+    # --- Модель мира ---
+    html_parts.append("<h2>Модель мира</h2>")
+    if hasattr(brain, 'world_model') and brain.world_model:
+        wm = brain.world_model
+        html_parts.append(f"<p>Фактов: {len(wm.facts)}, Убеждений: {len(wm.beliefs)}, Гипотез: {len(wm.hypotheses)}, Эпизодов: {len(wm.episodes)}</p>")
+        if wm.facts:
+            html_parts.append("<h3>Последние факты</h3>")
+            html_parts.append("<table border='1'><tr><th>Субъект</th><th>Отношение</th><th>Объект</th><th>Увер.</th><th>Источник</th></tr>")
+            for f in wm.facts[-30:]:
+                html_parts.append(f"<tr><td>{f.subject}</td><td>{f.relation}</td><td>{f.object}</td><td>{f.confidence:.2f}</td><td>{f.source}</td></tr>")
+            html_parts.append("</table>")
+        if wm.hypotheses:
+            html_parts.append("<h3>Гипотезы</h3>")
+            html_parts.append("<ul>")
+            for h in wm.hypotheses[-10:]:
+                html_parts.append(f"<li>{h.content} (увер: {h.confidence:.2f}, проверена: {h.verified}, результат: {h.result})</li>")
+            html_parts.append("</ul>")
+    else:
+        html_parts.append("<p>Модель мира отключена.</p>")
+
+    # --- Self-модель ---
+    html_parts.append("<h2>Self-модель</h2>")
+    if hasattr(brain, 'self_model') and brain.self_model:
+        sm = brain.self_model
+        html_parts.append(f"<p>Способности: {sm.capabilities}</p>")
+        if sm.recent_errors:
+            html_parts.append(f"<p>Недавние ошибки: {', '.join(sm.recent_errors[-5:])}</p>")
+        if sm.successful_strategies:
+            html_parts.append(f"<p>Успешные стратегии: {', '.join(sm.successful_strategies[-5:])}</p>")
+        if sm.unresolved_questions:
+            html_parts.append(f"<p>Нерешённые вопросы: {', '.join(sm.unresolved_questions[-5:])}</p>")
+    else:
+        html_parts.append("<p>Self-модель отключена.</p>")
 
     # --- Закрывающие теги ---
     html_parts.append("</body></html>")

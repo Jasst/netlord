@@ -208,6 +208,43 @@
         <div id="bulkTrainLog" style="background:var(--bg); padding:10px; border-radius:8px; border:1px solid var(--border); font-family: monospace; font-size:12px; max-height:200px; overflow-y:auto; white-space:pre-wrap; color:var(--text);"></div>
     </form>
 </div>
+
+                <!-- ===== МОДЕЛЬ МИРА ===== -->
+                <div class="settings-section">
+    <h3>🌍 Модель мира</h3>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
+        <button id="refreshWorldModelBtn" class="small">🔄 Обновить</button>
+        <button id="clearFactsBtn" class="small danger" style="display:none;">🗑 Очистить</button>
+    </div>
+    <div id="worldModelStats" style="font-size:13px; color:var(--text-muted);"></div>
+    <div id="factsListWorld" style="max-height:200px; overflow-y:auto; margin-top:8px; font-size:13px;">
+        <p class="empty-hint">Загружаем факты...</p>
+    </div>
+    <details>
+        <summary style="cursor:pointer; color:var(--text-muted); font-size:13px;">🔍 Гипотезы</summary>
+        <div id="hypothesesList" style="margin-top:6px; font-size:13px; max-height:150px; overflow-y:auto;">
+            <p class="empty-hint">Нет гипотез.</p>
+        </div>
+    </details>
+</div>
+
+<!-- ===== SELF-МОДЕЛЬ ===== -->
+<div class="settings-section">
+    <h3>🧠 Self-модель</h3>
+    <button id="refreshSelfModelBtn" class="small">🔄 Обновить</button>
+    <div id="selfModelContent" style="font-size:13px; margin-top:8px; max-height:200px; overflow-y:auto;">
+        <p class="empty-hint">Загружаем...</p>
+    </div>
+</div>
+
+<!-- ===== ПЛАНИРОВЩИК ===== -->
+<div class="settings-section">
+    <h3>📋 Планы и цели</h3>
+    <button id="refreshPlannerBtn" class="small">🔄 Обновить</button>
+    <div id="plannerContent" style="font-size:13px; margin-top:8px; max-height:200px; overflow-y:auto;">
+        <p class="empty-hint">Нет активных целей.</p>
+    </div>
+</div>
             </aside>
         </div>
 
@@ -231,6 +268,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     <script src="/static/js/app.js"></script>
     <script src="/static/js/bulk_train.js"></script>
+    <script src="/static/js/cognitive_panel.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', function() {
             const btn = document.getElementById('openGraphEditorBtn');

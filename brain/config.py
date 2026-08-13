@@ -1,3 +1,4 @@
+# brain/config.py
 from dataclasses import dataclass, field
 from typing import Optional, List
 
@@ -34,14 +35,14 @@ class BrainConfig:
     openai_api_key: Optional[str] = None
     llm_base_url: Optional[str] = "http://192.168.0.13:1234/v1"
 
-    # Параметры сэмплинга (фиксированные, без динамики)
+    # Параметры сэмплинга
     llm_top_p: float = 0.8
     llm_top_k: int = 20
     llm_repetition_penalty: float = 1.05
     presence_penalty: float = 0.0
     enable_thinking: bool = True
 
-    # Инструменты
+    # Инструменты (время убрано, оставлены погода и калькулятор)
     enable_tools: bool = True
     openweather_api_key: Optional[str] = None
 
@@ -63,26 +64,40 @@ class BrainConfig:
     enable_ewc: bool = True
     ewc_lambda: float = 0.1
 
-    # Рефлексия (оставлена, но теперь вызывается только через Teacher)
     enable_reflection: bool = True
 
-    # Проактивные мысли (опционально)
     proactive_enabled: bool = True
     proactive_interval_seconds: int = 60
     proactive_steps: int = 3
     proactive_top_k: int = 6
     proactive_reward: float = 0.5
 
-    # Двухуровневый ответ
     two_level_answer: bool = True
     summary_max_tokens: int = 250
     summary_temperature: float = 0.3
 
-    # Модули для агента (опциональны, но оставлены)
     enable_emotion: bool = True
     enable_user_model: bool = True
     enable_motivation: bool = True
 
-    # Для агента (не влияют на мозг)
     self_play_rounds: int = 3
     exploration_temperature: float = 0.9
+
+    # ---------- НОВЫЕ ПАРАМЕТРЫ (время, когнитивный цикл, мир, self, планировщик) ----------
+    include_time_in_context: bool = True
+    time_format: str = "%A, %d %B %Y, %H:%M:%S"
+    time_zone: str = "Europe/Moscow"
+
+    # Включение новых модулей
+    enable_world_model: bool = True
+    enable_reasoner: bool = True
+    enable_planner: bool = True
+    enable_self_model: bool = True
+    enable_controller: bool = True
+
+    world_model_capacity: int = 10000
+    planning_max_actions: int = 10
+
+    # Консолидация памяти
+    memory_consolidation_age_days: int = 30
+    memory_consolidation_threshold: float = 0.05

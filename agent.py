@@ -1,12 +1,18 @@
-# agent.py
+# brain/agent.py
 import time
 import threading
 import random
+import datetime
 from typing import List, Optional, Dict, Any
 from openai import OpenAI
 
 from brain import CognitiveBrain
 from brain.teacher import Teacher
+from brain.controller import CognitiveController
+from brain.world_model import WorldModel
+from brain.reasoner import Reasoner
+from brain.planner import Planner
+from brain.self_model import SelfModel
 
 
 class BrainAgent:
@@ -25,7 +31,6 @@ class BrainAgent:
         self_play_rounds: int = 3,
         exploration_factor: float = 0.2,
         history_per_topic: int = 15,
-        # НОВЫЕ ПАРАМЕТРЫ ДЛЯ АВТООБУЧЕНИЯ
         teacher_threshold: float = 0.7,
         use_dynamic_threshold: bool = True,
     ):
@@ -56,11 +61,16 @@ class BrainAgent:
         self.asked_questions: Dict[str, List[str]] = {t: [] for t in self.topics}
 
         self._proactive_counter = 0
-        # Счётчики для статистики автообучения
         self.accepted_count = 0
         self.improved_count = 0
         self.rejected_count = 0
         self.negative_count = 0
+
+        # Время последнего взаимодействия для проактивности
+        self.last_interaction_time = time.time()
+
+        # Если мозг имеет контроллер – используем его
+        self.controller = getattr(brain, "controller", None)
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -83,7 +93,7 @@ class BrainAgent:
                 self._cycle()
                 cycle_counter += 1
 
-                # --- ПРОАКТИВНЫЕ МЫСЛИ ---
+                # Проактивные мысли
                 if self.brain.config.proactive_enabled:
                     self._proactive_counter += 1
                     interval_seconds = self.brain.config.proactive_interval_seconds
@@ -91,47 +101,97 @@ class BrainAgent:
                         self.brain.proactive_thought()
                         self.brain.save()
 
-                # --- АВТОСОХРАНЕНИЕ ---
+                # Автосохранение
                 if cycle_counter % 10 == 0:
                     self.brain.save()
                     self.brain.save_dialog_history()
                     print("[Agent] Автосохранение выполнено.")
 
-                # --- ФОНОВЫЙ СИНТЕЗ НОВЫХ УЗЛОВ ---
+                # Фоновый синтез (с учётом интереса)
                 if cycle_counter % 5 == 0:
-                    self._synthesize_random_pair()
+                    self._synthesize_curious_pair()
 
-                # --- ПЕРИОДИЧЕСКАЯ СТАТИСТИКА АВТООБУЧЕНИЯ ---
+                # Периодическая статистика обучения
                 if cycle_counter % 20 == 0:
                     total = self.accepted_count + self.improved_count + self.rejected_count + self.negative_count
                     if total > 0:
                         print(f"[Agent] Автообучение: принято={self.accepted_count}, улучшено={self.improved_count}, "
                               f"отклонено={self.rejected_count}, отрицательных={self.negative_count}")
 
+                # Проактивный запуск на основе времени и Self-модели
+                if cycle_counter % 3 == 0:
+                    self._time_based_proactive()
+
             for _ in range(self.interval):
                 if self._stop_flag:
                     break
                 time.sleep(1)
 
-    def _synthesize_random_pair(self):
+    def _synthesize_curious_pair(self):
+        """Синтез не случайный, а на основе «интереса»: ищем слабые или противоречивые связи."""
         graph = self.brain.graph
         if hasattr(graph, 'levels'):
             g = graph.levels[0]
         else:
             g = graph
+
         n_nodes = g.node_emb.shape[0]
         if n_nodes < 5:
             return
-        degrees = {nid: len(g._adjacency.get(nid, [])) for nid in range(1, n_nodes+1)}
-        if not degrees:
+
+        # Найдём узлы с низкой степенью (неисследованные)
+        degree = {nid: len(g._adjacency.get(nid, [])) for nid in range(1, n_nodes+1)}
+        if not degree:
             return
-        sorted_nodes = sorted(degrees, key=degrees.get, reverse=True)[:20]
-        if len(sorted_nodes) < 2:
+
+        # Выберем пару: один узел с высокой степенью, другой – с низкой (любопытство)
+        high_deg = sorted(degree.items(), key=lambda x: -x[1])[:10]
+        low_deg = sorted(degree.items(), key=lambda x: x[1])[:10]
+
+        if high_deg and low_deg:
+            nid1 = random.choice(high_deg)[0]
+            nid2 = random.choice(low_deg)[0]
+        else:
             return
-        nid1, nid2 = random.sample(sorted_nodes, 2)
+
+        # Проверим, нет ли между ними ребра
+        if g.get_edges_between(nid1, nid2):
+            return
+
         new_nid = self.brain.synthesize_concepts(nid1, nid2, optimizer=self.brain.optimizer)
         if new_nid != -1:
-            print(f"[Agent] Фоновый синтез: создан узел {new_nid} из {nid1} и {nid2}")
+            print(f"[Agent] Любопытный синтез: создан узел {new_nid} из {nid1} и {nid2}")
+
+    def _time_based_proactive(self):
+        """Инициировать диалог на основе времени и Self-модели."""
+        now = datetime.datetime.now()
+        hour = now.hour
+        # Если давно не было диалога и сейчас день
+        if time.time() - self.last_interaction_time > 1800 and 8 <= hour <= 22:
+            # Используем Self-модель для генерации вопроса о нерешённых вопросах
+            if hasattr(self.brain, "self_model"):
+                unresolved = self.brain.self_model.unresolved_questions
+                if unresolved:
+                    question = f"У меня есть нерешённый вопрос: {unresolved[-1]}. Хотите обсудить?"
+                    self.pending_question = question
+                    self.waiting_for_answer = True
+                    print(f"[Agent] Проактивный вопрос (нерешённый): {question}")
+                    self.last_interaction_time = time.time()
+                    return
+
+            # Иначе – вопрос о времени суток
+            if 5 <= hour < 12:
+                topic = "планы на день"
+            elif 12 <= hour < 18:
+                topic = "рабочие задачи"
+            else:
+                topic = "вечерний отдых"
+            question = self._generate_question_for_topic(topic)
+            if question:
+                self.pending_question = question
+                self.waiting_for_answer = True
+                print(f"[Agent] Проактивный вопрос о {topic}: {question}")
+                self.last_interaction_time = time.time()
 
     def _cycle(self):
         if self.interactive_mode:
@@ -153,7 +213,7 @@ class BrainAgent:
             if chosen and chosen['name'] == 'search_web':
                 query = self._generate_search_query()
                 if query:
-                    self.brain.step(query, use_search=True)
+                    self._ask_controller(query, use_search=True)
                 return
             elif chosen and chosen['name'] == 'propose_topic':
                 topic = self._select_topic_for_exploration()
@@ -211,7 +271,7 @@ class BrainAgent:
                 if chosen['name'] == 'search_web':
                     query = self._generate_search_query()
                     if query:
-                        self.brain.step(query, use_search=True)
+                        self._ask_controller(query, use_search=True)
                     return
                 elif chosen['name'] == 'explore_new':
                     topic = min(self.topic_confidence, key=self.topic_confidence.get)
@@ -230,46 +290,54 @@ class BrainAgent:
                 break
             self._ask_and_learn(topic)
 
+    def _ask_controller(self, question: str, use_search: bool = False):
+        """Используем контроллер для обработки вопроса."""
+        if self.controller:
+            answer = self.controller.process_input(question)
+        else:
+            result = self.brain.step(question, use_search=use_search)
+            answer = result["answer"]
+        # Сохраняем в диалог
+        self.brain.dialog_memory.append({"user": question, "assistant": answer, "time": time.time()})
+        self.last_interaction_time = time.time()
+
     def _ask_and_learn(self, topic: str):
         q = self._generate_question_for_topic(topic)
         if not q:
             return
-        result = self.brain.step(q)
-        thoughts = result.get("thoughts", result["answer"])
-        confidence = result.get("confidence", 0.5)
+        if self.controller:
+            answer = self.controller.process_input(q)
+            thoughts = answer
+            confidence = 0.5  # можно получить из контроллера, но пока упростим
+        else:
+            result = self.brain.step(q)
+            thoughts = result.get("thoughts", result["answer"])
+            confidence = result.get("confidence", 0.5)
 
-        # ----- НОВАЯ ЛОГИКА ОЦЕНКИ -----
         score, improved, _ = self.teacher.evaluate(q, thoughts)
 
-        # Динамический порог
         if self.use_dynamic_threshold:
-            # Чем выше уверенность графа, тем ниже порог
-            dynamic_threshold = 0.5 + 0.25 * (1 - confidence)  # от 0.5 до 0.75
+            dynamic_threshold = 0.5 + 0.25 * (1 - confidence)
             threshold = dynamic_threshold
         else:
             threshold = self.teacher_threshold
 
-        # Принятие решения
         if score >= threshold:
-            # Хороший ответ – обучаем
             self.brain.learn_pair(q, thoughts, reward=score)
             self._update_topic_confidence(topic, score)
             self.accepted_count += 1
         else:
-            # Пытаемся улучшить
             if improved != thoughts and score > 0.3:
-                # Есть улучшенный вариант и оценка не совсем провальная
                 self.brain.learn_pair(q, improved, reward=max(0.5, score + 0.1))
                 self._update_topic_confidence(topic, max(0.5, score + 0.1))
                 self.improved_count += 1
             else:
-                # Плохо – либо отрицательное обучение, либо пропуск
                 if score < 0.3:
                     self.brain.learn_negative_pair(q, thoughts)
                     self.negative_count += 1
                 else:
-                    # Пропускаем (средний ответ без улучшения)
                     self.rejected_count += 1
+        self.last_interaction_time = time.time()
 
     def _select_topic_for_exploration(self) -> str:
         if self.brain.user_model is not None:
@@ -355,53 +423,17 @@ class BrainAgent:
 
     def submit_answer(self, question: str, answer: str):
         if self.active_question == question:
-            self.brain.learn_pair(question, answer)
+            # Используем контроллер для обработки ответа пользователя
+            if self.controller:
+                self.controller.process_input(answer)  # ответ пользователя как новый ввод
+            else:
+                self.brain.learn_pair(question, answer)
             self.brain.save()
             self.brain.save_dialog_history()
             print(f"[Agent] Пользователь ответил на '{question}' -> '{answer}', выучено.")
             self.active_question = None
             self.waiting_for_answer = False
             self.brain.dialog_memory.append({"user": question, "assistant": answer, "time": time.time()})
+            self.last_interaction_time = time.time()
         else:
             print(f"[Agent] Ответ на неактивный вопрос: {question} (активный: {self.active_question})")
-
-
-if __name__ == "__main__":
-    import signal
-    import sys
-    from brain import BrainConfig
-
-    config = BrainConfig()
-    brain = CognitiveBrain(config)
-    brain.load()
-    brain.load_dialog_history()
-
-    llm_client = OpenAI(base_url=config.llm_base_url, api_key="not-needed")
-    teacher = Teacher(llm_client=llm_client)
-
-    agent = BrainAgent(
-        brain=brain,
-        teacher=teacher,
-        llm_client=llm_client,
-        interactive_mode=False,
-        teacher_threshold=0.7,
-        use_dynamic_threshold=True,
-    )
-
-    def _shutdown():
-        print("\n[Agent] Остановка и сохранение...")
-        agent.stop()
-        brain.save()
-        brain.save_dialog_history()
-
-    signal.signal(signal.SIGINT, lambda s, f: (_shutdown(), sys.exit(0)))
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, lambda s, f: (_shutdown(), sys.exit(0)))
-
-    agent.start()
-    print("[Agent] Работает в фоне. Ctrl+C для остановки.")
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        _shutdown()

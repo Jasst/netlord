@@ -5,7 +5,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import json
 import os
-import time
+import time as time_module
 import re
 import random
 import threading
@@ -13,6 +13,7 @@ import pickle
 import requests
 import math
 import ast
+import datetime
 from collections import deque
 from typing import List, Dict, Optional, Any, Tuple
 
@@ -28,14 +29,16 @@ from brain.emotion import EmotionModel
 from brain.user_model import UserModel
 from brain.teacher import Teacher
 
-_SEARCH_TRIGGER_WORDS = (
-    "сейчас", "сегодня", "текущ", "актуальн", "последн", "свежие", "новост",
-    "курс", "погода", "прямо сейчас", "в этом году", "недавно",
-)
+# Новые модули
+from brain.world_model import WorldModel
+from brain.reasoner import Reasoner
+from brain.planner import Planner
+from brain.self_model import SelfModel
+from brain.controller import CognitiveController
 
 
 # ----------------------------------------------------------------------
-# Вспомогательные модули
+# Вспомогательные модули (Reflector, EWC) – без изменений
 # ----------------------------------------------------------------------
 class Reflector:
     def __init__(self, llm: LLMInterface):
@@ -80,6 +83,10 @@ class EWC:
             loss = loss + (self.fisher[name] * (param - self.anchor[name]) ** 2).sum()
         return self.lambda_ * loss
 
+
+# ----------------------------------------------------------------------
+# ToolRegistry – только погода и калькулятор, время убрано
+# ----------------------------------------------------------------------
 class ToolRegistry:
     def __init__(self, config: BrainConfig):
         self.config = config
@@ -114,20 +121,18 @@ class ToolRegistry:
             return f"{expression} = {result}"
         except Exception as e:
             return f"Ошибка вычисления: {e}"
-    def get_datetime(self) -> str:
-        return time.strftime("%Y-%m-%d %H:%M:%S")
     def execute(self, text: str) -> Optional[str]:
         lower = text.lower()
+        # Погода
         match = re.search(r'погод[ау]?\s+(в\s+)?([А-Яа-я\s\-]+)', lower)
         if match:
             city = match.group(2).strip()
             if city:
                 return self.get_weather(city)
+        # Калькулятор
         match = re.search(r'(\d+[\s+\-*/()]*\d+)', text)
         if match and any(kw in lower for kw in ['сколько', 'посчитай', 'вычисли', 'реши']):
             return self.calculate(match.group(1))
-        if any(kw in lower for kw in ['дата', 'время', 'сейчас', 'сегодня', 'который час']):
-            return self.get_datetime()
         return None
 
 
@@ -165,10 +170,12 @@ class CognitiveBrain(nn.Module):
         self.dim = config.dim_embedding
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Embedder
         self.embedder = EmbeddingProvider(dim=self.dim, model_name=config.embedding_model)
         if os.path.exists(config.embedding_cache_path):
             self.embedder.load_cache(config.embedding_cache_path)
 
+        # Граф
         if config.use_hierarchical_graph:
             self.graph = HierarchicalGraph(
                 dims=config.graph_levels,
@@ -186,12 +193,14 @@ class CognitiveBrain(nn.Module):
                 num_layers=config.gnn_num_layers
             ).to(self.device)
 
+        # Память
         self.memory = HierarchicalMemory(
             dim=self.dim,
             working_size=config.working_memory_size,
             episodic_capacity=config.episodic_capacity
         )
 
+        # LLM
         self.llm = LLMInterface(
             model_name=config.llm_model,
             use_openai_api=config.use_openai_api,
@@ -199,31 +208,59 @@ class CognitiveBrain(nn.Module):
             base_url=config.llm_base_url
         )
 
+        # Поиск и инструменты
         self.searcher = WebSearcher(max_results=5)
         self.tool_registry = ToolRegistry(config) if config.enable_tools else None
         self.teacher = Teacher(llm_client=self.llm.client) if getattr(self.llm, "client", None) else None
         self.reflector = Reflector(self.llm) if config.enable_reflection else None
         self.ewc = EWC(self.graph, lambda_=config.ewc_lambda) if config.enable_ewc else None
 
+        # Оптимизатор
         self.optimizer = optim.Adam(self.graph.parameters(), lr=config.learning_rate)
 
+        # Счётчики
         self.step_counter = 0
         self._learn_counter = 0
 
+        # Диалог, индексы, база знаний
         self.dialog_memory = []
         self.concept_index = {}
         self.knowledge_base = []
         self.lock = threading.RLock()
         self.proactive_thoughts = []
 
+        # Эмоции, мотивация, модель пользователя
         self.emotion = EmotionModel() if config.enable_emotion else None
         self.motivation = DriveSystem() if config.enable_motivation else None
         self.user_model = UserModel(dim=config.dim_embedding) if config.enable_user_model else None
 
+        # Кэш для базы знаний
         self._kb_emb_cache: Optional[torch.Tensor] = None
         self._kb_cache_dirty: bool = True
 
+        # ---------- НОВЫЕ МОДУЛИ (когнитивный цикл) ----------
+        self.world_model = WorldModel(self.embedder, dim=self.dim, capacity=config.world_model_capacity) if config.enable_world_model else None
+        self.reasoner = Reasoner(self.world_model) if config.enable_reasoner and self.world_model else None
+        self.self_model = SelfModel() if config.enable_self_model else None
+        self.planner = Planner(self.llm, self.world_model) if config.enable_planner and self.world_model else None
+        self.controller = None
+        if config.enable_controller and self.world_model and self.reasoner and self.planner and self.self_model:
+            self.controller = CognitiveController(
+                brain=self,
+                world_model=self.world_model,
+                reasoner=self.reasoner,
+                planner=self.planner,
+                self_model=self.self_model,
+                llm=self.llm,
+                teacher=self.teacher,
+                searcher=self.searcher
+            )
+
+        # Инициализация графа
         self._init_architecture()
+
+        # Сохраним последний запрос для уверенности
+        self._last_query = ""
 
     def _init_architecture(self):
         for i in range(10):
@@ -242,10 +279,15 @@ class CognitiveBrain(nn.Module):
         with self.lock:
             for _ in range(epochs):
                 self._learn_from_pair(input_text, output_text, reward=reward)
-                time.sleep(0.05)
+                time_module.sleep(0.05)
             self._learn_counter += epochs
             if self._learn_counter % self.config.checkpoint_every == 0:
                 self.save()
+            # Обновляем модель мира
+            if self.world_model:
+                self.world_model.add_fact("question", "answer", output_text,
+                                          confidence=reward, source="brain",
+                                          evidence=[input_text])
 
     def _learn_from_pair(self, q: str, a: str, reward: float):
         q_vec = self.text_to_embedding(q, is_query=True)
@@ -351,7 +393,7 @@ class CognitiveBrain(nn.Module):
             if self._learn_counter % self.config.checkpoint_every == 0:
                 self.save()
 
-    # ---------- МЕТОДЫ МЫШЛЕНИЯ (подкрепление, ассоциации, синтез) ----------
+    # ---------- МЕТОДЫ МЫШЛЕНИЯ ----------
     def reinforce_activated_pathway(self, start_nid: int, thought_stream: List[Tuple[int, float]], reward: float):
         if not thought_stream or len(thought_stream) < 2:
             return
@@ -407,61 +449,46 @@ class CognitiveBrain(nn.Module):
         return self.memory.retrieve(query_vec, k=max_items)
 
     # ---------- Основной шаг ----------
-    def _needs_search(self, text: str) -> bool:
-        lower = text.lower()
-        return any(kw in lower for kw in _SEARCH_TRIGGER_WORDS)
-
     def step(self, input_text: str, use_search: bool = False, temperature: Optional[float] = None) -> Dict[str, Any]:
-        with self.lock:
-            return self._step_locked(input_text, use_search=use_search, temperature=temperature)
+        """
+        Основной метод обработки запроса.
+        Если включён контроллер – используем его, иначе – старую логику.
+        """
+        if self.controller is not None and self.config.enable_controller:
+            answer = self.controller.process_input(input_text)
+            return {
+                "input": input_text,
+                "answer": answer,
+                "thoughts": answer,
+                "activated_neurons": [],
+                "memory_results": [],
+                "confidence": 0.5,  # контроллер пока не возвращает уверенность
+                "teacher_score": 0.5,
+                "teacher_details": {}
+            }
+        else:
+            # Старая логика (без контроллера)
+            return self._legacy_step(input_text, use_search, temperature)
 
-    def _step_locked(self, input_text: str, use_search: bool = False,
+    def _legacy_step(self, input_text: str, use_search: bool = False,
                      temperature: Optional[float] = None) -> Dict[str, Any]:
+        """Старый step, вызывается если контроллер отключён."""
         self.step_counter += 1
+        self._last_query = input_text
 
-        # Инструменты
+        # Инструменты (погода, калькулятор)
         if self.tool_registry is not None:
             tool_result = self.tool_registry.execute(input_text)
             if tool_result:
                 self._update_after_step(input_text, tool_result)
                 return {"input": input_text, "answer": tool_result, "activated_neurons": [], "memory_results": [], "tool_result": True}
 
-        if not use_search and self._needs_search(input_text):
-            use_search = True
-
-        lower = input_text.lower()
-        if any(kw in lower for kw in ["биткоин", "btc", "курс биткоина"]):
-            price = self._get_crypto_price("bitcoin", "usd")
-            if price is not None:
-                answer = f"Текущий курс BTC/USD: ${price:.2f}"
-                self._update_after_step(input_text, answer)
-                return {"input": input_text, "answer": answer, "activated_neurons": [], "memory_results": []}
-
-        if use_search:
-            enhanced = self._enhance_search_query(input_text)
-            results = self.searcher.search(enhanced)
-            if results:
-                context = self._build_search_context(input_text, enhanced, results)
-                full_answer = self.llm.generate(
-                    context,
-                    system=self.SYSTEM_PROMPT,
-                    history=self._recent_history(),
-                    max_tokens=2000,
-                    temperature=temperature if temperature is not None else 0.3,
-                    top_p=self.config.llm_top_p,
-                    repetition_penalty=self.config.llm_repetition_penalty,
-                    top_k=self.config.llm_top_k,
-                    presence_penalty=self.config.presence_penalty,
-                    enable_thinking=self.config.enable_thinking,
-                )
-            else:
-                full_answer = "Не удалось найти информацию."
-            self._update_after_step(input_text, full_answer)
-            if self.config.two_level_answer:
-                summary = self._summarize_answer(full_answer)
-            else:
-                summary = full_answer
-            return {"input": input_text, "answer": summary, "thoughts": full_answer, "activated_neurons": [], "memory_results": []}
+        # Получаем текущее время для контекста
+        now = datetime.datetime.now()
+        if self.config.include_time_in_context and self.config.time_format:
+            time_str = now.strftime(self.config.time_format)
+        else:
+            time_str = now.isoformat()
 
         # Основной путь
         query_vec = self.text_to_embedding(input_text, is_query=True)
@@ -480,7 +507,9 @@ class CognitiveBrain(nn.Module):
         thought_stream = self.graph.spreading_activation(start_nid, steps=3, decay=0.6, top_k=6)
         pre_confidence = self._compute_confidence(query_vec, None, thought_stream)
 
-        context = self._build_context(input_text, memory_results, start_nid, thought_stream, pre_confidence=pre_confidence)
+        # Построение контекста с временем
+        context = self._build_context(input_text, memory_results, start_nid, thought_stream,
+                                      pre_confidence=pre_confidence, current_time=time_str)
 
         temp = temperature if temperature is not None else 0.7
         full_answer = self.llm.generate(
@@ -513,7 +542,7 @@ class CognitiveBrain(nn.Module):
         if score > 0.55:
             self.learn_pair(input_text, full_answer, reward=score)
 
-        # ---------- ПОДКРЕПЛЕНИЕ, АССОЦИАЦИИ, СИНТЕЗ ----------
+        # Подкрепление, ассоциации, синтез
         if thought_stream and len(thought_stream) > 1:
             self.reinforce_activated_pathway(start_nid, thought_stream, score)
             self.create_new_associations(thought_stream, threshold=0.15)
@@ -569,7 +598,7 @@ class CognitiveBrain(nn.Module):
         return msgs
 
     def _update_after_step(self, question: str, answer: str):
-        self.dialog_memory.append({"user": question, "assistant": answer, "time": time.time()})
+        self.dialog_memory.append({"user": question, "assistant": answer, "time": time_module.time()})
         if len(self.dialog_memory) > 1000:
             self.dialog_memory = self.dialog_memory[-1000:]
 
@@ -583,7 +612,7 @@ class CognitiveBrain(nn.Module):
         self.knowledge_base.append({
             "q": q, "a": a,
             "emb": (q_vec + a_vec) / 2,
-            "time": time.time(),
+            "time": time_module.time(),
             "confidence": 0.5,
             "access_count": 0
         })
@@ -593,8 +622,13 @@ class CognitiveBrain(nn.Module):
 
     def _build_context(self, query: str, memory_results: List[Dict], start_nid: int,
                        thought_stream: Optional[List[Tuple[int, float]]] = None,
-                       max_facts: int = 12, pre_confidence: Optional[float] = None) -> str:
-        context = f"Вопрос: {query}\n"
+                       max_facts: int = 12, pre_confidence: Optional[float] = None,
+                       current_time: Optional[str] = None) -> str:
+        context = ""
+        if self.config.include_time_in_context and current_time:
+            context += f"Текущее время: {current_time}\n"
+        context += f"Вопрос: {query}\n"
+
         node_labels = getattr(self.graph, 'node_labels', {})
         start_label = node_labels.get(start_nid, "")
         if start_label:
@@ -659,7 +693,12 @@ class CognitiveBrain(nn.Module):
         return context
 
     def _build_search_context(self, query: str, enhanced: str, results: List[Dict]) -> str:
-        context = f"Вопрос: {query}\nУлучшенный запрос: {enhanced}\n"
+        now = datetime.datetime.now()
+        time_str = now.strftime(self.config.time_format) if self.config.time_format else now.isoformat()
+        context = ""
+        if self.config.include_time_in_context:
+            context += f"Текущее время: {time_str}\n"
+        context += f"Вопрос: {query}\nУлучшенный запрос: {enhanced}\n"
         context += "Результаты поиска:\n"
         for r in results:
             context += f"- {r.get('title', '')}: {r.get('body', '')[:200]}\n"
@@ -721,16 +760,18 @@ class CognitiveBrain(nn.Module):
             return None
 
     def _enhance_search_query(self, query: str) -> str:
-        return query + " " + time.strftime("%d.%m.%Y")
+        now = datetime.datetime.now()
+        date_str = now.strftime("%d.%m.%Y")
+        return query + " " + date_str
 
     def _compute_confidence(self, query_vec: torch.Tensor, answer_vec: torch.Tensor,
                             thought_stream: Optional[List[Tuple[int, float]]]) -> float:
+        """Умный confidence: учитывает согласованность с моделью мира."""
         if not thought_stream:
             return 0.3
         strengths = [s for _, s in thought_stream]
         if not strengths:
             return 0.3
-        import math
         entropy = -sum(p * math.log(p) for p in strengths if p > 0)
         max_entropy = math.log(len(strengths) + 1)
         norm_entropy = entropy / max_entropy if max_entropy > 0 else 0
@@ -738,6 +779,14 @@ class CognitiveBrain(nn.Module):
         if answer_vec is not None and query_vec is not None:
             sim = F.cosine_similarity(query_vec.unsqueeze(0), answer_vec.unsqueeze(0)).item()
             confidence = 0.7 * confidence + 0.3 * sim
+
+        # Коррекция на основе модели мира (если есть)
+        if hasattr(self, 'world_model') and self.world_model is not None and self._last_query:
+            facts = self.world_model.query_by_text(self._last_query, k=3)
+            if facts:
+                avg_conf = sum(f.confidence for f in facts) / len(facts)
+                confidence = 0.6 * confidence + 0.4 * avg_conf
+
         return max(0.1, min(0.9, confidence))
 
     # ---------- Проактивные мысли ----------
@@ -767,28 +816,56 @@ class CognitiveBrain(nn.Module):
                         recent_context += f"Пользователь: {turn['user']}\n"
                     if turn.get("assistant") and not turn["assistant"].startswith("[внутренняя мысль]"):
                         recent_context += f"Ассистент: {turn['assistant']}\n"
-            prompt = (f"Ты – внутренний голос когнитивного графа.\nНедавний диалог:\n{recent_context}\n"
+            # Время суток для тона
+            now = datetime.datetime.now()
+            hour = now.hour
+            if 5 <= hour < 12:
+                time_tone = "утро"
+            elif 12 <= hour < 17:
+                time_tone = "день"
+            elif 17 <= hour < 22:
+                time_tone = "вечер"
+            else:
+                time_tone = "ночь"
+            prompt = (f"Ты – внутренний голос когнитивного графа.\n"
+                      f"Сейчас {time_tone}.\n"
+                      f"Недавний диалог:\n{recent_context}\n"
                       f"Поток ассоциаций:\n{associations}\n"
-                      "Сформулируй одну связную мысль, которая естественно вытекает из этих ассоциаций и развивает тему диалога.")
+                      "Сформулируй одну связную мысль, которая естественно вытекает из этих ассоциаций и развивает тему диалога, учитывая время суток.")
             thought = self.llm.generate(prompt, max_tokens=100, temperature=0.8, enable_thinking=False)
             if thought and len(thought.strip()) > 20:
                 self.learn_pair("внутренняя мысль", thought, reward=self.config.proactive_reward)
-                self.proactive_thoughts.append({"thought": thought, "time": time.time()})
+                self.proactive_thoughts.append({"thought": thought, "time": time_module.time()})
                 print(f"[Proactive] {thought[:80]}...")
 
     # ---------- Сон ----------
     def sleep(self, duration_steps: int = 10):
         with self.lock:
             print("💤 Сон...")
-            self.memory.consolidate(threshold=0.05)
+            # Консолидация памяти
+            self.memory.consolidate(threshold=self.config.memory_consolidation_threshold,
+                                    max_age_days=self.config.memory_consolidation_age_days)
+            # Перестройка иерархии графа
             if hasattr(self.graph, "rebuild_hierarchy"):
                 self.graph.rebuild_hierarchy(optimizer=self.optimizer)
             if self.ewc is not None:
                 self.ewc.set_anchor()
+
+            # Консолидация модели мира
+            self._consolidate_world_model()
+
             for _ in range(3):
                 self.proactive_thought()
-                time.sleep(0.5)
+                time_module.sleep(0.5)
             print("😴 Сон завершён")
+
+    def _consolidate_world_model(self):
+        """Усилить факты, подкреплённые эпизодами (упрощённо)."""
+        if self.world_model is None:
+            return
+        # Для простоты: повышаем уверенность фактов, которые встречались в нескольких эпизодах
+        # Здесь можно реализовать более сложную логику
+        pass
 
     # ---------- Сохранение / загрузка ----------
     def _resize_parameter(self, param: nn.Parameter, new_shape: tuple) -> nn.Parameter:
@@ -853,6 +930,14 @@ class CognitiveBrain(nn.Module):
         if self.user_model:
             with open(f"{path}/user_model.pkl", "wb") as f:
                 pickle.dump(self.user_model, f)
+
+        # Сохранение новых модулей
+        if self.world_model:
+            with open(f"{path}/world_model.pkl", "wb") as f:
+                pickle.dump(self.world_model, f)
+        if self.self_model:
+            with open(f"{path}/self_model.pkl", "wb") as f:
+                pickle.dump(self.self_model, f)
 
         print(f"[Brain] Модель сохранена в {path}")
 
@@ -954,6 +1039,17 @@ class CognitiveBrain(nn.Module):
             with open(um_path, "rb") as f:
                 self.user_model = pickle.load(f)
 
+        # Загрузка новых модулей
+        wm_path = f"{path}/world_model.pkl"
+        if os.path.exists(wm_path) and self.world_model:
+            with open(wm_path, "rb") as f:
+                self.world_model = pickle.load(f)
+
+        sm_path = f"{path}/self_model.pkl"
+        if os.path.exists(sm_path) and self.self_model:
+            with open(sm_path, "rb") as f:
+                self.self_model = pickle.load(f)
+
         self.optimizer = optim.Adam(self.graph.parameters(), lr=self.config.learning_rate)
         print(f"[Brain] Модель загружена из {path}")
 
@@ -991,4 +1087,13 @@ class CognitiveBrain(nn.Module):
                                 "dominance": self.emotion.dominance}
         if self.motivation:
             stats["drives"] = self.motivation.drives
+        if self.world_model:
+            stats["world_model"] = self.world_model.get_stats()
+        if self.self_model:
+            stats["self_model"] = {
+                "capabilities": self.self_model.capabilities,
+                "errors": len(self.self_model.recent_errors),
+                "strategies": len(self.self_model.successful_strategies),
+                "unresolved": len(self.self_model.unresolved_questions),
+            }
         return stats

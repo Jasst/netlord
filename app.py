@@ -717,5 +717,98 @@ atexit.register(save_brain)
 signal.signal(signal.SIGINT, lambda s, f: (save_brain(), sys.exit(0)))
 signal.signal(signal.SIGTERM, lambda s, f: (save_brain(), sys.exit(0)))
 
+# ===== НОВЫЕ ЭНДПОИНТЫ ДЛЯ КОГНИТИВНЫХ МОДУЛЕЙ =====
+
+@app.get("/world_model/stats")
+async def world_model_stats():
+    """Статистика модели мира."""
+    if brain.world_model is None:
+        return {"error": "World model disabled"}
+    return brain.world_model.get_stats()
+
+@app.get("/world_model/facts")
+async def world_model_facts(limit: int = 20, min_confidence: float = 0.0):
+    """Получить последние факты из модели мира."""
+    if brain.world_model is None:
+        return {"facts": []}
+    facts = brain.world_model.get_facts(min_confidence=min_confidence)
+    # Сортируем по времени (свежие сверху)
+    facts = sorted(facts, key=lambda f: f.timestamp, reverse=True)[:limit]
+    return {
+        "facts": [
+            {
+                "subject": f.subject,
+                "relation": f.relation,
+                "object": f.object,
+                "confidence": f.confidence,
+                "source": f.source,
+                "timestamp": f.timestamp,
+                "is_hypothesis": f.is_hypothesis,
+                "evidence": f.evidence[:3],
+            }
+            for f in facts
+        ]
+    }
+
+@app.get("/world_model/hypotheses")
+async def world_model_hypotheses():
+    """Получить активные гипотезы."""
+    if brain.world_model is None:
+        return {"hypotheses": []}
+    hyps = brain.world_model.hypotheses[-20:]  # последние 20
+    return {
+        "hypotheses": [
+            {
+                "content": h.content,
+                "confidence": h.confidence,
+                "generated_from": h.generated_from,
+                "verified": h.verified,
+                "result": h.result,
+                "tests": h.tests,
+            }
+            for h in hyps
+        ]
+    }
+
+@app.get("/self_model/status")
+async def self_model_status():
+    """Состояние Self-модели."""
+    if brain.self_model is None:
+        return {"error": "Self model disabled"}
+    return {
+        "capabilities": brain.self_model.capabilities,
+        "recent_errors": brain.self_model.recent_errors[-5:],
+        "successful_strategies": brain.self_model.successful_strategies[-5:],
+        "unresolved_questions": brain.self_model.unresolved_questions[-5:],
+        "knowledge": [
+            {"aspect": k.aspect, "description": k.description, "confidence": k.confidence}
+            for k in brain.self_model.knowledge[-10:]
+        ],
+    }
+
+@app.get("/planner/goals")
+async def planner_goals():
+    """Текущие цели и планы."""
+    if brain.planner is None:
+        return {"goals": []}
+    goals = brain.planner.goals[-10:]
+    return {
+        "goals": [
+            {
+                "description": g.description,
+                "priority": g.priority,
+                "status": g.status,
+                "plan": [
+                    {"type": a.type, "params": a.params, "status": a.status}
+                    for a in g.plan
+                ],
+                "created": g.created,
+                "completed": g.completed,
+            }
+            for g in goals
+        ]
+    }
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)

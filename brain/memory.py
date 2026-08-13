@@ -6,7 +6,7 @@ import time
 from collections import deque
 from typing import List, Dict, Any, Optional, Tuple
 
-# --- VectorMemoryIndex (без изменений) ---
+# --- VectorMemoryIndex (с поддержкой удаления по времени) ---
 class VectorMemoryIndex:
     def __init__(self, dim: int = 384, capacity: int = 50000):
         self.dim = dim
@@ -70,11 +70,19 @@ class VectorMemoryIndex:
         age_factor = max(0, 1 - age / (30 * 24 * 3600))
         return (self.access_counts[vid] + 1) * age_factor
 
-    def consolidate(self, threshold: float = 0.1):
+    def consolidate(self, threshold: float = 0.1, max_age_days: int = 30):
+        """Улучшенная консолидация: удаление по важности и по возрасту."""
+        # Удаление по важности
         to_remove = [vid for vid, imp in self.importance_scores.items() if imp < threshold]
+        # Удаление по возрасту
+        now = time.time()
+        for vid, ts in self.timestamps.items():
+            if (now - ts) > max_age_days * 86400:
+                if vid not in to_remove:
+                    to_remove.append(vid)
         self._remove_ids(to_remove)
 
-# --- HierarchicalMemory (с исправленным query_semantic) ---
+# --- HierarchicalMemory (с исправленным query_semantic и улучшенной консолидацией) ---
 class HierarchicalMemory:
     def __init__(self, dim: int = 384, working_size: int = 10, episodic_capacity: int = 50000):
         self.dim = dim
@@ -91,11 +99,12 @@ class HierarchicalMemory:
     def retrieve(self, query: torch.Tensor, k: int = 5) -> List[Dict]:
         return self.episodic.search(query.detach().cpu().numpy(), k)
 
-    def consolidate(self, threshold: float = 0.1):
+    def consolidate(self, threshold: float = 0.05, max_age_days: int = 30):
+        """Перенос рабочей памяти в эпизодическую и чистка."""
         for item in list(self.working):
             self.add_episodic(torch.from_numpy(item["vector"]).float(), item["context"])
         self.working.clear()
-        self.episodic.consolidate(threshold)
+        self.episodic.consolidate(threshold, max_age_days)
 
     # --- Семантическая память (обёртка) ---
     def add_semantic_triple(self, subj: str, pred: str, obj: str, confidence: float = 1.0, embedder=None):
@@ -104,23 +113,18 @@ class HierarchicalMemory:
     def query_semantic(self, query_text: Optional[str] = None, embedder=None,
                        subj: Optional[str] = None, pred: Optional[str] = None, obj: Optional[str] = None,
                        k: int = 10) -> List[Tuple]:
-        """
-        Поиск по семантической памяти.
-        Если заданы subj/pred/obj — точный фильтр.
-        Иначе — векторный поиск по query_text (с использованием embedder).
-        """
         if subj is not None or pred is not None or obj is not None:
             return self.semantic_memory.query_exact(subj, pred, obj)
         if query_text:
             return self.semantic_memory.query_vector(query_text, embedder, k=k)
         return []
 
-# --- SemanticGraph (с векторным поиском) ---
+# --- SemanticGraph (без изменений) ---
 class SemanticGraph:
     def __init__(self, dim: int = 384, capacity: int = 10000):
         self.dim = dim
         self.capacity = capacity
-        self.triples = []  # (subj, pred, obj, confidence)
+        self.triples = []
         self.index = faiss.IndexIDMap2(faiss.IndexFlatIP(dim))
         self._next_id = 0
         self.id_to_triple = {}
