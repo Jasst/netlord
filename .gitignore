@@ -17,3 +17,4 @@ brain/__pycache__/search.cpython-313.pyc
 brain/__pycache__/brain.cpython-313.pyc
 *.pyc
 *.pkl
+*.pkl
